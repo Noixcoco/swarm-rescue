@@ -1,7 +1,7 @@
-from swarm_rescue.solutions.my_drone_random import MyDroneRandom
+from swarm_rescue.solutions.my_drone_prototype import MyDronePrototype
 
 
-class MyDroneEval(MyDroneRandom):
+class MyDroneEval(MyDronePrototype):
     """
     Evaluation drone class that inherits from MyDroneRandom.
 
