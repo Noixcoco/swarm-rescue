@@ -174,36 +174,29 @@ class MyDronePrototype(DroneAbstract):
         rotation_speed = np.clip(rotation_speed, -1.0, 1.0)
         self.prev_angle_error = angle_error
 
-        # --- Gestion de la vitesse ---
-        # Valeur par défaut si la LIDAR n'a pas encore de point
-        front_dist = 1000.0
-        if lidar_data is not None:
-            front_dist = lidar_data[90]  # devant le drone
-        
-
         distance_to_target = np.linalg.norm(delta_pos)
 
-        # Base speed : plus rapide en ligne droite, plus lente proche du waypoint
-        if distance_to_target > 100:
-            base_speed = 1.0
-        elif distance_to_target > 50:
-            base_speed = 0.7
-        else:
-            base_speed = 0.4  # ralentit fortement près du waypoint
+        # --- Gestion de la vitesse ---
+        if angle_error > 0.1 or angle_error < -0.1 : # Si on est en train de tourner, alors on met forward_speed à 0         
+            forward_speed = 0
+            #print("on tourne")
 
-        # Ajustement selon l'angle : si le drone doit tourner beaucoup, ralentir
-        if abs(angle_error) < 0.3:
-            # Si obstacle devant, stop
-            if front_dist < 30:
-                forward_speed = 0.0
-            else:
-                forward_speed = base_speed
-        else:
-            # virage important → avancer plus lentement
-            forward_speed = 0.5 * base_speed
+        else :
+            target_speed = min(4.0, distance_to_target*0.05 - 0.03)
+            measured_speed = math.sqrt(self.measured_velocity()[0]**2 + self.measured_velocity()[1]**2)
+
+            if measured_speed > target_speed :
+                forward_speed = -1 # On ralentit
+            elif measured_speed < target_speed :
+                forward_speed = 1 # On accélère
+            else :
+                forward_speed = 0 # On garde la même vitesse
+            
+            #print("target speed : ", target_speed)
+            #print("measured speed : ", measured_speed)
 
         # Si proche du waypoint → passer au suivant
-        if distance_to_target < 25:
+        if distance_to_target < 50:
             self.path.pop(0)
 
         # Si proche du but final
