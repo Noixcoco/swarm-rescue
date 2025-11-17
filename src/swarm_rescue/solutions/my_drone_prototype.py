@@ -182,7 +182,7 @@ class MyDronePrototype(DroneAbstract):
             #print("on tourne")
 
         else :
-            target_speed = min(4.0, distance_to_target*0.05 - 0.03)
+            target_speed = min(6.0, distance_to_target*0.05 - 0.03)
             measured_speed = math.sqrt(self.measured_velocity()[0]**2 + self.measured_velocity()[1]**2)
 
             if measured_speed > target_speed :
