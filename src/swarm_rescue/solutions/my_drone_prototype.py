@@ -106,8 +106,6 @@ class MyDronePrototype(DroneAbstract):
         
         # --- 1. PERCEPTION ---
         self.update_pose()
-        #self.update_map()
-        #self._display_map() 
         
         lidar_data = self.lidar_values()
         if lidar_data is None:
@@ -156,8 +154,6 @@ class MyDronePrototype(DroneAbstract):
             self.grid.display(self.grid.zoomed_grid,
                               self.estimated_pose,
                               title="zoomed occupancy grid")
-            
-        self.display_pos()
 
         return command
 
@@ -186,6 +182,7 @@ class MyDronePrototype(DroneAbstract):
             if len(points_list) > 1:
                 # Utiliser 'draw_line_strip' pour dessiner le chemin complet
                 arcade.draw_line_strip(points_list, arcade.color.GREEN, 5)
+        self.display_pose()
 
 
     # --------------------------------------------------------------------------
@@ -287,18 +284,16 @@ class MyDronePrototype(DroneAbstract):
         cv2.imshow("Carte Mentale du Drone (B&W)", vis_map_flipped)
         cv2.waitKey(1) 
 
-    def display_pos(self) :
+    def display_pose(self) :
         radius = 10
         red = (0,0,255)
-        blue = (255,0,0)
-        arcade.draw_circle_filled(self.current_pose[0],
-                              self.current_pose[1],
+        green = (0,255,0)
+
+        current_pose = self.current_pose[:2] + self._half_size_array
+        arcade.draw_circle_filled(current_pose[0],
+                              current_pose[1],
                               radius=radius,
                               color=red)
-        arcade.draw_circle_filled(self.true_position()[0],
-                              self.true_position()[1],
-                              radius=radius,
-                              color=blue)
 
     # --------------------------------------------------------------------------
     # FONCTIONS PRINCIPALES (Localisation, Cartographie Binaire)
@@ -309,6 +304,7 @@ class MyDronePrototype(DroneAbstract):
         compass_angle = self.measured_compass_angle()
 
         if not np.isnan(gps_pos[0]):
+        #if False :
             self.current_pose[0] = gps_pos[0]
             self.current_pose[1] = gps_pos[1]
             self.current_pose[2] = compass_angle
