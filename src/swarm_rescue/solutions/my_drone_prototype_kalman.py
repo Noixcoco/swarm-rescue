@@ -74,6 +74,43 @@ class MyDronePrototype(DroneAbstract):
             np.array([-300, 200.0]),
             # 5. Tourner à gauche (vers le couloir)
             np.array([-300, -200]),
+
+
+
+
+        ####### KALMAN #######
+
+       # --- Configuration du Filtre de Kalman Étendu (EKF) ---
+        
+        # P = Matrice de Covariance (Notre incertitude)
+        # On commence avec une incertitude très élevée (500) sur x, y, angle
+        self.P = np.eye(3) * 500.0
+
+        # Q = Bruit de Processus (Incertitude de l'odométrie)
+        # À quel point on se méfie de la "dérive" de l'odométrie à chaque pas.
+        # Faibles valeurs = on fait très confiance à l'odométrie
+        self.Q = np.diag([
+            0.1,  # Incertitude sur x (liée à la distance)
+            0.1,  # Incertitude sur y (liée à la distance)
+            0.01  # Incertitude sur l'angle (liée à la rotation)
+        ])
+
+        # R = Bruit de Mesure (Incertitude du GPS/Compas)
+        # À quel point on se méfie du "bruit" des capteurs absolus.
+        # Valeurs élevées = on se méfie beaucoup du GPS
+        self.R = np.diag([
+            10.0, # Incertitude du GPS en X (assez bruyant)
+            10.0, # Incertitude du GPS en Y (assez bruyant)
+            0.5   # Incertitude du Compas (plus fiable)
+        ])
+
+        # H = Matrice de Mesure
+        # Fait le lien entre l'état [x, y, angle] et la mesure [gps_x, gps_y, compass_angle]
+        # Ici, c'est une simple identité car on mesure directement l'état.
+        self.H = np.eye(3)
+ 
+        # I = Matrice Identité (pour les calculs)
+        self.I = np.eye(3)
             
         ]
         
