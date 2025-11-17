@@ -86,7 +86,6 @@ class MyDronePrototype(DroneAbstract):
         ]
 
         self.iteration: int = 0
-        self.size_area = (2000, 2000)
         resolution = 8
         self.grid = OccupancyGrid(size_area_world=self.size_area,
                                   resolution=resolution,
