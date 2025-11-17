@@ -16,6 +16,14 @@ try:
 except ImportError:
     pass
 
+import sys
+from pathlib import Path
+
+# Ajoute le chemin du dossier parent au sys.path
+sys.path.append(str(Path(__file__).resolve().parent.parent.parent.parent))
+from examples.example_mapping import OccupancyGrid
+from swarm_rescue.simulation.utils.pose import Pose
+
 
 class MyDronePrototype(DroneAbstract):
     """
@@ -76,6 +84,13 @@ class MyDronePrototype(DroneAbstract):
             np.array([-300, -200]),
             
         ]
+
+        self.iteration: int = 0
+        self.size_area = (2000, 2000)
+        resolution = 8
+        self.grid = OccupancyGrid(size_area_world=self.size_area,
+                                  resolution=resolution,
+                                  lidar=self.lidar())
         
         # self.state est inutile dans ce test
 
@@ -86,11 +101,14 @@ class MyDronePrototype(DroneAbstract):
         """
         Cerveau : Logique de test simplifiée.
         """
+
+        # increment the iteration counter
+        self.iteration += 1
         
         # --- 1. PERCEPTION ---
         self.update_pose()
-        self.update_map()
-        self._display_map() 
+        #self.update_map()
+        #self._display_map() 
         
         lidar_data = self.lidar_values()
         if lidar_data is None:
@@ -127,6 +145,19 @@ class MyDronePrototype(DroneAbstract):
             command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
 
         command["grasper"] = 0
+
+        self.estimated_pose = Pose(np.asarray(self.measured_gps_position()),
+                                   self.measured_compass_angle())
+
+        self.grid.update_grid(pose=self.estimated_pose)
+        if self.iteration % 5 == 0:
+            self.grid.display(self.grid.grid,
+                              self.estimated_pose,
+                              title="occupancy grid")
+            self.grid.display(self.grid.zoomed_grid,
+                              self.estimated_pose,
+                              title="zoomed occupancy grid")
+
         return command
 
         if self.current_pose is None or np.any(np.isnan(self.current_pose)):
