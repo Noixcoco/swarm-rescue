@@ -59,10 +59,11 @@ class MyDroneProton(DroneAbstract):
         self.Kp = 3
         self.Kd = 2
 
-        # PID translation
-        self.prev_diff_position = np.zeros(2)  # dérivée pour translation
-        self.Kp_pos = 1.6
-        self.Kd_pos = 11.0
+        # NOTE: Les paramètres PID de translation suivants ne sont pas utilisés
+        # dans la fonction 'follow_path' actuelle.
+        # self.prev_diff_position = np.zeros(2)  # dérivée pour translation
+        # self.Kp_pos = 1.6
+        # self.Kd_pos = 11.0
 
         # --- CHEMIN CORRIGÉ (Waypoints pour suivre la ligne verte) ---
         self.path = [
@@ -72,6 +73,14 @@ class MyDroneProton(DroneAbstract):
             np.array([-300, 200.0]),
             np.array([-300, -200])
         ]
+
+
+        # --- EKF TEST LOGGING ---
+        # Listes pour stocker les données à chaque étape
+        self.estimated_poses = []
+        self.true_poses = [] # AJOUTÉ: Pour stocker la trajectoire vraie
+        
+        # ------------------------
 
         ####### KALMAN #######
 
@@ -102,7 +111,7 @@ class MyDroneProton(DroneAbstract):
         # --- EKF TEST LOGGING ---
         # Listes pour stocker les données à chaque étape
         self.estimated_poses = []
-        self.true_poses = []
+        
         # ------------------------
 
         # self.state est inutile dans ce test
@@ -115,13 +124,6 @@ class MyDroneProton(DroneAbstract):
         Cerveau : Logique de test simplifiée.
         """
 
-        # --- EKF TEST: Log data ---
-        # On log les données AVANT que 'update_pose' ne soit appelé
-        # NOTE: 'self.true_pose' est fourni par la classe parent 'DroneAbstract'
-        if hasattr(self, 'true_pose'):
-            self.estimated_poses.append(np.copy(self.current_pose))
-            self.true_poses.append(np.copy(self.true_pose))
-        # --------------------------
 
         # --- 1. PERCEPTION ---
         self.update_pose()
@@ -132,11 +134,25 @@ class MyDroneProton(DroneAbstract):
         if lidar_data is None:
             return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0, "grasper": 0}
 
+
+
+        # --- EKF TEST: Log data ---
+        # On log les données AVANT que 'update_pose' ne soit appelé
+        # NOTE: 'self.true_pose' est fourni par la classe parent 'DroneAbstract'
+        self.estimated_poses.append(np.copy(self.current_pose))
+
+
+        # AJOUTÉ: Logger aussi la position vraie
+        true_pos_current = self.true_position()
+        if true_pos_current is not None:
+            self.true_poses.append(np.copy(true_pos_current))
+    
+        # --------------------------
         # --- 2. STRATÉGIE (DÉSACTIVÉE) ---
         # Toute la logique FBE et A* est désactivée.
 
-        # Si le chemin n'a jamais été initialisé
-        if not self.path and len(self.path) == 0:
+        # Si le chemin est terminé (liste vide)
+        if not self.path:
             # Recharger le chemin si le test est fini (pour relancer le test)
             self.path = [
                 np.array([400.0, -200.0]),
@@ -168,54 +184,61 @@ class MyDroneProton(DroneAbstract):
 
     def draw_bottom_layer(self):
         """
-        Dessine le chemin (vert), la position estimée (rouge), la position vraie (bleue),
-        et la ligne d'erreur (jaune).
+        MODIFIÉ: Dessine le chemin (vert), les trajectoires (rouge/bleu), 
+        les positions instantanées (cercles rouge/bleu), et la ligne d'erreur (jaune).
         """
+        # Assumes self._half_size_array is defined in the parent class (e.g., DroneAbstract)
 
         # --- 1. Dessine le chemin A* (self.path) en vert ---
         if self.path:
-            points_list = []
-            # Utilise la position estimée comme point de départ du chemin
-            start_point = self.current_pose[:2] + self._half_size_array
-            points_list.append((start_point[0], start_point[1]))
+            points_list_path = [] # Renommé pour éviter confusion
+            start_point_path = self.current_pose[:2] + self._half_size_array
+            points_list_path.append((start_point_path[0], start_point_path[1]))
+            
             for point_world in self.path:
                 point_arcade = point_world + self._half_size_array
-                points_list.append((point_arcade[0], point_arcade[1]))
-            if len(points_list) > 1:
-                arcade.draw_line_strip(points_list, arcade.color.GREEN, 5)
-
-        # --- 2. Dessine la Vérité Terrain vs Estimation EKF ---
-        if hasattr(self, 'true_pose'):
-            # A. Position Vraie (Ground Truth)
-            true_pos_arcade = self.true_pose[:2] + self._half_size_array
+                points_list_path.append((point_arcade[0], point_arcade[1]))
             
-            # B. Position Estimée (EKF)
+            if len(points_list_path) > 1:
+                arcade.draw_line_strip(points_list_path, arcade.color.GREEN, 5)
+
+        # --- 2. Dessine les trajectoires historiques ---
+
+        # Trajectoire Estimée (Rouge)
+        if len(self.estimated_poses) > 1:
+            estimated_path_points = []
+            for pose in self.estimated_poses:
+                screen_pos = pose[:2] + self._half_size_array
+                estimated_path_points.append((screen_pos[0], screen_pos[1]))
+            arcade.draw_line_strip(estimated_path_points, arcade.color.RED, 2)
+
+        # Trajectoire Vraie (Bleue)
+        if len(self.true_poses) > 1:
+            true_path_points = []
+            for pose in self.true_poses:
+                screen_pos = pose[:2] + self._half_size_array
+                true_path_points.append((screen_pos[0], screen_pos[1]))
+            arcade.draw_line_strip(true_path_points, arcade.color.BLUE, 2)
+
+
+        # --- 3. Dessine la Vérité Terrain vs Estimation EKF INSTANTANÉE ---
+        true_pos = self.true_position()
+        
+        if true_pos is not None:
+            true_pos_arcade = true_pos[:2] + self._half_size_array
             est_pos_arcade = self.current_pose[:2] + self._half_size_array
 
-            # C. Ligne d'Erreur (Jaune)
-            arcade.draw_line(
-                true_pos_arcade[0], true_pos_arcade[1],
-                est_pos_arcade[0], est_pos_arcade[1],
-                arcade.color.YELLOW, 2
-            )
 
-            # D. Cercle Vrai (Bleu)
-            arcade.draw_circle_filled(
-                true_pos_arcade[0], true_pos_arcade[1],
-                10, arcade.color.BLUE
-            )
-
-            # E. Cercle Estimé (Rouge)
+            # E. Cercle Estimé (Rouge) - Dessiné par-dessus la trajectoire
             arcade.draw_circle_filled(
                 est_pos_arcade[0], est_pos_arcade[1],
                 10, arcade.color.RED
             )
-
-
-    # --------------------------------------------------------------------------
+            
+            
+    #------------------------------------------------------------------------
     # FONCTIONS DE PILOTAGE
     # --------------------------------------------------------------------------
-
     def follow_path(self, lidar_data) -> CommandsDict:
         if not self.path:
             return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
@@ -234,7 +257,7 @@ class MyDroneProton(DroneAbstract):
         distance_to_target = np.linalg.norm(delta_pos)
 
         # --- Gestion de la vitesse ---
-        if angle_error > 0.1 or angle_error < -0.1 : # Si on est en train de tourner, alors on met forward_speed à 0
+        if angle_error > 0.1 or angle_error < -0.1 : # Si on est en train de tourner, alors on met forward_speed à 0         
             forward_speed = 0
             #print("on tourne")
 
@@ -248,7 +271,7 @@ class MyDroneProton(DroneAbstract):
                 forward_speed = 1 # On accélère
             else :
                 forward_speed = 0 # On garde la même vitesse
-
+            
             #print("target speed : ", target_speed)
             #print("measured speed : ", measured_speed)
 
@@ -265,7 +288,7 @@ class MyDroneProton(DroneAbstract):
 
         return {"forward": forward_speed, "lateral": 0.0, "rotation": rotation_speed}
 
-
+   
     # --------------------------------------------------------------------------
     # FONCTIONS DE CONVERSION & AFFICHAGE
     # --------------------------------------------------------------------------
@@ -285,25 +308,26 @@ class MyDroneProton(DroneAbstract):
         obstacle_mask = (self.occupancy_grid <= 0)
         inflated_map = ndimage.binary_dilation(obstacle_mask, iterations=self.inflation_radius_cells)
 
-        vis_map[self.occupancy_grid == 0] = [128, 128, 128] # Gris
-        vis_map[inflated_map == True] = [50, 50, 50]       # Gris foncé
-        vis_map[self.occupancy_grid == -1] = [0, 0, 0]         # Noir
-        vis_map[self.occupancy_grid == 1] = [255, 255, 255] # Blanc
+        vis_map[self.occupancy_grid == 0] = [128, 128, 128] # Gris (Inconnu)
+        vis_map[inflated_map == True] = [50, 50, 50]        # Gris foncé (Inflé)
+        vis_map[self.occupancy_grid == -1] = [0, 0, 0]      # Noir (Obstacle)
+        vis_map[self.occupancy_grid == 1] = [255, 255, 255] # Blanc (Libre)
 
         if self.path:
             for point_world in self.path:
                 point_grid = self.world_to_grid(point_world)
+                # NETTOYÉ: radius=1 pour dessiner un pixel (radius=0 est ambigu)
                 cv2.circle(vis_map, (point_grid[0], point_grid[1]),
-                           radius=0, color=(0, 255, 0), thickness=-1)
+                           radius=1, color=(0, 255, 0), thickness=-1)
 
         if self.goal_position is not None:
             goal_grid_pos_xy = self.world_to_grid(self.goal_position)
             cv2.circle(vis_map, (goal_grid_pos_xy[0], goal_grid_pos_xy[1]),
-                       radius=3, color=(255, 0, 0), thickness=-1) # Bleu
+                           radius=3, color=(255, 0, 0), thickness=-1) # Bleu
 
         drone_grid_pos_xy = self.world_to_grid(self.current_pose[:2])
         cv2.circle(vis_map, (drone_grid_pos_xy[0], drone_grid_pos_xy[1]),
-                   radius=2, color=(0, 0, 255), thickness=-1) # Rouge
+                       radius=2, color=(0, 0, 255), thickness=-1) # Rouge
 
         vis_map_large = cv2.resize(vis_map, (400, 400), interpolation=cv2.INTER_NEAREST)
         vis_map_flipped = cv2.flip(vis_map_large, 0)
@@ -378,7 +402,7 @@ class MyDroneProton(DroneAbstract):
         grid_pos_xy = self.world_to_grid(self.current_pose[:2])
         gx, gy = grid_pos_xy[0], grid_pos_xy[1]
 
-        gyx = (gy, gx)
+        # NETTOYÉ: La variable 'gyx' n'était pas utilisée
         if 0 <= gy < self.grid_size and 0 <= gx < self.grid_size:
             self.occupancy_grid[gy, gx] = 1
 
