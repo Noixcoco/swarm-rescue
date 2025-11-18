@@ -247,48 +247,43 @@ class MyDroneProton(DroneAbstract):
         delta_pos = target_pos - self.current_pose[:2]
         target_angle = math.atan2(delta_pos[1], delta_pos[0])
 
-        # --- PID sur la rotation ---
+        # --- PID for rotation (aggressive tuning) ---
         angle_error = normalize_angle(target_angle - self.current_pose[2])
         deriv_error = angle_error - self.prev_angle_error
-        rotation_speed = self.Kp * angle_error + self.Kd * deriv_error
+        rotation_speed = 5.0 * angle_error + 3.0 * deriv_error  # Increased Kp and Kd
         rotation_speed = np.clip(rotation_speed, -1.0, 1.0)
         self.prev_angle_error = angle_error
 
+        # --- Dynamic speed control (aggressive scaling) ---
         distance_to_target = np.linalg.norm(delta_pos)
+        # Scale speed aggressively with distance (max speed: 8.0)
+        target_speed = min(20, distance_to_target * 0.3)  # Increased multiplier
+        measured_speed = math.sqrt(self.measured_velocity()[0]**2 + self.measured_velocity()[1]**2)
 
-        # --- Gestion de la vitesse ---
-        if angle_error > 0.1 or angle_error < -0.1 : # Si on est en train de tourner, alors on met forward_speed à 0         
-            forward_speed = 0
-            #print("on tourne")
+        # Dynamic acceleration/deceleration
+        if abs(angle_error) > 0.05:  # Reduced threshold for stopping
+            forward_speed = 0.0  # Stop only if angle error is significant
+        else:
+            if measured_speed < target_speed:
+                forward_speed = 1.0  # Full throttle if below target
+            elif measured_speed > target_speed:
+                forward_speed = -0.5  # Gentle braking if above target
+            else:
+                forward_speed = 0.0  # Maintain speed
 
-        else :
-            target_speed = min(4.0, distance_to_target*0.05 - 0.03)
-            measured_speed = math.sqrt(self.measured_velocity()[0]**2 + self.measured_velocity()[1]**2)
-
-            if measured_speed > target_speed :
-                forward_speed = -1 # On ralentit
-            elif measured_speed < target_speed :
-                forward_speed = 1 # On accélère
-            else :
-                forward_speed = 0 # On garde la même vitesse
-            
-            #print("target speed : ", target_speed)
-            #print("measured speed : ", measured_speed)
-
-        # Si proche du waypoint → passer au suivant
-        if distance_to_target < 50:
+        # --- Waypoint switching logic (tighter threshold) ---
+        if distance_to_target < 20.0:  # Reduced from 50.0
             self.path.pop(0)
 
-        # Si proche du but final
+        # --- Goal check ---
         dist_to_goal = np.linalg.norm(self.goal_position - self.current_pose[:2])
-        if dist_to_goal < 50:
+        if dist_to_goal < 20.0:  # Reduced from 50.0
             print("✅ Mission terminée : le drone est arrivé au but.")
             self.mission_done = True
             return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
 
         return {"forward": forward_speed, "lateral": 0.0, "rotation": rotation_speed}
 
-   
     # --------------------------------------------------------------------------
     # FONCTIONS DE CONVERSION & AFFICHAGE
     # --------------------------------------------------------------------------
