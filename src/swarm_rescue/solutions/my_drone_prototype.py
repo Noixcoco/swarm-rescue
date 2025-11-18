@@ -238,52 +238,6 @@ class MyDronePrototype(DroneAbstract):
 
         return {"forward": forward_speed, "lateral": 0.0, "rotation": rotation_speed}
 
-   
-    # --------------------------------------------------------------------------
-    # FONCTIONS DE CONVERSION & AFFICHAGE
-    # --------------------------------------------------------------------------
-
-    def world_to_grid(self, world_pos_xy):
-        grid_pos_xy = (world_pos_xy / self.map_resolution + self.map_origin_offset).astype(int)
-        grid_pos_xy[0] = np.clip(grid_pos_xy[0], 0, self.map_max_index)
-        grid_pos_xy[1] = np.clip(grid_pos_xy[1], 0, self.map_max_index)
-        return grid_pos_xy
-
-    def grid_to_world(self, grid_pos_xy):
-        return (grid_pos_xy - self.map_origin_offset) * self.map_resolution
-
-    def _display_map(self):
-        vis_map = np.zeros((self.grid_size, self.grid_size, 3), dtype=np.uint8)
-        
-        obstacle_mask = (self.occupancy_grid <= 0)
-        inflated_map = ndimage.binary_dilation(obstacle_mask, iterations=self.inflation_radius_cells)
-
-        vis_map[self.occupancy_grid == 0] = [128, 128, 128] # Gris
-        vis_map[inflated_map == True] = [50, 50, 50]       # Gris foncé
-        vis_map[self.occupancy_grid == -1] = [0, 0, 0]       # Noir
-        vis_map[self.occupancy_grid == 1] = [255, 255, 255] # Blanc
-        
-        if self.path:
-            for point_world in self.path:
-                point_grid = self.world_to_grid(point_world)
-                cv2.circle(vis_map, (point_grid[0], point_grid[1]), 
-                           radius=0, color=(0, 255, 0), thickness=-1)
-
-        if self.goal_position is not None:
-            goal_grid_pos_xy = self.world_to_grid(self.goal_position)
-            cv2.circle(vis_map, (goal_grid_pos_xy[0], goal_grid_pos_xy[1]),
-                       radius=3, color=(255, 0, 0), thickness=-1) # Bleu
-                           
-        drone_grid_pos_xy = self.world_to_grid(self.current_pose[:2])
-        cv2.circle(vis_map, (drone_grid_pos_xy[0], drone_grid_pos_xy[1]), 
-                   radius=2, color=(0, 0, 255), thickness=-1) # Rouge
-                       
-        vis_map_large = cv2.resize(vis_map, (400, 400), interpolation=cv2.INTER_NEAREST)
-        vis_map_flipped = cv2.flip(vis_map_large, 0) 
-
-        cv2.imshow("Carte Mentale du Drone (B&W)", vis_map_flipped)
-        cv2.waitKey(1) 
-
     def display_pose(self) :
         radius = 10
         red = (0,0,255)
@@ -322,39 +276,4 @@ class MyDronePrototype(DroneAbstract):
             self.current_pose[0] += dx
             self.current_pose[1] += dy
 
-    def update_map(self):
-        grid_pos_xy = self.world_to_grid(self.current_pose[:2])
-        gx, gy = grid_pos_xy[0], grid_pos_xy[1]
-        
-        gyx = (gy, gx)
-        if 0 <= gy < self.grid_size and 0 <= gx < self.grid_size:
-            self.occupancy_grid[gy, gx] = 1 
-        
-        lidar_values = self.lidar_values()
-        if lidar_values is None: return 
-            
-        lidar_angles = self.lidar().ray_angles
-        max_range = self.lidar().max_range * 0.95 
-
-        for angle, dist in zip(lidar_angles, lidar_values):
-            global_angle = normalize_angle(self.current_pose[2] + angle)
-            
-            if dist < max_range:
-                end_point_world = self.current_pose[:2] + np.array([dist * math.cos(global_angle), dist * math.sin(global_angle)])
-                is_obstacle = True
-            else:
-                end_point_world = self.current_pose[:2] + np.array([max_range * math.cos(global_angle), max_range * math.sin(global_angle)])
-                is_obstacle = False
-            
-            grid_end_point_xy = self.world_to_grid(end_point_world)
-            gx_end, gy_end = grid_end_point_xy[0], grid_end_point_xy[1]
-            
-            rr, cc = draw_line(gy, gx, gy_end, gx_end)
-            
-            rr = np.clip(rr, 0, self.map_max_index)
-            cc = np.clip(cc, 0, self.map_max_index)
-
-            self.occupancy_grid[rr, cc] = 1 
-            
-            if is_obstacle:
-                self.occupancy_grid[gy_end, gx_end] = -1
+    
