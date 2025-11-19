@@ -7,6 +7,7 @@ from typing import Tuple, Dict, Any
 
 # Requis pour la cartographie et le dessin
 from skimage.draw import line as draw_line
+from scipy.ndimage import generate_binary_structure, binary_dilation
 from scipy import ndimage 
 import cv2
 import arcade
@@ -40,17 +41,16 @@ class MyDronePrototype(DroneAbstract):
         # Mission accomplie ?
         self.mission_done = False
 
-        # --- Configuration de la Carte (Binaire) ---
-        self.map_size_pixels = 1000 
-        self.map_resolution = 5 
-        self.grid_size = self.map_size_pixels // self.map_resolution
-        self.map_max_index = self.grid_size - 1 
-        self.occupancy_grid = np.zeros((self.grid_size, self.grid_size), dtype=np.int8) 
-        self.map_origin_offset = np.array([self.grid_size // 2, self.grid_size // 2]) 
+        self.iteration: int = 0
+        resolution = 8
+        self.grid = OccupancyGrid(size_area_world=self.size_area,
+                                  resolution=resolution,
+                                  lidar=self.lidar())
         
         # --- Sécurité et Inflation ---
         self.robot_radius_pixels = 30 
-        self.inflation_radius_cells = int(self.robot_radius_pixels / self.map_resolution)
+        # Le rayon d'inflation utilise maintenant la résolution de self.grid
+        self.inflation_radius_cells = int(self.robot_radius_pixels / self.grid.resolution)
         if self.inflation_radius_cells < 1:
             self.inflation_radius_cells = 1
         
@@ -71,7 +71,7 @@ class MyDronePrototype(DroneAbstract):
         
         # --- CHEMIN CORRIGÉ (Waypoints pour suivre la ligne verte) ---
         # NOTE: Ces points sont choisis pour simuler un chemin A* qui contourne les murs.
-        self.path = [
+        """self.path = [
             # 1. Sortir de la zone de retour (en bas à droite)
             np.array([300.0, -200.0]),
             # 2. Descendre à droite
@@ -83,13 +83,9 @@ class MyDronePrototype(DroneAbstract):
             # 5. Tourner à gauche (vers le couloir)
             np.array([-300, -200]),
             
-        ]
-
-        self.iteration: int = 0
-        resolution = 8
-        self.grid = OccupancyGrid(size_area_world=self.size_area,
-                                  resolution=resolution,
-                                  lidar=self.lidar())
+        ]"""
+        self.path = []
+        self.frontiers_world = []
         
         # self.state est inutile dans ce test
 
@@ -107,27 +103,41 @@ class MyDronePrototype(DroneAbstract):
         # --- 1. PERCEPTION ---
         self.update_pose()
         
+        # Mise à jour de la grille probabiliste self.grid.grid (utilisée pour l'exploration)
+        self.estimated_pose = Pose(np.asarray(self.measured_gps_position()),
+                                   self.measured_compass_angle())
+        self.grid.update_grid(pose=self.estimated_pose) # Mise à jour de la carte utilisée!
+        #print("grid :", self.grid.grid > 0.0)
+
         lidar_data = self.lidar_values()
         if lidar_data is None:
             return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0, "grasper": 0}
 
         # --- 2. STRATÉGIE (DÉSACTIVÉE) ---
-        # Toute la logique FBE et A* est désactivée.
-
-
-        
-        # Si le chemin n'a jamais été initialisé
-        if not self.path and len(self.path) == 0:
-            # Recharger le chemin si le test est fini (pour relancer le test)
-            self.path = [
-                np.array([400.0, -200.0]),
-                np.array([400.0, -300.0]),
-                np.array([100.0, -300.0]),
-                np.array([100.0, 300.0]),
-                np.array([-300.0, 300.0]),
-                np.array([-400.0, -300.0])
-            ]
+        # Replanification si le chemin est vide ou si le waypoint est atteint
+        if not self.path or len(self.path) < 1:
             
+            self.frontiers_world = self.find_safe_frontier_points() # Met à jour la liste des frontières
+            print("frontieres : ",self.frontiers_world)
+            if self.frontiers_world:
+                # Scoring simplifié : choisir le point de frontière le plus proche
+                
+                # Calculer la distance de chaque frontière au drone
+                distances = [np.linalg.norm(f - self.current_pose[:2]) for f in self.frontiers_world]
+                
+                # Trouver l'indice de la frontière la plus proche
+                closest_index = np.argmin(distances)
+                
+                target_point = self.frontiers_world[closest_index]
+                
+                # Le chemin devient ce point de frontière
+                self.path = [target_point]
+                
+            else:
+                if not self.mission_done:
+                    print("Exploration terminée ou drone bloqué. Arrêt de l'exploration.")
+                    #self.mission_done = True 
+
         # Si la mission est déjà terminée, le drone reste immobile
         if self.mission_done:
             return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0, "grasper": 0}
@@ -143,10 +153,6 @@ class MyDronePrototype(DroneAbstract):
 
         command["grasper"] = 0
 
-        self.estimated_pose = Pose(np.asarray(self.measured_gps_position()),
-                                   self.measured_compass_angle())
-
-        self.grid.update_grid(pose=self.estimated_pose)
         if self.iteration % 5 == 0:
             self.grid.display(self.grid.grid,
                               self.estimated_pose,
@@ -157,31 +163,86 @@ class MyDronePrototype(DroneAbstract):
 
         return command
 
-        if self.current_pose is None or np.any(np.isnan(self.current_pose)):
-            print("⚠️ Pose non initialisée, attente de données LIDAR...")
-        return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0, "grasper": 0}
+    # --------------------------------------------------------------------------
+    # FONCTION DE DÉTECTION DES FRONTIÈRES SÛRES (Mise à jour pour self.frontiers_world)
+    # --------------------------------------------------------------------------
+
+    def find_safe_frontier_points(self) -> list:
+        
+        grid_map = self.grid.grid 
+        
+        # --- NOUVEAUX SEUILS ADAPTÉS À L'INITIALISATION À ZÉRO ---
+        # Si grid.grid est initialisée à 0.0:
+        
+        SEUIL_INCONNU = 0.0001 # Tout ce qui est égal à 0.0 (non exploré)
+        SEUIL_MUR = 0.6        # Probabilité > 0.6 = Considéré comme mur
+        
+        frontiers_world_temp = []
+        frontiers = []
+
+        # 1. Identifier les masques
+        # is_unknown: Les cellules dont la valeur est très proche de zéro (état initial)
+        is_unknown = (grid_map < SEUIL_INCONNU) 
+        #print("u :", is_unknown)
+        
+        # is_wall: Les cellules où la probabilité d'occupation est élevée
+        is_wall = (grid_map >= SEUIL_MUR)   
+        #print("w :", is_wall)                                          
+        
+        # is_free: Les cellules qui ont été balayées et ne sont pas des murs (0.0 < valeur < 0.6)
+        is_free = (grid_map >= SEUIL_INCONNU) & (grid_map < SEUIL_MUR) 
+        #print("f :", is_free) 
+        
+        # Le reste du code reste inchangé:
+        # 2. Définir la zone dangereuse (murs dilatés)
+        struct = generate_binary_structure(2, 2) 
+        dangerous_zone = binary_dilation(is_wall, 
+                                        structure=struct, 
+                                        iterations=1)
+        
+        # 3. Détecter les frontières brutes (Inconnu adjacent à Libre)
+        dilated_free = binary_dilation(is_free, structure=struct, iterations=1)
+        raw_frontiers = is_unknown & dilated_free
+        
+        """print("raw_frontiers")
+        for index_ligne, ligne in enumerate(raw_frontiers):
+            for index_colonne, valeur in enumerate(ligne):
+                if valeur:
+                    print(f"[Ligne : {index_ligne}, Colonne : {index_colonne}]")"""
+
+        # 4. Filtrer les frontières par la zone dangereuse
+        safe_frontiers_mask = raw_frontiers & (~dangerous_zone)
+
+        print("safe_frontiers_mask")
+        for index_ligne, ligne in enumerate(safe_frontiers_mask):
+            for index_colonne, valeur in enumerate(ligne):
+                if valeur:
+                    print(f"[Ligne : {index_ligne}, Colonne : {index_colonne}]")
+                    x_frontier_world, y_frontier_world = self.grid._conv_grid_to_world(index_ligne, index_colonne)
+                    new_frontier = np.array([x_frontier_world, y_frontier_world])
+                    frontiers.append(new_frontier)
+                 
+        return frontiers
 
     # --------------------------------------------------------------------------
     # FONCTION DE DESSIN
     # --------------------------------------------------------------------------
     
     def draw_bottom_layer(self):
-        """ Dessine le chemin A* (self.path) en pointillés verts. """
+        """ Dessine les frontières """
         if self.path:
-            points_list = []
-            
-            # 1. Ajouter la position actuelle du drone au début du chemin
-            start_point = self.current_pose[:2] + self._half_size_array
-            points_list.append((start_point[0], start_point[1]))
+            point_arcade = self.path[0] + self._half_size_array
+            #point_arcade = np.array([100.0, 100.0])
 
-            # 2. Ajouter les waypoints restants
-            for point_world in self.path:
-                point_arcade = point_world + self._half_size_array
-                points_list.append((point_arcade[0], point_arcade[1]))
+            radius = 10
+            red = (0,0,255)
 
-            if len(points_list) > 1:
-                # Utiliser 'draw_line_strip' pour dessiner le chemin complet
-                arcade.draw_line_strip(points_list, arcade.color.GREEN, 5)
+            arcade.draw_circle_filled(point_arcade[0],
+                              point_arcade[1],
+                              radius=radius,
+                              color=red)
+
+
         self.display_pose()
 
 
@@ -190,6 +251,7 @@ class MyDronePrototype(DroneAbstract):
     # --------------------------------------------------------------------------
  
     def follow_path(self, lidar_data) -> CommandsDict:
+        #print("following_path")
         if not self.path:
             return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
 
@@ -231,10 +293,10 @@ class MyDronePrototype(DroneAbstract):
 
         # Si proche du but final
         dist_to_goal = np.linalg.norm(self.goal_position - self.current_pose[:2])
-        if dist_to_goal < 50:
+        """if dist_to_goal < 50:
             print("✅ Mission terminée : le drone est arrivé au but.")
-            self.mission_done = True
-            return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
+            #self.mission_done = True
+            #return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}"""
 
         return {"forward": forward_speed, "lateral": 0.0, "rotation": rotation_speed}
 
