@@ -28,6 +28,65 @@ from swarm_rescue.simulation.utils.pose import Pose
 
 
 class MyDronePrototype(DroneAbstract):
+    def creer_chemin(self, start_world, goal_world):
+        """
+        Calcule un chemin entre start_world et goal_world en évitant les murs et les zones proches des murs (moins de 4 pixels) avec A*.
+        Retourne une liste de points (en coordonnées monde).
+        """
+        import heapq
+        from scipy.ndimage import binary_dilation
+        grid = self.grid.grid
+        # Conversion monde -> grille
+        start = self.grid._conv_world_to_grid(*start_world)
+        goal = self.grid._conv_world_to_grid(*goal_world)
+        start = tuple(map(int, start))
+        goal = tuple(map(int, goal))
+
+        # Masque des murs
+        SEUIL_MUR = 10.0
+        is_wall = (grid >= SEUIL_MUR)
+        # Dilate les murs pour éviter les zones proches (moins de 4 pixels)
+        struct = np.ones((9, 9), dtype=bool)  # carré 9x9 ~ rayon 4
+        danger_zone = binary_dilation(is_wall, structure=struct, iterations=1)
+
+        def heuristic(a, b):
+            return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+        neighbors = [(-1,0),(1,0),(0,-1),(0,1)]  # 4-connecté
+
+        close_set = set()
+        came_from = {}
+        gscore = {start: 0}
+        fscore = {start: heuristic(start, goal)}
+        oheap = [(fscore[start], start)]
+
+        while oheap:
+            current = heapq.heappop(oheap)[1]
+            if current == goal:
+                # Reconstruire le chemin
+                path = [current]
+                while current in came_from:
+                    current = came_from[current]
+                    path.append(current)
+                path.reverse()
+                # Conversion grille -> monde
+                return [np.array(self.grid._conv_grid_to_world(*pt)) for pt in path]
+            close_set.add(current)
+            for dx, dy in neighbors:
+                neighbor = (current[0] + dx, current[1] + dy)
+                if (0 <= neighbor[0] < grid.shape[0] and 0 <= neighbor[1] < grid.shape[1]):
+                    if danger_zone[neighbor]:
+                        continue
+                    tentative_g_score = gscore[current] + 1
+                    if neighbor in close_set and tentative_g_score >= gscore.get(neighbor, float('inf')):
+                        continue
+                    if tentative_g_score < gscore.get(neighbor, float('inf')):
+                        came_from[neighbor] = current
+                        gscore[neighbor] = tentative_g_score
+                        fscore[neighbor] = tentative_g_score + heuristic(neighbor, goal)
+                        heapq.heappush(oheap, (fscore[neighbor], neighbor))
+        # Pas de chemin trouvé
+        return []
     """
     HARNAIS DE TEST (V-Test) - CHEMIN CORRIGÉ
     Objectif : Tester UNIQUEMENT le pilotage (la fonction 'follow_path').
@@ -132,12 +191,7 @@ class MyDronePrototype(DroneAbstract):
                 target_point = self.frontiers_world[closest_index]
                 
                 # Le chemin devient ce point de frontière
-                self.path = [target_point]
-                
-            #else: 
-                #if not self.mission_done:
-                    #print("Exploration terminée ou drone bloqué. Arrêt de l'exploration.")
-                    #self.mission_done = True 
+                self.path = self.creer_chemin(self.current_pose[:2], target_point)
 
         # Si la mission est déjà terminée, le drone reste immobile
         if self.mission_done:
@@ -282,19 +336,20 @@ class MyDronePrototype(DroneAbstract):
     # --------------------------------------------------------------------------
     
     def draw_bottom_layer(self):
-        """ Dessine les frontières """
-        if self.path:
-            point_arcade = self.path[0] + self._half_size_array
-            #point_arcade = np.array([100.0, 100.0])
-
-            radius = 10
+        """ Dessine le chemin calculé (tous les points) """
+        if self.path and len(self.path) > 0:
+            radius = 7
             blue = (0,0,255)
-
-            arcade.draw_circle_filled(point_arcade[0],
-                              point_arcade[1],
-                              radius=radius,
-                              color=blue)
-
+            green = (0,255,0)
+            # Affiche chaque point du chemin
+            for pt in self.path:
+                point_arcade = pt + self._half_size_array
+                arcade.draw_circle_filled(point_arcade[0], point_arcade[1], radius=radius, color=blue)
+            # Relie les points par des segments
+            for i in range(len(self.path)-1):
+                p1 = self.path[i] + self._half_size_array
+                p2 = self.path[i+1] + self._half_size_array
+                arcade.draw_line(p1[0], p1[1], p2[0], p2[1], color=green, line_width=3)
 
         self.display_pose()
 
