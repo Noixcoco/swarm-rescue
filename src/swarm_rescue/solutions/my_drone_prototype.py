@@ -1,5 +1,6 @@
 import math
 import numpy as np
+from scipy.ndimage import binary_dilation
 from swarm_rescue.simulation.drone.drone_abstract import DroneAbstract
 from swarm_rescue.simulation.utils.utils import normalize_angle
 from swarm_rescue.simulation.drone.controller import CommandsDict
@@ -133,9 +134,9 @@ class MyDronePrototype(DroneAbstract):
                 # Le chemin devient ce point de frontière
                 self.path = [target_point]
                 
-            else:
-                if not self.mission_done:
-                    print("Exploration terminée ou drone bloqué. Arrêt de l'exploration.")
+            #else: 
+                #if not self.mission_done:
+                    #print("Exploration terminée ou drone bloqué. Arrêt de l'exploration.")
                     #self.mission_done = True 
 
         # Si la mission est déjà terminée, le drone reste immobile
@@ -174,35 +175,87 @@ class MyDronePrototype(DroneAbstract):
         # --- NOUVEAUX SEUILS ADAPTÉS À L'INITIALISATION À ZÉRO ---
         # Si grid.grid est initialisée à 0.0:
         
-        SEUIL_INCONNU = 0.0001 # Tout ce qui est égal à 0.0 (non exploré)
-        SEUIL_MUR = 0.6        # Probabilité > 0.6 = Considéré comme mur
+        SEUIL_FREE = -10.0
+        SEUIL_MUR = 10.0        
         
         frontiers_world_temp = []
         frontiers = []
 
         # 1. Identifier les masques
         # is_unknown: Les cellules dont la valeur est très proche de zéro (état initial)
-        is_unknown = (grid_map < SEUIL_INCONNU) 
+        #is_unknown = (grid_map < SEUIL_MUR) & (grid_map > SEUIL_FREE)
+        is_unknown = (grid_map <= 10) & (grid_map >= -10)
         #print("u :", is_unknown)
         
         # is_wall: Les cellules où la probabilité d'occupation est élevée
-        is_wall = (grid_map >= SEUIL_MUR)   
+        is_wall = (grid_map >= SEUIL_MUR)  
+        
+        for l in grid_map.T :
+            line_str = ""
+            for e in l :
+                if e <= SEUIL_FREE :
+                    line_str += "x"
+                elif e >= SEUIL_MUR :
+                    line_str += "I"
+                else :
+                    line_str += "o"
+            print("map : ", line_str)
         #print("w :", is_wall)                                          
         
         # is_free: Les cellules qui ont été balayées et ne sont pas des murs (0.0 < valeur < 0.6)
-        is_free = (grid_map >= SEUIL_INCONNU) & (grid_map < SEUIL_MUR) 
+        is_free = (grid_map < SEUIL_FREE) 
         #print("f :", is_free) 
+
+        # ---------------------------------------------------------
+        # ÉTAPE A : DÉTECTION DES FRONTIÈRES BRUTES (Voisinage 4)
+        # ---------------------------------------------------------
+        frontier_mask = np.zeros_like(is_free, dtype=bool)
+
+        # connectivity structure
+        structure = np.array([[0,1,0],
+                              [1,1,1],
+                              [0,1,0]], dtype=bool)
+
+        # Dilate is_unknown to mark neighbors
+        unknown_neighbors = binary_dilation(is_unknown, structure=structure)
+        frontier_mask = is_free & unknown_neighbors
+
+        for l in frontier_mask.T :
+            line_str = ""
+            for e in l :
+                if e :
+                    line_str += "S"
+                else :
+                    line_str += "o"
+            print("frontières : ", line_str)
+
+        # Structure 8-connectée pour la dilatation
+        struct = np.ones((5, 5), dtype=bool)
+        # Dilate is_wall by 2 pixels
+        danger_zone = binary_dilation(is_wall, structure=struct, iterations=2)
+        # Remove frontiers too close to a wall
+        frontier_mask = frontier_mask & (~danger_zone)
+        safe_frontiers_mask = frontier_mask
+
+        for l in safe_frontiers_mask.T :
+            line_str = ""
+            for e in l :
+                if e :
+                    line_str += "S"
+                else :
+                    line_str += "o"
+            print("sans murs : ", line_str)
         
-        # Le reste du code reste inchangé:
+        """# Le reste du code reste inchangé:
         # 2. Définir la zone dangereuse (murs dilatés)
         struct = generate_binary_structure(2, 2) 
         dangerous_zone = binary_dilation(is_wall, 
                                         structure=struct, 
-                                        iterations=1)
+                                        iterations=3)
         
         # 3. Détecter les frontières brutes (Inconnu adjacent à Libre)
         dilated_free = binary_dilation(is_free, structure=struct, iterations=1)
-        raw_frontiers = is_unknown & dilated_free
+        raw_frontiers = is_unknown & dilated_free"""
         
         """print("raw_frontiers")
         for index_ligne, ligne in enumerate(raw_frontiers):
@@ -210,14 +263,14 @@ class MyDronePrototype(DroneAbstract):
                 if valeur:
                     print(f"[Ligne : {index_ligne}, Colonne : {index_colonne}]")"""
 
-        # 4. Filtrer les frontières par la zone dangereuse
-        safe_frontiers_mask = raw_frontiers & (~dangerous_zone)
+        """# 4. Filtrer les frontières par la zone dangereuse
+        safe_frontiers_mask = raw_frontiers & (~dangerous_zone)"""
 
-        print("safe_frontiers_mask")
+        #print("safe_frontiers_mask")
         for index_ligne, ligne in enumerate(safe_frontiers_mask):
             for index_colonne, valeur in enumerate(ligne):
                 if valeur:
-                    print(f"[Ligne : {index_ligne}, Colonne : {index_colonne}]")
+                    #print(f"[x : {index_ligne}, y : {index_colonne}]")
                     x_frontier_world, y_frontier_world = self.grid._conv_grid_to_world(index_ligne, index_colonne)
                     new_frontier = np.array([x_frontier_world, y_frontier_world])
                     frontiers.append(new_frontier)
@@ -235,12 +288,12 @@ class MyDronePrototype(DroneAbstract):
             #point_arcade = np.array([100.0, 100.0])
 
             radius = 10
-            red = (0,0,255)
+            blue = (0,0,255)
 
             arcade.draw_circle_filled(point_arcade[0],
                               point_arcade[1],
                               radius=radius,
-                              color=red)
+                              color=blue)
 
 
         self.display_pose()
