@@ -43,11 +43,30 @@ class MyDronePrototype(DroneAbstract):
         goal = tuple(map(int, goal))
 
         # Masque des murs
-        SEUIL_MUR = 10.0
+        SEUIL_MUR = 5.0
         is_wall = (grid >= SEUIL_MUR)
-        # Dilate les murs pour éviter les zones proches (moins de 4 pixels)
-        struct = np.ones((9, 9), dtype=bool)  # carré 9x9 ~ rayon 4
+        # Dilate les murs pour éviter les zones proches (moins de 2 pixels)
+        struct = np.ones((5, 5), dtype=bool)  # carré 5x5 ~ rayon 2
         danger_zone = binary_dilation(is_wall, structure=struct, iterations=1)
+        # Si le start ou le goal sont dans la danger_zone (par ex. drone collé au mur),
+        # on autorise une petite zone autour d'eux pour permettre à A* de s'extraire.
+        try:
+            radius_clear = 2
+            sy, sx = start
+            gy, gx = goal
+            y0 = max(0, sy - radius_clear)
+            y1 = min(grid.shape[0], sy + radius_clear + 1)
+            x0 = max(0, sx - radius_clear)
+            x1 = min(grid.shape[1], sx + radius_clear + 1)
+            danger_zone[y0:y1, x0:x1] = False
+            y0 = max(0, gy - radius_clear)
+            y1 = min(grid.shape[0], gy + radius_clear + 1)
+            x0 = max(0, gx - radius_clear)
+            x1 = min(grid.shape[1], gx + radius_clear + 1)
+            danger_zone[y0:y1, x0:x1] = False
+        except Exception:
+            # en cas de problème d'indices, on ignore et laisse danger_zone inchangé
+            pass
 
         def heuristic(a, b):
             return abs(a[0] - b[0]) + abs(a[1] - b[1])
@@ -63,14 +82,25 @@ class MyDronePrototype(DroneAbstract):
         while oheap:
             current = heapq.heappop(oheap)[1]
             if current == goal:
-                # Reconstruire le chemin
+                # Reconstruire le chemin (liste de tuples grille)
                 path = [current]
                 while current in came_from:
                     current = came_from[current]
                     path.append(current)
                 path.reverse()
-                # Conversion grille -> monde
-                return [np.array(self.grid._conv_grid_to_world(*pt)) for pt in path]
+                # Compresser le chemin: ne garder que les points où la direction change
+                if len(path) <= 2:
+                    compressed = path
+                else:
+                    compressed = [path[0]]
+                    for i in range(1, len(path) - 1):
+                        prev_v = (path[i][0] - path[i-1][0], path[i][1] - path[i-1][1])
+                        next_v = (path[i+1][0] - path[i][0], path[i+1][1] - path[i][1])
+                        if prev_v != next_v:
+                            compressed.append(path[i])
+                    compressed.append(path[-1])
+                # Conversion grille -> monde et retour
+                return [np.array(self.grid._conv_grid_to_world(*pt)) for pt in compressed]
             close_set.add(current)
             for dx, dy in neighbors:
                 neighbor = (current[0] + dx, current[1] + dy)
@@ -98,9 +128,6 @@ class MyDronePrototype(DroneAbstract):
         
         self.current_pose = np.array([0.0, 0.0, 0.0])
 
-        # Mission accomplie ?
-        self.mission_done = False
-
         self.iteration: int = 0
         resolution = 8
         self.grid = OccupancyGrid(size_area_world=self.size_area,
@@ -123,27 +150,13 @@ class MyDronePrototype(DroneAbstract):
         self.Kp = 3
         self.Kd = 2
 
-                # PID translation
+        # PID translation
         self.prev_diff_position = np.zeros(2)  # dérivée pour translation
         self.Kp_pos = 1.6
         self.Kd_pos = 11.0
+        # Pour le PID de vitesse
+        self.prev_speed_error = 0.0
 
-        
-        # --- CHEMIN CORRIGÉ (Waypoints pour suivre la ligne verte) ---
-        # NOTE: Ces points sont choisis pour simuler un chemin A* qui contourne les murs.
-        """self.path = [
-            # 1. Sortir de la zone de retour (en bas à droite)
-            np.array([300.0, -200.0]),
-            # 2. Descendre à droite
-            np.array([-50, -200.0]),
-            # 3. Contourner le mur central par le bas
-            np.array([-50,200]),
-            # 4. Monter (milieu de l'image)
-            np.array([-300, 200.0]),
-            # 5. Tourner à gauche (vers le couloir)
-            np.array([-300, -200]),
-            
-        ]"""
         self.path = []
         self.frontiers_world = []
         
@@ -171,6 +184,7 @@ class MyDronePrototype(DroneAbstract):
 
         lidar_data = self.lidar_values()
         if lidar_data is None:
+            print("lidar_data is None")
             return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0, "grasper": 0}
 
         # --- 2. STRATÉGIE (DÉSACTIVÉE) ---
@@ -192,10 +206,6 @@ class MyDronePrototype(DroneAbstract):
                 
                 # Le chemin devient ce point de frontière
                 self.path = self.creer_chemin(self.current_pose[:2], target_point)
-
-        # Si la mission est déjà terminée, le drone reste immobile
-        if self.mission_done:
-            return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0, "grasper": 0}
         
         # --- 3. ACTION (Le "Pilote") ---
         
@@ -204,6 +214,7 @@ class MyDronePrototype(DroneAbstract):
             command = self.follow_path(lidar_data)
         else:
             # Si le chemin est terminé, on s'arrête
+            print("Exploration terminée ou pas de frontieres sûres trouvées.")
             command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
 
         command["grasper"] = 0
@@ -230,7 +241,7 @@ class MyDronePrototype(DroneAbstract):
         # Si grid.grid est initialisée à 0.0:
         
         SEUIL_FREE = -10.0
-        SEUIL_MUR = 10.0        
+        SEUIL_MUR = 5.0        
         
         frontiers_world_temp = []
         frontiers = []
@@ -299,26 +310,6 @@ class MyDronePrototype(DroneAbstract):
                 else :
                     line_str += "o"
             print("sans murs : ", line_str)
-        
-        """# Le reste du code reste inchangé:
-        # 2. Définir la zone dangereuse (murs dilatés)
-        struct = generate_binary_structure(2, 2) 
-        dangerous_zone = binary_dilation(is_wall, 
-                                        structure=struct, 
-                                        iterations=3)
-        
-        # 3. Détecter les frontières brutes (Inconnu adjacent à Libre)
-        dilated_free = binary_dilation(is_free, structure=struct, iterations=1)
-        raw_frontiers = is_unknown & dilated_free"""
-        
-        """print("raw_frontiers")
-        for index_ligne, ligne in enumerate(raw_frontiers):
-            for index_colonne, valeur in enumerate(ligne):
-                if valeur:
-                    print(f"[Ligne : {index_ligne}, Colonne : {index_colonne}]")"""
-
-        """# 4. Filtrer les frontières par la zone dangereuse
-        safe_frontiers_mask = raw_frontiers & (~dangerous_zone)"""
 
         #print("safe_frontiers_mask")
         for index_ligne, ligne in enumerate(safe_frontiers_mask):
@@ -359,54 +350,53 @@ class MyDronePrototype(DroneAbstract):
     # --------------------------------------------------------------------------
  
     def follow_path(self, lidar_data) -> CommandsDict:
-        #print("following_path")
         if not self.path:
+            print("No path to follow.")
             return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
-
         target_pos = self.path[0]
         delta_pos = target_pos - self.current_pose[:2]
         target_angle = math.atan2(delta_pos[1], delta_pos[0])
 
-        # --- PID sur la rotation ---
+        # --- PID sur la rotation (inchangé) ---
         angle_error = normalize_angle(target_angle - self.current_pose[2])
         deriv_error = angle_error - self.prev_angle_error
         rotation_speed = self.Kp * angle_error + self.Kd * deriv_error
-        rotation_speed = np.clip(rotation_speed, -1.0, 1.0)
+        rotation_speed = float(np.clip(rotation_speed, -1.0, 1.0))
         self.prev_angle_error = angle_error
 
         distance_to_target = np.linalg.norm(delta_pos)
 
-        # --- Gestion de la vitesse ---
-        if angle_error > 0.1 or angle_error < -0.1 : # Si on est en train de tourner, alors on met forward_speed à 0         
-            forward_speed = 0
-            #print("on tourne")
+        # --- Profil de vitesse souhaitée ---
+        max_speed = 6.0
+        # profil proportionnel à la distance, plus fin près du but
+        target_speed = max(0.0, min(max_speed, distance_to_target * 0.1 + 0.3))
 
-        else :
-            target_speed = min(6.0, distance_to_target*0.05 - 0.03)
-            measured_speed = math.sqrt(self.measured_velocity()[0]**2 + self.measured_velocity()[1]**2)
+        measured_vel = self.measured_velocity()
+        measured_speed = math.sqrt(measured_vel[0] ** 2 + measured_vel[1] ** 2)
 
-            if measured_speed > target_speed :
-                forward_speed = -1 # On ralentit
-            elif measured_speed < target_speed :
-                forward_speed = 1 # On accélère
-            else :
-                forward_speed = 0 # On garde la même vitesse
-            
-            #print("target speed : ", target_speed)
-            #print("measured speed : ", measured_speed)
+        # --- PID sur la vitesse (Kp_pos, Kd_pos) ---
+        # erreur = consigne - mesuré
+        speed_error = target_speed - measured_speed
+        deriv_speed = speed_error - self.prev_speed_error
+        # commande continue - peut être négative si il faut freiner
+        forward_cmd = self.Kp_pos * speed_error + self.Kd_pos * deriv_speed
+        # si on est en train de fortement tourner, ne pas avancer
+        if abs(angle_error) > 0.2:
+            forward_cmd = 0.0
+        # normaliser la commande dans [-1, 1]
+        forward_cmd = float(np.clip(forward_cmd, -1.0, 1.0))
+        self.prev_speed_error = speed_error
 
         # Si proche du waypoint → passer au suivant
-        if distance_to_target < 50:
+        if distance_to_target < 20:
+            # on arrête le mouvement frontal pour éviter dépassement
+            forward_cmd = 0.0
             self.path.pop(0)
 
         # Si proche du but final
         dist_to_goal = np.linalg.norm(self.goal_position - self.current_pose[:2])
-        """if dist_to_goal < 50:
-            print("✅ Mission terminée : le drone est arrivé au but.")
-            #self.mission_done = True
-            #return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}"""
 
-        return {"forward": forward_speed, "lateral": 0.0, "rotation": rotation_speed}
+        return {"forward": forward_cmd, "lateral": 0.0, "rotation": rotation_speed}
 
     def display_pose(self) :
         radius = 10
