@@ -188,22 +188,23 @@ class MyDronePrototype(DroneAbstract):
             return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0, "grasper": 0}
 
         # --- 2. STRATÉGIE (DÉSACTIVÉE) ---
-        # Replanification si le chemin est vide ou si le waypoint est atteint
+        # Replanification si le chemin est vide, si le waypoint est atteint, ou tous les 10 itérations
+        need_replan = False
         if not self.path or len(self.path) < 1:
-            
+            need_replan = True
+        # Met à jour le chemin tous les 10 itérations (si cible existante)
+        if self.path and hasattr(self, 'target_point') and self.iteration % 10 == 0:
+            need_replan = True
+
+        if need_replan:
             self.frontiers_world = self.find_safe_frontier_points() # Met à jour la liste des frontières
-            print("frontieres : ",self.frontiers_world)
+            #print("frontieres : ",self.frontiers_world)
             if self.frontiers_world:
                 # Scoring simplifié : choisir le point de frontière le plus proche
-                
-                # Calculer la distance de chaque frontière au drone
                 distances = [np.linalg.norm(f - self.current_pose[:2]) for f in self.frontiers_world]
-                
-                # Trouver l'indice de la frontière la plus proche
                 closest_index = np.argmin(distances)
-                
                 target_point = self.frontiers_world[closest_index]
-                
+                self.target_point = target_point
                 # Le chemin devient ce point de frontière
                 self.path = self.creer_chemin(self.current_pose[:2], target_point)
         
@@ -255,7 +256,7 @@ class MyDronePrototype(DroneAbstract):
         # is_wall: Les cellules où la probabilité d'occupation est élevée
         is_wall = (grid_map >= SEUIL_MUR)  
         
-        for l in grid_map.T :
+        """for l in grid_map.T :
             line_str = ""
             for e in l :
                 if e <= SEUIL_FREE :
@@ -264,7 +265,7 @@ class MyDronePrototype(DroneAbstract):
                     line_str += "I"
                 else :
                     line_str += "o"
-            print("map : ", line_str)
+            print("map : ", line_str)"""
         #print("w :", is_wall)                                          
         
         # is_free: Les cellules qui ont été balayées et ne sont pas des murs (0.0 < valeur < 0.6)
@@ -292,7 +293,7 @@ class MyDronePrototype(DroneAbstract):
                     line_str += "S"
                 else :
                     line_str += "o"
-            print("frontières : ", line_str)
+            #print("frontières : ", line_str)
 
         # Structure 8-connectée pour la dilatation
         struct = np.ones((5, 5), dtype=bool)
@@ -309,17 +310,38 @@ class MyDronePrototype(DroneAbstract):
                     line_str += "S"
                 else :
                     line_str += "o"
-            print("sans murs : ", line_str)
+            #print("sans murs : ", line_str)
 
-        #print("safe_frontiers_mask")
-        for index_ligne, ligne in enumerate(safe_frontiers_mask):
-            for index_colonne, valeur in enumerate(ligne):
-                if valeur:
-                    #print(f"[x : {index_ligne}, y : {index_colonne}]")
-                    x_frontier_world, y_frontier_world = self.grid._conv_grid_to_world(index_ligne, index_colonne)
-                    new_frontier = np.array([x_frontier_world, y_frontier_world])
-                    frontiers.append(new_frontier)
-                 
+        # Regrouper les cellules frontier contiguës en composants connexes (voisinage 4)
+        # et retourner le barycentre (en coordonnées monde) de chaque composant.
+        # safe_frontiers_mask est un tableau booléen de forme (nx, ny)
+        structure = generate_binary_structure(2, 2)  # 8-connectivité
+        labeled, num_features = ndimage.label(safe_frontiers_mask, structure=structure)
+
+        self.frontier_clusters = []
+        min_cluster_size = 4
+        for label_idx in range(1, num_features + 1):
+            ys, xs = np.where(labeled == label_idx)
+            size = ys.size
+            if size == 0:
+                continue
+            if size < min_cluster_size:
+                continue
+            # barycentre en indices grille (float)
+            mean_x = float(np.mean(ys))
+            mean_y = float(np.mean(xs))
+            # conversion grille -> monde (barycentre)
+            x_world, y_world = self.grid._conv_grid_to_world(mean_x, mean_y)
+            # conversion des cellules du cluster en coordonnées monde
+            x_cells_world, y_cells_world = self.grid._conv_grid_to_world(ys, xs)
+            cells_world = np.vstack((x_cells_world, y_cells_world)).T
+            frontiers.append(np.array([x_world, y_world]))
+            self.frontier_clusters.append({
+                "cells_world": cells_world,
+                "barycenter": np.array([x_world, y_world]),
+                "size": int(size)
+            })
+
         return frontiers
 
     # --------------------------------------------------------------------------
@@ -328,6 +350,25 @@ class MyDronePrototype(DroneAbstract):
     
     def draw_bottom_layer(self):
         """ Dessine le chemin calculé (tous les points) """
+        # --- DEBUG VISUALISATION DES FRONTIERES (START) ---
+        # Ces lignes de dessin servent uniquement à visualiser les clusters
+        # de frontières et leurs barycentres. Elles sont clairement marquées
+        # pour pouvoir être retirées facilement.
+        if hasattr(self, 'frontier_clusters') and self.frontier_clusters:
+            # dessin des cellules de chaque cluster (petits points rouges)
+            for cluster in self.frontier_clusters:
+                cells = cluster.get('cells_world')
+                if cells is None or len(cells) == 0:
+                    continue
+                for c in cells:
+                    pt = c + self._half_size_array
+                    arcade.draw_circle_filled(pt[0], pt[1], radius=3, color=(255,0,0))
+                # barycentre (jaune)
+                bc = cluster.get('barycenter')
+                ptb = bc + self._half_size_array
+                arcade.draw_circle_filled(ptb[0], ptb[1], radius=6, color=(255,255,0))
+        # --- DEBUG VISUALISATION DES FRONTIERES (END) ---
+
         if self.path and len(self.path) > 0:
             radius = 7
             blue = (0,0,255)
@@ -366,10 +407,11 @@ class MyDronePrototype(DroneAbstract):
 
         distance_to_target = np.linalg.norm(delta_pos)
 
-        # --- Profil de vitesse souhaitée ---
-        max_speed = 6.0
-        # profil proportionnel à la distance, plus fin près du but
-        target_speed = max(0.0, min(max_speed, distance_to_target * 0.1 + 0.3))
+        # --- Profil de vitesse souhaitée (tunable) ---
+        # Augmenter max_speed pour rendre le drone plus rapide
+        max_speed = 10.0
+        # profil proportionnel à la distance, coef augmenté pour plus de vitesse
+        target_speed = max(0.0, min(max_speed, distance_to_target * 0.12 + 0.3))
 
         measured_vel = self.measured_velocity()
         measured_speed = math.sqrt(measured_vel[0] ** 2 + measured_vel[1] ** 2)
@@ -388,8 +430,10 @@ class MyDronePrototype(DroneAbstract):
         self.prev_speed_error = speed_error
 
         # Si proche du waypoint → passer au suivant
-        if distance_to_target < 20:
-            # on arrête le mouvement frontal pour éviter dépassement
+        # Si proche du waypoint → passer au suivant
+        # seuil réduit pour permettre d'atteindre les waypoints plus précisément
+        if distance_to_target < 30:
+        # on arrête le mouvement frontal pour éviter dépassement
             forward_cmd = 0.0
             self.path.pop(0)
 
