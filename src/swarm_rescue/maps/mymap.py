@@ -24,7 +24,7 @@ from swarm_rescue.simulation.utils.misc_data import MiscData
 from swarm_rescue.maps.walls_medium_01 import add_walls, add_boxes
 
 
-class MapMedium01(MapAbstract):
+class MyMap(MapAbstract):
 
     def __init__(self, drone_type: Type[DroneAbstract], zones_config: ZonesConfig = ()):
         super().__init__(drone_type, zones_config)
@@ -43,8 +43,10 @@ class MapMedium01(MapAbstract):
         self._no_com_zone = NoComZone(size=(402, 742))
         self._no_com_zone_pos = ((-328, 72), 0)
 
+
         self._no_gps_zone = NoGpsZone(size=(574, 393))
         self._no_gps_zone_pos = ((-538, 42), 0)
+
 
         self._kill_zone = KillZone(size=(89, 77))
         self._kill_zone_pos = ((-576, 112), 0)
@@ -81,6 +83,7 @@ class MapMedium01(MapAbstract):
 
         self._playground.add(self._return_area, self._return_area_pos)
         self._playground.add(self._rescue_center, self._rescue_center_pos)
+        self._playground.add(self._no_gps_zone, self._no_gps_zone_pos )
 
         add_walls(self._playground)
         add_boxes(self._playground)
@@ -116,7 +119,7 @@ class MapMedium01(MapAbstract):
 
 
 if __name__ == '__main__':
-    the_map = MapMedium01(drone_type=DroneMotionless)
+    the_map = MyMap(drone_type=DroneMotionless)
 
     gui = GuiSR(the_map=the_map,
                 use_mouse_measure=True,
