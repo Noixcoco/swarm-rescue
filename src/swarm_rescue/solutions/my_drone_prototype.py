@@ -1,27 +1,15 @@
 import math
 import numpy as np
-from scipy.ndimage import binary_dilation
+from scipy.ndimage import binary_dilation, generate_binary_structure
+from scipy import ndimage
 from swarm_rescue.simulation.drone.drone_abstract import DroneAbstract
 from swarm_rescue.simulation.utils.utils import normalize_angle
 from swarm_rescue.simulation.drone.controller import CommandsDict
-from typing import Tuple, Dict, Any
-
-# Requis pour la cartographie et le dessin
-from skimage.draw import line as draw_line
-from scipy.ndimage import generate_binary_structure, binary_dilation
-from scipy import ndimage 
-import cv2
 import arcade
-# A* n'est pas utilisé dans ce test, mais il est dans le chemin
-try:
-    from . import a_star
-except ImportError:
-    pass
-
 import sys
 from pathlib import Path
 
-# Ajoute le chemin du dossier parent au sys.path
+# Ensure examples can be imported when running from the repository root
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent.parent))
 from examples.example_mapping import OccupancyGrid
 from swarm_rescue.simulation.utils.pose import Pose
@@ -69,9 +57,12 @@ class MyDronePrototype(DroneAbstract):
             pass
 
         def heuristic(a, b):
-            return abs(a[0] - b[0]) + abs(a[1] - b[1])
+            # Euclidean distance as an admissible heuristic for 8-connected grid
+            return math.hypot(a[0] - b[0], a[1] - b[1])
 
-        neighbors = [(-1,0),(1,0),(0,-1),(0,1)]  # 4-connecté
+        # Allow 8-connected moves (including diagonals)
+        neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1),
+                     (-1, -1), (-1, 1), (1, -1), (1, 1)]
 
         close_set = set()
         came_from = {}
@@ -104,25 +95,39 @@ class MyDronePrototype(DroneAbstract):
             close_set.add(current)
             for dx, dy in neighbors:
                 neighbor = (current[0] + dx, current[1] + dy)
-                if (0 <= neighbor[0] < grid.shape[0] and 0 <= neighbor[1] < grid.shape[1]):
-                    if danger_zone[neighbor]:
-                        continue
-                    tentative_g_score = gscore[current] + 1
-                    if neighbor in close_set and tentative_g_score >= gscore.get(neighbor, float('inf')):
-                        continue
-                    if tentative_g_score < gscore.get(neighbor, float('inf')):
-                        came_from[neighbor] = current
-                        gscore[neighbor] = tentative_g_score
-                        fscore[neighbor] = tentative_g_score + heuristic(neighbor, goal)
-                        heapq.heappush(oheap, (fscore[neighbor], neighbor))
+                # bounds check
+                if not (0 <= neighbor[0] < grid.shape[0] and 0 <= neighbor[1] < grid.shape[1]):
+                    continue
+
+                # don't enter danger zone
+                if danger_zone[neighbor]:
+                    continue
+
+                # Prevent corner-cutting: if moving diagonally, ensure adjacent orthogonal
+                # cells are not blocked (i.e. allow diagonal only if there's space)
+                if abs(dx) == 1 and abs(dy) == 1:
+                    neigh1 = (current[0] + dx, current[1])
+                    neigh2 = (current[0], current[1] + dy)
+                    if (0 <= neigh1[0] < grid.shape[0] and 0 <= neigh1[1] < grid.shape[1]):
+                        if danger_zone[neigh1]:
+                            continue
+                    if (0 <= neigh2[0] < grid.shape[0] and 0 <= neigh2[1] < grid.shape[1]):
+                        if danger_zone[neigh2]:
+                            continue
+
+                # movement cost: diagonal sqrt(2), straight 1
+                move_cost = math.hypot(dx, dy)
+                tentative_g_score = gscore[current] + move_cost
+
+                if neighbor in close_set and tentative_g_score >= gscore.get(neighbor, float('inf')):
+                    continue
+                if tentative_g_score < gscore.get(neighbor, float('inf')):
+                    came_from[neighbor] = current
+                    gscore[neighbor] = tentative_g_score
+                    fscore[neighbor] = tentative_g_score + heuristic(neighbor, goal)
+                    heapq.heappush(oheap, (fscore[neighbor], neighbor))
         # Pas de chemin trouvé
         return []
-    """
-    HARNAIS DE TEST (V-Test) - CHEMIN CORRIGÉ
-    Objectif : Tester UNIQUEMENT le pilotage (la fonction 'follow_path').
-    Le chemin est codé en dur pour suivre la ligne verte.
-    """
-    
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         
@@ -159,8 +164,6 @@ class MyDronePrototype(DroneAbstract):
 
         self.path = []
         self.frontiers_world = []
-        
-        # self.state est inutile dans ce test
 
     def define_message_for_all(self) -> None:
         pass 
@@ -184,7 +187,6 @@ class MyDronePrototype(DroneAbstract):
 
         lidar_data = self.lidar_values()
         if lidar_data is None:
-            print("lidar_data is None")
             return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0, "grasper": 0}
 
         # --- 2. STRATÉGIE (DÉSACTIVÉE) ---
@@ -256,17 +258,7 @@ class MyDronePrototype(DroneAbstract):
         # is_wall: Les cellules où la probabilité d'occupation est élevée
         is_wall = (grid_map >= SEUIL_MUR)  
         
-        """for l in grid_map.T :
-            line_str = ""
-            for e in l :
-                if e <= SEUIL_FREE :
-                    line_str += "x"
-                elif e >= SEUIL_MUR :
-                    line_str += "I"
-                else :
-                    line_str += "o"
-            print("map : ", line_str)"""
-        #print("w :", is_wall)                                          
+        # (grid diagnostics removed)
         
         # is_free: Les cellules qui ont été balayées et ne sont pas des murs (0.0 < valeur < 0.6)
         is_free = (grid_map < SEUIL_FREE) 
@@ -286,14 +278,7 @@ class MyDronePrototype(DroneAbstract):
         unknown_neighbors = binary_dilation(is_unknown, structure=structure)
         frontier_mask = is_free & unknown_neighbors
 
-        for l in frontier_mask.T :
-            line_str = ""
-            for e in l :
-                if e :
-                    line_str += "S"
-                else :
-                    line_str += "o"
-            #print("frontières : ", line_str)
+        # frontier mask computed
 
         # Structure 8-connectée pour la dilatation
         struct = np.ones((5, 5), dtype=bool)
@@ -303,14 +288,7 @@ class MyDronePrototype(DroneAbstract):
         frontier_mask = frontier_mask & (~danger_zone)
         safe_frontiers_mask = frontier_mask
 
-        for l in safe_frontiers_mask.T :
-            line_str = ""
-            for e in l :
-                if e :
-                    line_str += "S"
-                else :
-                    line_str += "o"
-            #print("sans murs : ", line_str)
+        # safe_frontiers_mask ready
 
         # Regrouper les cellules frontier contiguës en composants connexes (voisinage 4)
         # et retourner le barycentre (en coordonnées monde) de chaque composant.
@@ -429,9 +407,7 @@ class MyDronePrototype(DroneAbstract):
         forward_cmd = float(np.clip(forward_cmd, -1.0, 1.0))
         self.prev_speed_error = speed_error
 
-        # Si proche du waypoint → passer au suivant
-        # Si proche du waypoint → passer au suivant
-        # seuil réduit pour permettre d'atteindre les waypoints plus précisément
+        # Si proche du waypoint → passer au suivant (seuil réduit pour précision)
         if distance_to_target < 30:
         # on arrête le mouvement frontal pour éviter dépassement
             forward_cmd = 0.0
