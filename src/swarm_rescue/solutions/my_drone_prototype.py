@@ -1,5 +1,7 @@
 import math
 import numpy as np
+# ... (rest of the original imports)
+from scipy.ndimage import binary_dilation
 from swarm_rescue.simulation.drone.drone_abstract import DroneAbstract
 from swarm_rescue.simulation.utils.utils import normalize_angle
 from swarm_rescue.simulation.drone.controller import CommandsDict
@@ -7,6 +9,7 @@ from typing import Tuple, Dict, Any
 
 # Requis pour la cartographie et le dessin
 from skimage.draw import line as draw_line
+from scipy.ndimage import generate_binary_structure, binary_dilation
 from scipy import ndimage 
 import cv2
 import arcade
@@ -16,8 +19,107 @@ try:
 except ImportError:
     pass
 
+import sys
+from pathlib import Path
+
+# Ajoute le chemin du dossier parent au sys.path
+sys.path.append(str(Path(__file__).resolve().parent.parent.parent.parent))
+from examples.example_mapping import OccupancyGrid
+from swarm_rescue.simulation.utils.pose import Pose
+
 
 class MyDronePrototype(DroneAbstract):
+    # ... (Keep creer_chemin as is)
+    def creer_chemin(self, start_world, goal_world):
+        """
+        Calcule un chemin entre start_world et goal_world en évitant les murs et les zones proches des murs (moins de 4 pixels) avec A*.
+        Retourne une liste de points (en coordonnées monde).
+        """
+        import heapq
+        from scipy.ndimage import binary_dilation
+        grid = self.grid.grid
+        # Conversion monde -> grille
+        start = self.grid._conv_world_to_grid(*start_world)
+        goal = self.grid._conv_world_to_grid(*goal_world)
+        start = tuple(map(int, start))
+        goal = tuple(map(int, goal))
+
+        # Masque des murs
+        SEUIL_MUR = 5.0
+        is_wall = (grid >= SEUIL_MUR)
+        # Dilate les murs pour éviter les zones proches (moins de 2 pixels)
+        struct = np.ones((5, 5), dtype=bool)  # carré 5x5 ~ rayon 2
+        danger_zone = binary_dilation(is_wall, structure=struct, iterations=1)
+        # Si le start ou le goal sont dans la danger_zone (par ex. drone collé au mur),
+        # on autorise une petite zone autour d'eux pour permettre à A* de s'extraire.
+        try:
+            radius_clear = 2
+            sy, sx = start
+            gy, gx = goal
+            y0 = max(0, sy - radius_clear)
+            y1 = min(grid.shape[0], sy + radius_clear + 1)
+            x0 = max(0, sx - radius_clear)
+            x1 = min(grid.shape[1], sx + radius_clear + 1)
+            danger_zone[y0:y1, x0:x1] = False
+            y0 = max(0, gy - radius_clear)
+            y1 = min(grid.shape[0], gy + radius_clear + 1)
+            x0 = max(0, gx - radius_clear)
+            x1 = min(grid.shape[1], gx + radius_clear + 1)
+            danger_zone[y0:y1, x0:x1] = False
+        except Exception:
+            # en cas de problème d'indices, on ignore et laisse danger_zone inchangé
+            pass
+
+        def heuristic(a, b):
+            return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+        neighbors = [(-1,0),(1,0),(0,-1),(0,1)]  # 4-connecté
+
+        close_set = set()
+        came_from = {}
+        gscore = {start: 0}
+        fscore = {start: heuristic(start, goal)}
+        oheap = [(fscore[start], start)]
+
+        while oheap:
+            current = heapq.heappop(oheap)[1]
+            if current == goal:
+                # Reconstruire le chemin (liste de tuples grille)
+                path = [current]
+                while current in came_from:
+                    current = came_from[current]
+                    path.append(current)
+                path.reverse()
+                # Compresser le chemin: ne garder que les points où la direction change
+                if len(path) <= 2:
+                    compressed = path
+                else:
+                    compressed = [path[0]]
+                    for i in range(1, len(path) - 1):
+                        prev_v = (path[i][0] - path[i-1][0], path[i][1] - path[i-1][1])
+                        next_v = (path[i+1][0] - path[i][0], path[i+1][1] - path[i][1])
+                        if prev_v != next_v:
+                            compressed.append(path[i])
+                    compressed.append(path[-1])
+                # Conversion grille -> monde et retour
+                return [np.array(self.grid._conv_grid_to_world(*pt)) for pt in compressed]
+            close_set.add(current)
+            for dx, dy in neighbors:
+                neighbor = (current[0] + dx, current[1] + dy)
+                if (0 <= neighbor[0] < grid.shape[0] and 0 <= neighbor[1] < grid.shape[1]):
+                    if danger_zone[neighbor]:
+                        continue
+                    tentative_g_score = gscore[current] + 1
+                    if neighbor in close_set and tentative_g_score >= gscore.get(neighbor, float('inf')):
+                        continue
+                    if tentative_g_score < gscore.get(neighbor, float('inf')):
+                        came_from[neighbor] = current
+                        gscore[neighbor] = tentative_g_score
+                        fscore[neighbor] = tentative_g_score + heuristic(neighbor, goal)
+                        heapq.heappush(oheap, (fscore[neighbor], neighbor))
+        # Pas de chemin trouvé
+        return []
+
     """
     HARNAIS DE TEST (V-Test) - CHEMIN CORRIGÉ
     Objectif : Tester UNIQUEMENT le pilotage (la fonction 'follow_path').
@@ -27,22 +129,20 @@ class MyDronePrototype(DroneAbstract):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         
-        self.current_pose = np.array([0.0, 0.0, 0.0])
+        # Le drone doit utiliser self.current_pose pour le pilotage (follow_path)
+        # Mais pour le KF, on utilise un état à 3 dimensions (x, y, theta)
+        self.current_pose = np.array([0.0, 0.0, 0.0]) # [x, y, theta]
 
-        # Mission accomplie ?
-        self.mission_done = False
-
-        # --- Configuration de la Carte (Binaire) ---
-        self.map_size_pixels = 1000 
-        self.map_resolution = 5 
-        self.grid_size = self.map_size_pixels // self.map_resolution
-        self.map_max_index = self.grid_size - 1 
-        self.occupancy_grid = np.zeros((self.grid_size, self.grid_size), dtype=np.int8) 
-        self.map_origin_offset = np.array([self.grid_size // 2, self.grid_size // 2]) 
+        self.iteration: int = 0
+        resolution = 8
+        self.grid = OccupancyGrid(size_area_world=self.size_area,
+                                     resolution=resolution,
+                                     lidar=self.lidar())
         
         # --- Sécurité et Inflation ---
         self.robot_radius_pixels = 30 
-        self.inflation_radius_cells = int(self.robot_radius_pixels / self.map_resolution)
+        # Le rayon d'inflation utilise maintenant la résolution de self.grid
+        self.inflation_radius_cells = int(self.robot_radius_pixels / self.grid.resolution)
         if self.inflation_radius_cells < 1:
             self.inflation_radius_cells = 1
         
@@ -50,36 +150,43 @@ class MyDronePrototype(DroneAbstract):
         self.goal_position = np.array([-300.0, -200.0])
 
         # parametre PID rotation
-
         self.prev_angle_error = 0.0
         self.Kp = 3
         self.Kd = 2
 
-                # PID translation
+        # PID translation
         self.prev_diff_position = np.zeros(2)  # dérivée pour translation
         self.Kp_pos = 1.6
         self.Kd_pos = 11.0
+        # Pour le PID de vitesse
+        self.prev_speed_error = 0.0
 
+        self.path = []
+        self.frontiers_world = []
         
-        # --- CHEMIN CORRIGÉ (Waypoints pour suivre la ligne verte) ---
-        # NOTE: Ces points sont choisis pour simuler un chemin A* qui contourne les murs.
-        self.path = [
-            # 1. Sortir de la zone de retour (en bas à droite)
-            np.array([300.0, -200.0]),
-            # 2. Descendre à droite
-            np.array([-50, -200.0]),
-            # 3. Contourner le mur central par le bas
-            np.array([-50,200]),
-            # 4. Monter (milieu de l'image)
-            np.array([-300, 200.0]),
-            # 5. Tourner à gauche (vers le couloir)
-            np.array([-300, -200]),
-            
-        ]
+        # ----------------------------------------------------------------------
+        # --- INITIALISATION DU FILTRE DE KALMAN (EKF dans ce cas simple) ---
+        # ----------------------------------------------------------------------
+        # État initial: [x, y, theta]^T
+        self.state_estimate = np.array([[0.0], [0.0], [0.0]]) 
         
+        # Covariance de l'état (P). Grandes valeurs initiales pour l'incertitude.
+        self.P = np.diag([10.0, 10.0, 10.0])
+        
+        # Covariance du bruit du processus (Q). Petite incertitude pour le modèle de mouvement (odométrie).
+        # Q = np.diag([var_x, var_y, var_theta])
+        self.Q = np.diag([0.01**2, 0.01**2, np.deg2rad(0.5)**2]) 
+        
+        # Covariance du bruit de mesure (R). Incertitude des capteurs (GPS/Compass).
+        # GPS est généralement plus précis en position que l'odométrie à long terme.
+        # Compass est une mesure directe de theta.
+        # R = np.diag([var_gps_x, var_gps_y, var_compass_theta])
+        self.R = np.diag([0.5**2, 0.5**2, np.deg2rad(1.0)**2])
+        
+        # Variable pour stocker la pose odométrique précédente
+        # Utilisé pour calculer le déplacement du drone pour le modèle de mouvement
+        self.prev_odom_pose = np.array([0.0, 0.0, 0.0])
 
-        
-        # self.state est inutile dans ce test
 
     def define_message_for_all(self) -> None:
         pass 
@@ -88,36 +195,46 @@ class MyDronePrototype(DroneAbstract):
         """
         Cerveau : Logique de test simplifiée.
         """
+
+        # increment the iteration counter
+        self.iteration += 1
         
         # --- 1. PERCEPTION ---
-        self.update_pose()
-        self.update_map()
-        self._display_map() 
+        self.update_pose() # *** Mise à jour via le KF ***
         
+        # Mise à jour de la grille probabiliste self.grid.grid (utilisée pour l'exploration)
+        # On utilise l'état estimé par le KF
+        self.estimated_pose = Pose(np.asarray([self.state_estimate[0,0], self.state_estimate[1,0]]),
+                                   self.state_estimate[2,0])
+        self.grid.update_grid(pose=self.estimated_pose) # Mise à jour de la carte utilisée!
+
         lidar_data = self.lidar_values()
         if lidar_data is None:
+            print("lidar_data is None")
             return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0, "grasper": 0}
 
         # --- 2. STRATÉGIE (DÉSACTIVÉE) ---
-        # Toute la logique FBE et A* est désactivée.
+        # Replanification si le chemin est vide, si le waypoint est atteint, ou tous les 10 itérations
+        need_replan = False
+        if not self.path or len(self.path) < 1:
+            need_replan = True
+        # Met à jour le chemin tous les 10 itérations (si cible existante)
+        # Note: self.current_pose est maintenant mise à jour à partir du KF
+        if self.path and hasattr(self, 'target_point') and self.iteration % 10 == 0:
+            need_replan = True
 
-
-        
-        # Si le chemin n'a jamais été initialisé
-        if not self.path and len(self.path) == 0:
-            # Recharger le chemin si le test est fini (pour relancer le test)
-            self.path = [
-                np.array([400.0, -200.0]),
-                np.array([400.0, -300.0]),
-                np.array([100.0, -300.0]),
-                np.array([100.0, 300.0]),
-                np.array([-300.0, 300.0]),
-                np.array([-400.0, -300.0])
-            ]
-            
-        # Si la mission est déjà terminée, le drone reste immobile
-        if self.mission_done:
-            return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0, "grasper": 0}
+        if need_replan:
+            self.frontiers_world = self.find_safe_frontier_points() # Met à jour la liste des frontières
+            #print("frontieres : ",self.frontiers_world)
+            if self.frontiers_world:
+                # Scoring simplifié : choisir le point de frontière le plus proche
+                # Utiliser la pose estimée pour le calcul de distance
+                distances = [np.linalg.norm(f - self.estimated_pose.position) for f in self.frontiers_world]
+                closest_index = np.argmin(distances)
+                target_point = self.frontiers_world[closest_index]
+                self.target_point = target_point
+                # Le chemin devient ce point de frontière
+                self.path = self.creer_chemin(self.estimated_pose.position, target_point)
         
         # --- 3. ACTION (Le "Pilote") ---
         
@@ -126,195 +243,338 @@ class MyDronePrototype(DroneAbstract):
             command = self.follow_path(lidar_data)
         else:
             # Si le chemin est terminé, on s'arrête
+            print("Exploration terminée ou pas de frontieres sûres trouvées.")
             command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
 
         command["grasper"] = 0
+
+        if self.iteration % 5 == 0:
+            self.grid.display(self.grid.grid,
+                                 self.estimated_pose,
+                                 title="occupancy grid")
+            self.grid.display(self.grid.zoomed_grid,
+                                 self.estimated_pose,
+                                 title="zoomed occupancy grid")
+
         return command
 
-        if self.current_pose is None or np.any(np.isnan(self.current_pose)):
-            print("⚠️ Pose non initialisée, attente de données LIDAR...")
-        return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0, "grasper": 0}
+    # ... (Keep find_safe_frontier_points, draw_bottom_layer, follow_path, display_pose as is,
+    # but ensure follow_path uses self.current_pose which is updated by KF)
+    # --------------------------------------------------------------------------
+    # FONCTION DE DÉTECTION DES FRONTIÈRES SÛRES (Mise à jour pour self.frontiers_world)
+    # --------------------------------------------------------------------------
+
+    def find_safe_frontier_points(self) -> list:
+        
+        grid_map = self.grid.grid 
+        
+        # --- NOUVEAUX SEUILS ADAPTÉS À L'INITIALISATION À ZÉRO ---
+        # Si grid.grid est initialisée à 0.0:
+        
+        SEUIL_FREE = -10.0
+        SEUIL_MUR = 5.0        
+        
+        frontiers_world_temp = []
+        frontiers = []
+
+        # 1. Identifier les masques
+        # is_unknown: Les cellules dont la valeur est très proche de zéro (état initial)
+        #is_unknown = (grid_map < SEUIL_MUR) & (grid_map > SEUIL_FREE)
+        is_unknown = (grid_map <= 10) & (grid_map >= -10)
+        #print("u :", is_unknown)
+        
+        # is_wall: Les cellules où la probabilité d'occupation est élevée
+        is_wall = (grid_map >= SEUIL_MUR)  
+        
+        """for l in grid_map.T :
+            line_str = ""
+            for e in l :
+                if e <= SEUIL_FREE :
+                    line_str += "x"
+                elif e >= SEUIL_MUR :
+                    line_str += "I"
+                else :
+                    line_str += "o"
+            print("map : ", line_str)"""
+        #print("w :", is_wall)                      
+        
+        # is_free: Les cellules qui ont été balayées et ne sont pas des murs (0.0 < valeur < 0.6)
+        is_free = (grid_map < SEUIL_FREE) 
+        #print("f :", is_free) 
+
+        # ---------------------------------------------------------
+        # ÉTAPE A : DÉTECTION DES FRONTIÈRES BRUTES (Voisinage 4)
+        # ---------------------------------------------------------
+        frontier_mask = np.zeros_like(is_free, dtype=bool)
+
+        # connectivity structure
+        structure = np.array([[0,1,0],
+                              [1,1,1],
+                              [0,1,0]], dtype=bool)
+
+        # Dilate is_unknown to mark neighbors
+        unknown_neighbors = binary_dilation(is_unknown, structure=structure)
+        frontier_mask = is_free & unknown_neighbors
+
+        for l in frontier_mask.T :
+            line_str = ""
+            for e in l :
+                if e :
+                    line_str += "S"
+                else :
+                    line_str += "o"
+            #print("frontières : ", line_str)
+
+        # Structure 8-connectée pour la dilatation
+        struct = np.ones((5, 5), dtype=bool)
+        # Dilate is_wall by 2 pixels
+        danger_zone = binary_dilation(is_wall, structure=struct, iterations=2)
+        # Remove frontiers too close to a wall
+        frontier_mask = frontier_mask & (~danger_zone)
+        safe_frontiers_mask = frontier_mask
+
+        for l in safe_frontiers_mask.T :
+            line_str = ""
+            for e in l :
+                if e :
+                    line_str += "S"
+                else :
+                    line_str += "o"
+            #print("sans murs : ", line_str)
+
+        # Regrouper les cellules frontier contiguës en composants connexes (voisinage 4)
+        # et retourner le barycentre (en coordonnées monde) de chaque composant.
+        # safe_frontiers_mask est un tableau booléen de forme (nx, ny)
+        structure = generate_binary_structure(2, 2)  # 8-connectivité
+        labeled, num_features = ndimage.label(safe_frontiers_mask, structure=structure)
+
+        self.frontier_clusters = []
+        min_cluster_size = 4
+        for label_idx in range(1, num_features + 1):
+            ys, xs = np.where(labeled == label_idx)
+            size = ys.size
+            if size == 0:
+                continue
+            if size < min_cluster_size:
+                continue
+            # barycentre en indices grille (float)
+            mean_x = float(np.mean(ys))
+            mean_y = float(np.mean(xs))
+            # conversion grille -> monde (barycentre)
+            x_world, y_world = self.grid._conv_grid_to_world(mean_x, mean_y)
+            # conversion des cellules du cluster en coordonnées monde
+            x_cells_world, y_cells_world = self.grid._conv_grid_to_world(ys, xs)
+            cells_world = np.vstack((x_cells_world, y_cells_world)).T
+            frontiers.append(np.array([x_world, y_world]))
+            self.frontier_clusters.append({
+                "cells_world": cells_world,
+                "barycenter": np.array([x_world, y_world]),
+                "size": int(size)
+            })
+
+        return frontiers
 
     # --------------------------------------------------------------------------
     # FONCTION DE DESSIN
     # --------------------------------------------------------------------------
     
     def draw_bottom_layer(self):
-        """ Dessine le chemin A* (self.path) en pointillés verts. """
-        if self.path:
-            points_list = []
-            
-            # 1. Ajouter la position actuelle du drone au début du chemin
-            start_point = self.current_pose[:2] + self._half_size_array
-            points_list.append((start_point[0], start_point[1]))
+        """ Dessine le chemin calculé (tous les points) """
+        # --- DEBUG VISUALISATION DES FRONTIERES (START) ---
+        # Ces lignes de dessin servent uniquement à visualiser les clusters
+        # de frontières et leurs barycentres. Elles sont clairement marquées
+        # pour pouvoir être retirées facilement.
+        if hasattr(self, 'frontier_clusters') and self.frontier_clusters:
+            # dessin des cellules de chaque cluster (petits points rouges)
+            for cluster in self.frontier_clusters:
+                cells = cluster.get('cells_world')
+                if cells is None or len(cells) == 0:
+                    continue
+                for c in cells:
+                    pt = c + self._half_size_array
+                    arcade.draw_circle_filled(pt[0], pt[1], radius=3, color=(255,0,0))
+                # barycentre (jaune)
+                bc = cluster.get('barycenter')
+                ptb = bc + self._half_size_array
+                arcade.draw_circle_filled(ptb[0], ptb[1], radius=6, color=(255,255,0))
+        # --- DEBUG VISUALISATION DES FRONTIERES (END) ---
 
-            # 2. Ajouter les waypoints restants
-            for point_world in self.path:
-                point_arcade = point_world + self._half_size_array
-                points_list.append((point_arcade[0], point_arcade[1]))
+        if self.path and len(self.path) > 0:
+            radius = 7
+            blue = (0,0,255)
+            green = (0,255,0)
+            # Affiche chaque point du chemin
+            for pt in self.path:
+                point_arcade = pt + self._half_size_array
+                arcade.draw_circle_filled(point_arcade[0], point_arcade[1], radius=radius, color=blue)
+            # Relie les points par des segments
+            for i in range(len(self.path)-1):
+                p1 = self.path[i] + self._half_size_array
+                p2 = self.path[i+1] + self._half_size_array
+                arcade.draw_line(p1[0], p1[1], p2[0], p2[1], color=green, line_width=3)
 
-            if len(points_list) > 1:
-                # Utiliser 'draw_line_strip' pour dessiner le chemin complet
-                arcade.draw_line_strip(points_list, arcade.color.GREEN, 5)
+        self.display_pose()
+
 
     # --------------------------------------------------------------------------
     # FONCTIONS DE PILOTAGE
     # --------------------------------------------------------------------------
- 
+    
     def follow_path(self, lidar_data) -> CommandsDict:
         if not self.path:
+            print("No path to follow.")
             return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
-
+        
+        # Utilisez l'état estimé par le KF comme pose actuelle pour le contrôle
+        current_x = self.state_estimate[0, 0]
+        current_y = self.state_estimate[1, 0]
+        current_theta = self.state_estimate[2, 0]
+        
         target_pos = self.path[0]
-        delta_pos = target_pos - self.current_pose[:2]
+        delta_pos = target_pos - np.array([current_x, current_y])
         target_angle = math.atan2(delta_pos[1], delta_pos[0])
 
-        # --- PID sur la rotation ---
-        angle_error = normalize_angle(target_angle - self.current_pose[2])
+        # --- PID sur la rotation (inchangé) ---
+        angle_error = normalize_angle(target_angle - current_theta)
         deriv_error = angle_error - self.prev_angle_error
         rotation_speed = self.Kp * angle_error + self.Kd * deriv_error
-        rotation_speed = np.clip(rotation_speed, -1.0, 1.0)
+        rotation_speed = float(np.clip(rotation_speed, -1.0, 1.0))
         self.prev_angle_error = angle_error
 
         distance_to_target = np.linalg.norm(delta_pos)
 
-        # --- Gestion de la vitesse ---
-        if angle_error > 0.1 or angle_error < -0.1 : # Si on est en train de tourner, alors on met forward_speed à 0         
-            forward_speed = 0
-            #print("on tourne")
+        # --- Profil de vitesse souhaitée (tunable) ---
+        # Augmenter max_speed pour rendre le drone plus rapide
+        max_speed = 10.0
+        # profil proportionnel à la distance, coef augmenté pour plus de vitesse
+        target_speed = max(0.0, min(max_speed, distance_to_target * 0.12 + 0.3))
 
-        else :
-            target_speed = min(4.0, distance_to_target*0.05 - 0.03)
-            measured_speed = math.sqrt(self.measured_velocity()[0]**2 + self.measured_velocity()[1]**2)
+        measured_vel = self.measured_velocity()
+        measured_speed = math.sqrt(measured_vel[0] ** 2 + measured_vel[1] ** 2)
 
-            if measured_speed > target_speed :
-                forward_speed = -1 # On ralentit
-            elif measured_speed < target_speed :
-                forward_speed = 1 # On accélère
-            else :
-                forward_speed = 0 # On garde la même vitesse
-            
-            #print("target speed : ", target_speed)
-            #print("measured speed : ", measured_speed)
+        # --- PID sur la vitesse (Kp_pos, Kd_pos) ---
+        # erreur = consigne - mesuré
+        speed_error = target_speed - measured_speed
+        deriv_speed = speed_error - self.prev_speed_error
+        # commande continue - peut être négative si il faut freiner
+        forward_cmd = self.Kp_pos * speed_error + self.Kd_pos * deriv_speed
+        # si on est en train de fortement tourner, ne pas avancer
+        if abs(angle_error) > 0.2:
+            forward_cmd = 0.0
+        # normaliser la commande dans [-1, 1]
+        forward_cmd = float(np.clip(forward_cmd, -1.0, 1.0))
+        self.prev_speed_error = speed_error
 
         # Si proche du waypoint → passer au suivant
-        if distance_to_target < 50:
+        # seuil réduit pour permettre d'atteindre les waypoints plus précisément
+        if distance_to_target < 30:
+        # on arrête le mouvement frontal pour éviter dépassement
+            forward_cmd = 0.0
             self.path.pop(0)
 
         # Si proche du but final
-        dist_to_goal = np.linalg.norm(self.goal_position - self.current_pose[:2])
-        if dist_to_goal < 50:
-            print("✅ Mission terminée : le drone est arrivé au but.")
-            self.mission_done = True
-            return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
+        dist_to_goal = np.linalg.norm(self.goal_position - np.array([current_x, current_y]))
 
-        return {"forward": forward_speed, "lateral": 0.0, "rotation": rotation_speed}
-
-   
-    # --------------------------------------------------------------------------
-    # FONCTIONS DE CONVERSION & AFFICHAGE
-    # --------------------------------------------------------------------------
-
-    def world_to_grid(self, world_pos_xy):
-        grid_pos_xy = (world_pos_xy / self.map_resolution + self.map_origin_offset).astype(int)
-        grid_pos_xy[0] = np.clip(grid_pos_xy[0], 0, self.map_max_index)
-        grid_pos_xy[1] = np.clip(grid_pos_xy[1], 0, self.map_max_index)
-        return grid_pos_xy
-
-    def grid_to_world(self, grid_pos_xy):
-        return (grid_pos_xy - self.map_origin_offset) * self.map_resolution
-
-    def _display_map(self):
-        vis_map = np.zeros((self.grid_size, self.grid_size, 3), dtype=np.uint8)
+        # Mettre à jour self.current_pose pour la visualisation, même si on utilise self.state_estimate
+        self.current_pose[0] = current_x
+        self.current_pose[1] = current_y
+        self.current_pose[2] = current_theta
         
-        obstacle_mask = (self.occupancy_grid <= 0)
-        inflated_map = ndimage.binary_dilation(obstacle_mask, iterations=self.inflation_radius_cells)
+        return {"forward": forward_cmd, "lateral": 0.0, "rotation": rotation_speed}
 
-        vis_map[self.occupancy_grid == 0] = [128, 128, 128] # Gris
-        vis_map[inflated_map == True] = [50, 50, 50]       # Gris foncé
-        vis_map[self.occupancy_grid == -1] = [0, 0, 0]       # Noir
-        vis_map[self.occupancy_grid == 1] = [255, 255, 255] # Blanc
-        
-        if self.path:
-            for point_world in self.path:
-                point_grid = self.world_to_grid(point_world)
-                cv2.circle(vis_map, (point_grid[0], point_grid[1]), 
-                           radius=0, color=(0, 255, 0), thickness=-1)
+    def display_pose(self) :
+        radius = 10
+        red = (0,0,255)
+        green = (0,255,0)
 
-        if self.goal_position is not None:
-            goal_grid_pos_xy = self.world_to_grid(self.goal_position)
-            cv2.circle(vis_map, (goal_grid_pos_xy[0], goal_grid_pos_xy[1]),
-                       radius=3, color=(255, 0, 0), thickness=-1) # Bleu
-                           
-        drone_grid_pos_xy = self.world_to_grid(self.current_pose[:2])
-        cv2.circle(vis_map, (drone_grid_pos_xy[0], drone_grid_pos_xy[1]), 
-                   radius=2, color=(0, 0, 255), thickness=-1) # Rouge
-                       
-        vis_map_large = cv2.resize(vis_map, (400, 400), interpolation=cv2.INTER_NEAREST)
-        vis_map_flipped = cv2.flip(vis_map_large, 0) 
-
-        cv2.imshow("Carte Mentale du Drone (B&W)", vis_map_flipped)
-        cv2.waitKey(1) 
+        # Utiliser la pose estimée (self.state_estimate) pour la visualisation
+        current_pose = self.state_estimate[:2, 0] + self._half_size_array
+        arcade.draw_circle_filled(current_pose[0],
+                                     current_pose[1],
+                                     radius=radius,
+                                     color=red)
 
     # --------------------------------------------------------------------------
     # FONCTIONS PRINCIPALES (Localisation, Cartographie Binaire)
     # --------------------------------------------------------------------------
 
     def update_pose(self):
-        gps_pos = self.measured_gps_position()
-        compass_angle = self.measured_compass_angle()
-
-        if not np.isnan(gps_pos[0]):
-            self.current_pose[0] = gps_pos[0]
-            self.current_pose[1] = gps_pos[1]
-            self.current_pose[2] = compass_angle
-        else:
-            odom_data = self.odometer_values() 
-            if odom_data is None: return
+        """
+        Mise à jour de la pose en utilisant le Filtre de Kalman.
+        """
+        # 1. PRÉDICTION (Basée sur l'odométrie)
+        odom_data = self.odometer_values()
+        if odom_data is not None:
             dist_traveled = odom_data[0]
             rotation_change = odom_data[2]
             
-            self.current_pose[2] += rotation_change
-            self.current_pose[2] = normalize_angle(self.current_pose[2])
+            # Modèle de mouvement non-linéaire (utilisé pour EKF)
+            # x_k = f(x_{k-1}, u_k)
+            # u_k = [dist_traveled, rotation_change]
             
-            dx = dist_traveled * math.cos(self.current_pose[2])
-            dy = dist_traveled * math.sin(self.current_pose[2])
-            self.current_pose[0] += dx
-            self.current_pose[1] += dy
+            # État prédit (x_hat_k)
+            theta_prev = self.state_estimate[2, 0]
+            
+            # L'état prédit est une fonction non-linéaire de l'état précédent et de l'odométrie
+            pred_x = self.state_estimate[0, 0] + dist_traveled * math.cos(theta_prev)
+            pred_y = self.state_estimate[1, 0] + dist_traveled * math.sin(theta_prev)
+            pred_theta = normalize_angle(theta_prev + rotation_change)
+            
+            # Mise à jour de l'état prédit
+            x_hat_k = np.array([[pred_x], [pred_y], [pred_theta]])
+            
+            # Calcul de la matrice Jacobienne (F) du modèle de mouvement
+            F = np.array([[1.0, 0.0, -dist_traveled * math.sin(theta_prev)],
+                          [0.0, 1.0, dist_traveled * math.cos(theta_prev)],
+                          [0.0, 0.0, 1.0]])
 
-    def update_map(self):
-        grid_pos_xy = self.world_to_grid(self.current_pose[:2])
-        gx, gy = grid_pos_xy[0], grid_pos_xy[1]
+            # Covariance prédite (P_k = F P_{k-1} F^T + Q)
+            P_k = F @ self.P @ F.T + self.Q
+            
+            self.state_estimate = x_hat_k
+            self.P = P_k
         
-        gyx = (gy, gx)
-        if 0 <= gy < self.grid_size and 0 <= gx < self.grid_size:
-            self.occupancy_grid[gy, gx] = 1 
+        # 2. MISE À JOUR (Basée sur les mesures GPS/Compass)
+        gps_pos = self.measured_gps_position()
+        compass_angle = self.measured_compass_angle()
         
-        lidar_values = self.lidar_values()
-        if lidar_values is None: return 
+        # Ne mettre à jour que si les données de mesure sont disponibles
+        if gps_pos is not None and not np.isnan(gps_pos[0]):
             
-        lidar_angles = self.lidar().ray_angles
-        max_range = self.lidar().max_range * 0.95 
+            # Vecteur de mesure (z)
+            # z = [gps_x, gps_y, compass_theta]^T
+            z = np.array([[gps_pos[0]], [gps_pos[1]], [compass_angle]])
+            
+            # Fonction d'observation (h). Ici, c'est l'identité car la mesure est l'état.
+            # z_k = h(x_k)
+            h = self.state_estimate # H est la matrice identité
 
-        for angle, dist in zip(lidar_angles, lidar_values):
-            global_angle = normalize_angle(self.current_pose[2] + angle)
+            # Matrice Jacobienne d'observation (H). Ici, c'est l'identité (3x3).
+            H = np.eye(3)
             
-            if dist < max_range:
-                end_point_world = self.current_pose[:2] + np.array([dist * math.cos(global_angle), dist * math.sin(global_angle)])
-                is_obstacle = True
-            else:
-                end_point_world = self.current_pose[:2] + np.array([max_range * math.cos(global_angle), max_range * math.sin(global_angle)])
-                is_obstacle = False
+            # Calcul de l'innovation (y)
+            y = z - h
+            # Normaliser l'erreur angulaire dans l'innovation
+            y[2, 0] = normalize_angle(y[2, 0]) 
             
-            grid_end_point_xy = self.world_to_grid(end_point_world)
-            gx_end, gy_end = grid_end_point_xy[0], grid_end_point_xy[1]
+            # Calcul de la covariance d'innovation (S)
+            S = H @ self.P @ H.T + self.R
             
-            rr, cc = draw_line(gy, gx, gy_end, gx_end)
+            # Calcul du gain de Kalman (K)
+            K = self.P @ H.T @ np.linalg.inv(S)
             
-            rr = np.clip(rr, 0, self.map_max_index)
-            cc = np.clip(cc, 0, self.map_max_index)
+            # Mise à jour de l'état (x)
+            # x_new = x_pred + K y
+            self.state_estimate = self.state_estimate + K @ y
+            # Normaliser l'angle après la mise à jour
+            self.state_estimate[2, 0] = normalize_angle(self.state_estimate[2, 0])
+            
+            # Mise à jour de la covariance (P)
+            # P_new = (I - K H) P_pred
+            I = np.eye(3)
+            self.P = (I - K @ H) @ self.P
 
-            self.occupancy_grid[rr, cc] = 1 
-            
-            if is_obstacle:
-                self.occupancy_grid[gy_end, gx_end] = -1
+        # Mettre à jour self.current_pose pour le reste du code
+        self.current_pose[0] = self.state_estimate[0, 0]
+        self.current_pose[1] = self.state_estimate[1, 0]
+        self.current_pose[2] = self.state_estimate[2, 0]
