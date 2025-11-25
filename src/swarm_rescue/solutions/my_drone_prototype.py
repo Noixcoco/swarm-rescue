@@ -1,9 +1,10 @@
 import math
 import numpy as np
+from enum import Enum
 from scipy.ndimage import binary_dilation, generate_binary_structure
 from scipy import ndimage
 from swarm_rescue.simulation.drone.drone_abstract import DroneAbstract
-from swarm_rescue.simulation.utils.utils import normalize_angle
+from swarm_rescue.simulation.utils.utils import normalize_angle, circular_mean
 from swarm_rescue.simulation.drone.controller import CommandsDict
 import arcade
 import sys
@@ -16,9 +17,18 @@ from swarm_rescue.simulation.utils.pose import Pose
 
 
 class MyDronePrototype(DroneAbstract):
-    def creer_chemin(self, start_world, goal_world):
+    class Activity(Enum):
+        """
+        All the states of the drone as a state machine
+        """
+        EXPLORING = 1
+        GOING_TO_WOUNDED = 2
+        GOING_TO_RESCUE_CENTER = 3
+
+    def creer_chemin(self, start_world, goal_world, explored_only=False):
         """
         Calcule un chemin entre start_world et goal_world en évitant les murs et les zones proches des murs (moins de 4 pixels) avec A*.
+        Si explored_only=True, le chemin ne passera que par des zones explorées.
         Retourne une liste de points (en coordonnées monde).
         """
         import heapq
@@ -33,9 +43,19 @@ class MyDronePrototype(DroneAbstract):
         # Masque des murs
         SEUIL_MUR = 5.0
         is_wall = (grid >= SEUIL_MUR)
+        
+        # Masque des zones explorées (valeurs différentes de 0)
+        SEUIL_FREE = -10.0
+        is_explored = (grid < SEUIL_FREE)  # zones explorées et libres
+        
         # Dilate les murs pour éviter les zones proches (moins de 2 pixels)
         struct = np.ones((5, 5), dtype=bool)  # carré 5x5 ~ rayon 2
         danger_zone = binary_dilation(is_wall, structure=struct, iterations=1)
+        
+        # Si explored_only=True, ajouter les zones non explorées à danger_zone
+        if explored_only:
+            danger_zone = danger_zone | (~is_explored)
+        
         # Si le start ou le goal sont dans la danger_zone (par ex. drone collé au mur),
         # on autorise une petite zone autour d'eux pour permettre à A* de s'extraire.
         try:
@@ -47,10 +67,12 @@ class MyDronePrototype(DroneAbstract):
             x0 = max(0, sx - radius_clear)
             x1 = min(grid.shape[1], sx + radius_clear + 1)
             danger_zone[y0:y1, x0:x1] = False
-            y0 = max(0, gy - radius_clear)
-            y1 = min(grid.shape[0], gy + radius_clear + 1)
-            x0 = max(0, gx - radius_clear)
-            x1 = min(grid.shape[1], gx + radius_clear + 1)
+            # Clear zone autour du goal avec un rayon plus grand pour le rescue center
+            radius_clear_goal = 5  # Plus grand rayon pour le goal (rescue center)
+            y0 = max(0, gy - radius_clear_goal)
+            y1 = min(grid.shape[0], gy + radius_clear_goal + 1)
+            x0 = max(0, gx - radius_clear_goal)
+            x1 = min(grid.shape[1], gx + radius_clear_goal + 1)
             danger_zone[y0:y1, x0:x1] = False
         except Exception:
             # en cas de problème d'indices, on ignore et laisse danger_zone inchangé
@@ -165,6 +187,36 @@ class MyDronePrototype(DroneAbstract):
         self.path = []
         self.frontiers_world = []
 
+        # `wounded_to_rescue`: list of (x,y) tuples for detected wounded persons
+        # `rescue_zone_points`: list of (x,y) tuples representing detected rescue area points
+        self.wounded_to_rescue = []
+        self.rescue_zone_points = []
+
+        # internal metadata to remember when a detection was last seen
+        # keys are rounded tuples (x,y) -> last seen iteration
+        self._wounded_memory_meta = {}
+        self._rescue_memory_meta = {}
+        # State machine
+        self.state = self.Activity.EXPLORING
+        self.current_target_wounded = None
+        self.last_replan_iteration = 0  # Track when we last calculated a path
+        
+        # Kalman filter for GPS position (x, y)
+        # State: [x, y, vx, vy] (position and velocity)
+        self.kf_state = np.array([0.0, 0.0, 0.0, 0.0])  # Initial state
+        # State covariance matrix (uncertainty)
+        self.kf_P = np.eye(4) * 100.0  # Initial high uncertainty
+        # Process noise covariance (how much we trust the model)
+        self.kf_Q = np.eye(4) * 0.1  # Small process noise
+        self.kf_Q[2, 2] = 1.0  # Higher uncertainty on velocity
+        self.kf_Q[3, 3] = 1.0
+        # Measurement noise covariance (GPS noise)
+        self.kf_R = np.eye(2) * 25.0  # GPS measurement noise
+        # Time step for prediction (will be updated)
+        self.kf_dt = 0.1
+        self.kf_last_time = 0
+        self.kf_initialized = False
+
     def define_message_for_all(self) -> None:
         pass 
 
@@ -189,38 +241,150 @@ class MyDronePrototype(DroneAbstract):
         if lidar_data is None:
             return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0, "grasper": 0}
 
-        # --- 2. STRATÉGIE (DÉSACTIVÉE) ---
-        # Replanification si le chemin est vide, si le waypoint est atteint, ou tous les 10 itérations
-        need_replan = False
-        if not self.path or len(self.path) < 1:
-            need_replan = True
-        # Met à jour le chemin tous les 10 itérations (si cible existante)
-        if self.path and hasattr(self, 'target_point') and self.iteration % 10 == 0:
-            need_replan = True
+        # Also populate the simpler public lists requested by the user
+        try:
+            self.detect_semantic_entities()
+        except Exception:
+            pass
 
-        if need_replan:
-            self.frontiers_world = self.find_safe_frontier_points() # Met à jour la liste des frontières
-            #print("frontieres : ",self.frontiers_world)
-            if self.frontiers_world:
-                # Scoring simplifié : choisir le point de frontière le plus proche
-                distances = [np.linalg.norm(f - self.current_pose[:2]) for f in self.frontiers_world]
-                closest_index = np.argmin(distances)
-                target_point = self.frontiers_world[closest_index]
-                self.target_point = target_point
-                # Le chemin devient ce point de frontière
-                self.path = self.creer_chemin(self.current_pose[:2], target_point)
+        # STATE MACHINE LOGIC
+        # Transitions
+        if self.state == self.Activity.EXPLORING:
+            if self.wounded_to_rescue:
+                # Choose closest wounded
+                distances = [np.linalg.norm(np.array(w) - self.current_pose[:2]) for w in self.wounded_to_rescue]
+                closest_idx = int(np.argmin(distances))
+                self.current_target_wounded = self.wounded_to_rescue[closest_idx]
+                self.state = self.Activity.GOING_TO_WOUNDED
+                self.path = self.creer_chemin(self.current_pose[:2], self.current_target_wounded)
+                self.last_replan_iteration = self.iteration
+
+        elif self.state == self.Activity.GOING_TO_WOUNDED:
+            if self.grasper.grasped_wounded_persons:
+                # Successfully grasped, go to rescue center
+                self.state = self.Activity.GOING_TO_RESCUE_CENTER
+                
+                # Remove the grasped wounded from the list
+                if self.current_target_wounded is not None:
+                    # Find and remove the wounded within check_radius
+                    check_radius = 30.0
+                    self.wounded_to_rescue = [
+                        (wx, wy) for (wx, wy) in self.wounded_to_rescue
+                        if math.hypot(self.current_target_wounded[0] - wx, self.current_target_wounded[1] - wy) >= check_radius
+                    ]
+                    # Also clean up metadata
+                    def _key_of(pt):
+                        return (round(float(pt[0]), 1), round(float(pt[1]), 1))
+                    if self.current_target_wounded:
+                        key = _key_of(self.current_target_wounded)
+                        self._wounded_memory_meta.pop(key, None)
+                
+                if self.rescue_zone_points:
+                    self.path = self.creer_chemin(self.current_pose[:2], self.rescue_zone_points[0], explored_only=True)
+                    self.last_replan_iteration = self.iteration
+            elif self.current_target_wounded is not None:
+                # Check if target still exists (within radius, not exact match due to EMA smoothing)
+                target_still_exists = False
+                check_radius = 30.0  # tolerance radius for target identification
+                for (wx, wy) in self.wounded_to_rescue:
+                    if math.hypot(self.current_target_wounded[0] - wx, self.current_target_wounded[1] - wy) < check_radius:
+                        target_still_exists = True
+                        break
+                if not target_still_exists:
+                    # Target truly lost, return to exploring
+                    self.state = self.Activity.EXPLORING
+                    self.current_target_wounded = None
+            else:
+                # No target defined, return to exploring
+                self.state = self.Activity.EXPLORING
+                self.current_target_wounded = None
+
+        elif self.state == self.Activity.GOING_TO_RESCUE_CENTER:
+            if not self.grasper.grasped_wounded_persons:
+                # Dropped wounded, return to exploring
+                self.state = self.Activity.EXPLORING
+                self.current_target_wounded = None
+
+        # --- 2. STRATÉGIE ---
+        # Replanification for exploration (only when in EXPLORING state)
+        if self.state == self.Activity.EXPLORING:
+            need_replan = False
+            if not self.path or len(self.path) < 1:
+                need_replan = True
+            # Met à jour le chemin tous les 10 itérations (si cible existante)
+            if self.path and hasattr(self, 'target_point') and self.iteration % 10 == 0:
+                need_replan = True
+
+            if need_replan:
+                self.frontiers_world = self.find_safe_frontier_points()
+                if self.frontiers_world:
+                    # Scoring simplifié : choisir le point de frontière le plus proche
+                    distances = [np.linalg.norm(f - self.current_pose[:2]) for f in self.frontiers_world]
+                    closest_index = np.argmin(distances)
+                    target_point = self.frontiers_world[closest_index]
+                    self.target_point = target_point
+                    self.path = self.creer_chemin(self.current_pose[:2], target_point)
         
         # --- 3. ACTION (Le "Pilote") ---
-        
+        # Execute commands based on state
+        if self.state == self.Activity.EXPLORING:
+            # Continue exploration
+            if self.path:
+                command = self.follow_path(lidar_data)
+            else:
+                print("Exploration terminée ou pas de frontieres sûres trouvées.")
+                command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
 
-        if self.path:
-            command = self.follow_path(lidar_data)
+        elif self.state == self.Activity.GOING_TO_WOUNDED:
+            # Navigate to wounded
+            if self.current_target_wounded:
+                # Only replan if path is empty AND enough iterations have passed (avoid constant replanning)
+                # OR if this is the first time (last_replan_iteration == 0)
+                should_replan = False
+                if not self.path or len(self.path) == 0:
+                    iterations_since_replan = self.iteration - self.last_replan_iteration
+                    if iterations_since_replan >= 30 or self.last_replan_iteration == 0:
+                        should_replan = True
+                
+                if should_replan:
+                    self.path = self.creer_chemin(self.current_pose[:2], self.current_target_wounded)
+                    self.last_replan_iteration = self.iteration
+                
+                if self.path:
+                    command = self.follow_path(lidar_data)
+                else:
+                    command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
+            else:
+                command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
+
+        elif self.state == self.Activity.GOING_TO_RESCUE_CENTER:
+            # Navigate to rescue center
+            if self.rescue_zone_points:
+                # Only replan if path is empty AND enough iterations have passed
+                should_replan = False
+                if not self.path or len(self.path) == 0:
+                    iterations_since_replan = self.iteration - self.last_replan_iteration
+                    if iterations_since_replan >= 30 or self.last_replan_iteration == 0:
+                        should_replan = True
+                
+                if should_replan:
+                    self.path = self.creer_chemin(self.current_pose[:2], self.rescue_zone_points[0], explored_only=True)
+                    self.last_replan_iteration = self.iteration
+                
+                if self.path:
+                    command = self.follow_path(lidar_data)
+                else:
+                    command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
+            else:
+                # No rescue center known, explore
+                if self.path:
+                    command = self.follow_path(lidar_data)
+                else:
+                    command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
         else:
-            # Si le chemin est terminé, on s'arrête
-            print("Exploration terminée ou pas de frontieres sûres trouvées.")
             command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
 
-        command["grasper"] = 0
+        command["grasper"] = 1
 
         if self.iteration % 5 == 0:
             self.grid.display(self.grid.grid,
@@ -231,6 +395,168 @@ class MyDronePrototype(DroneAbstract):
                               title="zoomed occupancy grid")
 
         return command
+
+    def detect_semantic_entities(self):
+        """Populate `self.wounded_to_rescue` and `self.rescue_zone_points`.
+
+        Converts semantic detections into world coordinates and fills two
+        de-duplicated lists for user convenience. Keeps detections in memory
+        for a while when they go out of view.
+        """
+        try:
+            detections = self.semantic_values()
+        except Exception:
+            detections = None
+
+        # parameters
+        dedup_radius = 20.0         # close detections considered same
+        alpha_update = 0.3          # mixing factor when updating an existing entry
+        memory_max_age = 50000        # iterations before forgetting an unseen entry
+
+        # helper to round keys to reduce float-key issues
+        def _key_of(pt):
+            return (round(float(pt[0]), 1), round(float(pt[1]), 1))
+
+        # Ensure memory dicts exist
+        if not hasattr(self, '_wounded_memory_meta'):
+            self._wounded_memory_meta = {}
+        if not hasattr(self, '_rescue_memory_meta'):
+            self._rescue_memory_meta = {}
+
+        # Use local lists to accumulate new detections
+        newly_seen_wounded = []
+        newly_seen_rescue = []
+
+        if detections:
+            px = float(self.current_pose[0])
+            py = float(self.current_pose[1])
+            ptheta = float(self.current_pose[2])
+
+            for data in detections:
+                try:
+                    etype = getattr(data, 'entity_type', None)
+                    angle = float(getattr(data, 'angle', 0.0))
+                    dist = float(getattr(data, 'distance', 0.0))
+                except Exception:
+                    continue
+
+                global_angle = normalize_angle(ptheta + angle)
+                xw = px + dist * math.cos(global_angle)
+                yw = py + dist * math.sin(global_angle)
+
+                try:
+                    name = etype.name if hasattr(etype, 'name') else str(etype)
+                except Exception:
+                    name = str(etype)
+
+                if 'WOUNDED' in name.upper():
+                    newly_seen_wounded.append((xw, yw))
+                elif 'RESCUE' in name.upper():
+                    newly_seen_rescue.append((xw, yw))
+
+        # Initialize lists if missing
+        if not hasattr(self, 'wounded_to_rescue'):
+            self.wounded_to_rescue = []
+        if not hasattr(self, 'rescue_zone_points'):
+            self.rescue_zone_points = []
+
+        # Merge newly seen wounded into memory (update existing if near, else append)
+        for nx, ny in newly_seen_wounded:
+            merged = False
+            for i, (wx, wy) in enumerate(self.wounded_to_rescue):
+                if math.hypot(wx - nx, wy - ny) < dedup_radius:
+                    # weighted update
+                    newx = (1.0 - alpha_update) * wx + alpha_update * nx
+                    newy = (1.0 - alpha_update) * wy + alpha_update * ny
+                    self.wounded_to_rescue[i] = (newx, newy)
+                    self._wounded_memory_meta[_key_of(self.wounded_to_rescue[i])] = self.iteration
+                    merged = True
+                    break
+            if not merged:
+                pt = (nx, ny)
+                self.wounded_to_rescue.append(pt)
+                self._wounded_memory_meta[_key_of(pt)] = self.iteration
+
+        # Merge newly seen rescue points
+        for nx, ny in newly_seen_rescue:
+            merged = False
+            for i, (rx, ry) in enumerate(self.rescue_zone_points):
+                if math.hypot(rx - nx, ry - ny) < dedup_radius:
+                    newx = (1.0 - alpha_update) * rx + alpha_update * nx
+                    newy = (1.0 - alpha_update) * ry + alpha_update * ny
+                    self.rescue_zone_points[i] = (newx, newy)
+                    self._rescue_memory_meta[_key_of(self.rescue_zone_points[i])] = self.iteration
+                    merged = True
+                    break
+            if not merged:
+                pt = (nx, ny)
+                self.rescue_zone_points.append(pt)
+                self._rescue_memory_meta[_key_of(pt)] = self.iteration
+
+        # If no fresh detections, optionally refresh from semantic_tracks (stable tracks)
+        if not newly_seen_wounded:
+            for tr in getattr(self, 'semantic_tracks', []):
+                if tr.get('type') == 'WOUNDED' and tr.get('count', 0) >= 2:
+                    pt = tuple(tr['pos'].tolist())
+                    # merge as above
+                    merged = False
+                    for i, (wx, wy) in enumerate(self.wounded_to_rescue):
+                        if math.hypot(wx - pt[0], wy - pt[1]) < dedup_radius:
+                            newx = (1.0 - alpha_update) * wx + alpha_update * pt[0]
+                            newy = (1.0 - alpha_update) * wy + alpha_update * pt[1]
+                            self.wounded_to_rescue[i] = (newx, newy)
+                            self._wounded_memory_meta[_key_of(self.wounded_to_rescue[i])] = tr.get('last_seen', self.iteration)
+                            merged = True
+                            break
+                    if not merged:
+                        self.wounded_to_rescue.append(pt)
+                        self._wounded_memory_meta[_key_of(pt)] = tr.get('last_seen', self.iteration)
+
+        if not newly_seen_rescue:
+            rescue_tracks = [t for t in getattr(self, 'semantic_tracks', []) if t.get('type') == 'RESCUE']
+            for tr in rescue_tracks:
+                pt = tuple(tr['pos'].tolist())
+                merged = False
+                for i, (rx, ry) in enumerate(self.rescue_zone_points):
+                    if math.hypot(rx - pt[0], ry - pt[1]) < dedup_radius:
+                        newx = (1.0 - alpha_update) * rx + alpha_update * pt[0]
+                        newy = (1.0 - alpha_update) * ry + alpha_update * pt[1]
+                        self.rescue_zone_points[i] = (newx, newy)
+                        self._rescue_memory_meta[_key_of(self.rescue_zone_points[i])] = tr.get('last_seen', self.iteration)
+                        merged = True
+                        break
+                if not merged:
+                    self.rescue_zone_points.append(pt)
+                    self._rescue_memory_meta[_key_of(pt)] = tr.get('last_seen', self.iteration)
+
+        # Prune old memory entries
+        def _prune_memory(lst, meta):
+            to_keep = []
+            new_meta = {}
+            for pt in lst:
+                k = _key_of(pt)
+                last = meta.get(k, None)
+                if last is None:
+                    # keep if recently added (use current iteration)
+                    last = self.iteration
+                age = self.iteration - last
+                if age <= memory_max_age:
+                    to_keep.append(pt)
+                    new_meta[k] = last
+            return to_keep, new_meta
+
+        self.wounded_to_rescue, self._wounded_memory_meta = _prune_memory(self.wounded_to_rescue, self._wounded_memory_meta)
+        self.rescue_zone_points, self._rescue_memory_meta = _prune_memory(self.rescue_zone_points, self._rescue_memory_meta)
+
+        # Reduce rescue_zone_points to a single barycenter (if any)
+        if self.rescue_zone_points:
+            xs = [p[0] for p in self.rescue_zone_points]
+            ys = [p[1] for p in self.rescue_zone_points]
+            bx = float(sum(xs) / len(xs))
+            by = float(sum(ys) / len(ys))
+            self.rescue_zone_points = [(bx, by)]
+            # update metadata to mark barycenter as last seen now
+            self._rescue_memory_meta = {_key_of((bx, by)): self.iteration}
 
     # --------------------------------------------------------------------------
     # FONCTION DE DÉTECTION DES FRONTIÈRES SÛRES (Mise à jour pour self.frontiers_world)
@@ -322,7 +648,6 @@ class MyDronePrototype(DroneAbstract):
 
         return frontiers
 
-    # --------------------------------------------------------------------------
     # FONCTION DE DESSIN
     # --------------------------------------------------------------------------
     
@@ -347,6 +672,28 @@ class MyDronePrototype(DroneAbstract):
                 arcade.draw_circle_filled(ptb[0], ptb[1], radius=6, color=(255,255,0))
         # --- DEBUG VISUALISATION DES FRONTIERES (END) ---
 
+        # Draw wounded detected via new simple API (wounded_to_rescue)
+        try:
+            if hasattr(self, 'wounded_to_rescue') and self.wounded_to_rescue:
+                for (xw, yw) in self.wounded_to_rescue:
+                    pt = np.array([xw, yw]) + self._half_size_array
+                    # visible marker (outline + small filled center)
+                    arcade.draw_circle_outline(pt[0], pt[1], radius=18, color=(200,60,60), border_width=2)
+                    arcade.draw_circle_filled(pt[0], pt[1], radius=4, color=(255,80,80))
+                    arcade.draw_text("det", pt[0] + 14, pt[1] + 14, (200, 60, 60), 10)
+        except Exception:
+            pass
+
+        # Draw additional rescue zone points detected via new API
+        try:
+            if hasattr(self, 'rescue_zone_points') and self.rescue_zone_points:
+                for (xr, yr) in self.rescue_zone_points:
+                    pt = np.array([xr, yr]) + self._half_size_array
+                    arcade.draw_rectangle_outline(pt[0], pt[1], width=30, height=30, color=(0,160,0), border_width=2)
+                    arcade.draw_text("RZ", pt[0] + 12, pt[1] + 12, (0,120,0), 10)
+        except Exception:
+            pass
+
         if self.path and len(self.path) > 0:
             radius = 7
             blue = (0,0,255)
@@ -362,6 +709,21 @@ class MyDronePrototype(DroneAbstract):
                 arcade.draw_line(p1[0], p1[1], p2[0], p2[1], color=green, line_width=3)
 
         self.display_pose()
+        
+        # Display state machine status above drone
+        try:
+            current_pose_screen = self.current_pose[:2] + self._half_size_array
+            # Get state name
+            state_name = self.state.name if hasattr(self.state, 'name') else str(self.state)
+            # Display above drone (offset +25 pixels above)
+            arcade.draw_text(state_name, 
+                           current_pose_screen[0] - 30, 
+                           current_pose_screen[1] + 25, 
+                           (255, 255, 255), 
+                           12, 
+                           bold=True)
+        except Exception:
+            pass
 
 
     # --------------------------------------------------------------------------
@@ -437,12 +799,68 @@ class MyDronePrototype(DroneAbstract):
         gps_pos = self.measured_gps_position()
         compass_angle = self.measured_compass_angle()
 
+        # Calculate dt for Kalman filter
+        current_time = self.iteration * 0.1  # Assuming 10 Hz
+        if self.kf_last_time > 0:
+            self.kf_dt = current_time - self.kf_last_time
+        self.kf_last_time = current_time
+        
         if not np.isnan(gps_pos[0]):
-        #if False :
-            self.current_pose[0] = gps_pos[0]
-            self.current_pose[1] = gps_pos[1]
+            # GPS available - use Kalman filter
+            
+            # Initialize filter on first GPS measurement
+            if not self.kf_initialized:
+                self.kf_state[0] = gps_pos[0]
+                self.kf_state[1] = gps_pos[1]
+                self.kf_state[2] = 0.0  # Initial velocity
+                self.kf_state[3] = 0.0
+                self.kf_initialized = True
+            
+            # Kalman Filter Prediction Step
+            # State transition matrix F (constant velocity model)
+            F = np.array([
+                [1, 0, self.kf_dt, 0],
+                [0, 1, 0, self.kf_dt],
+                [0, 0, 1, 0],
+                [0, 0, 0, 1]
+            ])
+            
+            # Predict state
+            self.kf_state = F @ self.kf_state
+            
+            # Predict covariance
+            self.kf_P = F @ self.kf_P @ F.T + self.kf_Q
+            
+            # Kalman Filter Update Step
+            # Measurement matrix H (we only measure position, not velocity)
+            H = np.array([
+                [1, 0, 0, 0],
+                [0, 1, 0, 0]
+            ])
+            
+            # Measurement residual
+            z = np.array([gps_pos[0], gps_pos[1]])
+            y = z - H @ self.kf_state
+            
+            # Residual covariance
+            S = H @ self.kf_P @ H.T + self.kf_R
+            
+            # Kalman gain
+            K = self.kf_P @ H.T @ np.linalg.inv(S)
+            
+            # Update state
+            self.kf_state = self.kf_state + K @ y
+            
+            # Update covariance
+            I = np.eye(4)
+            self.kf_P = (I - K @ H) @ self.kf_P
+            
+            # Use filtered position
+            self.current_pose[0] = self.kf_state[0]
+            self.current_pose[1] = self.kf_state[1]
             self.current_pose[2] = compass_angle
         else:
+            # GPS unavailable - use odometry with Kalman prediction
             odom_data = self.odometer_values() 
             if odom_data is None: return
             dist_traveled = odom_data[0]
@@ -451,9 +869,24 @@ class MyDronePrototype(DroneAbstract):
             self.current_pose[2] += rotation_change
             self.current_pose[2] = normalize_angle(self.current_pose[2])
             
-            dx = dist_traveled * math.cos(self.current_pose[2])
-            dy = dist_traveled * math.sin(self.current_pose[2])
-            self.current_pose[0] += dx
-            self.current_pose[1] += dy
+            if self.kf_initialized:
+                # Use Kalman predicted position when GPS unavailable
+                F = np.array([
+                    [1, 0, self.kf_dt, 0],
+                    [0, 1, 0, self.kf_dt],
+                    [0, 0, 1, 0],
+                    [0, 0, 0, 1]
+                ])
+                self.kf_state = F @ self.kf_state
+                self.kf_P = F @ self.kf_P @ F.T + self.kf_Q
+                
+                self.current_pose[0] = self.kf_state[0]
+                self.current_pose[1] = self.kf_state[1]
+            else:
+                # Fallback to odometry if Kalman not yet initialized
+                dx = dist_traveled * math.cos(self.current_pose[2])
+                dy = dist_traveled * math.sin(self.current_pose[2])
+                self.current_pose[0] += dx
+                self.current_pose[1] += dy
 
     
