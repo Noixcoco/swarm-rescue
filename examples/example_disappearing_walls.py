@@ -140,6 +140,7 @@ class MapWithOpeningDoors(MapAbstract):
             number_drones=self._number_drones,
             max_timestep_limit=self._max_timestep_limit,
             max_walltime_limit=self._max_walltime_limit
+            
         )
 
         for i in range(self._number_drones):
