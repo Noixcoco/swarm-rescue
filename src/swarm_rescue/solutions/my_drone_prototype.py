@@ -358,21 +358,21 @@ class MyDronePrototype(DroneAbstract):
                 command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
 
         elif self.state == self.Activity.GOING_TO_RESCUE_CENTER:
-            # Navigate to rescue center
+            # Navigate to rescue center with regular replanning
             if self.rescue_zone_points:
-                # Only replan if path is empty AND enough iterations have passed
+                # Replan regularly (every 10 iterations, like exploration)
                 should_replan = False
                 if not self.path or len(self.path) == 0:
-                    iterations_since_replan = self.iteration - self.last_replan_iteration
-                    if iterations_since_replan >= 30 or self.last_replan_iteration == 0:
-                        should_replan = True
+                    should_replan = True
+                elif self.iteration % 10 == 0:
+                    should_replan = True
                 
                 if should_replan:
                     self.path = self.creer_chemin(self.current_pose[:2], self.rescue_zone_points[0], explored_only=True)
                     self.last_replan_iteration = self.iteration
                 
                 if self.path:
-                    command = self.follow_path(lidar_data)
+                    command = self.go_to_point(lidar_data)
                 else:
                     command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
             else:
@@ -385,6 +385,9 @@ class MyDronePrototype(DroneAbstract):
             command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
 
         command["grasper"] = 1
+        
+        # Store last command for display
+        self.last_command = command.copy()
 
         if self.iteration % 5 == 0:
             self.grid.display(self.grid.grid,
@@ -722,6 +725,17 @@ class MyDronePrototype(DroneAbstract):
                            (255, 255, 255), 
                            12, 
                            bold=True)
+            
+            # Display commands below drone
+            if hasattr(self, 'last_command'):
+                cmd = self.last_command
+                cmd_text = f"F:{cmd.get('forward', 0):.2f} L:{cmd.get('lateral', 0):.2f} R:{cmd.get('rotation', 0):.2f}"
+                arcade.draw_text(cmd_text, 
+                               current_pose_screen[0] - 50, 
+                               current_pose_screen[1] - 40, 
+                               (0, 0, 0), 
+                               10, 
+                               bold=False)
         except Exception:
             pass
 
@@ -734,50 +748,205 @@ class MyDronePrototype(DroneAbstract):
         if not self.path:
             print("No path to follow.")
             return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
-        target_pos = self.path[0]
+
+        # Pure pursuit with lookahead and lateral control
+        lookahead_idx = 0
+        lookahead_dist = 40.0
+        # choose a lookahead waypoint ahead along the path
+        for i, wp in enumerate(self.path):
+            if np.linalg.norm(wp - self.current_pose[:2]) > lookahead_dist:
+                lookahead_idx = i
+                break
+        target_pos = self.path[min(lookahead_idx, len(self.path)-1)]
+
         delta_pos = target_pos - self.current_pose[:2]
+        heading = self.current_pose[2]
         target_angle = math.atan2(delta_pos[1], delta_pos[0])
 
-        # --- PID sur la rotation (inchangé) ---
-        angle_error = normalize_angle(target_angle - self.current_pose[2])
+        # Decompose error into longitudinal and lateral components in body frame
+        cos_h = math.cos(heading)
+        sin_h = math.sin(heading)
+        # body-frame projection
+        x_err = cos_h * delta_pos[0] + sin_h * delta_pos[1]   # forward error
+        y_err = -sin_h * delta_pos[0] + cos_h * delta_pos[1]  # lateral (cross-track) error
+
+        distance_to_target = math.hypot(delta_pos[0], delta_pos[1])
+
+        # --- Rotation control (reduced when carrying wounded) ---
+        angle_error = normalize_angle(target_angle - heading)
         deriv_error = angle_error - self.prev_angle_error
-        rotation_speed = self.Kp * angle_error + self.Kd * deriv_error
+        # Gains adapt if carrying a wounded to reduce oscillation
+        carrying = bool(self.grasper.grasped_wounded_persons)
+        Kp_rot = self.Kp * (0.7 if carrying else 1.0)
+        Kd_rot = self.Kd * (0.7 if carrying else 1.0)
+        rotation_speed = Kp_rot * angle_error + Kd_rot * deriv_error
         rotation_speed = float(np.clip(rotation_speed, -1.0, 1.0))
         self.prev_angle_error = angle_error
 
-        distance_to_target = np.linalg.norm(delta_pos)
+        # --- Lateral control (new) ---
+        # Cross-track PID to counter lateral deviations, stronger when carrying
+        Kp_lat = 0.05 if not carrying else 0.09
+        Kd_lat = 0.02 if not carrying else 0.04
+        if not hasattr(self, 'prev_lat_error'):
+            self.prev_lat_error = 0.0
+        lat_deriv = y_err - self.prev_lat_error
+        lateral_cmd = Kp_lat * y_err + Kd_lat * lat_deriv
+        lateral_cmd = float(np.clip(lateral_cmd, -1.0, 1.0))
+        self.prev_lat_error = y_err
 
-        # --- Profil de vitesse souhaitée (tunable) ---
-        # Augmenter max_speed pour rendre le drone plus rapide
-        max_speed = 10.0
-        # profil proportionnel à la distance, coef augmenté pour plus de vitesse
-        target_speed = max(0.0, min(max_speed, distance_to_target * 0.12 + 0.3))
+        # --- Forward speed profile ---
+        max_speed = 12.0 if not carrying else 9.0
+        target_speed = max(0.0, min(max_speed, x_err * 0.15 + 0.3))
 
         measured_vel = self.measured_velocity()
         measured_speed = math.sqrt(measured_vel[0] ** 2 + measured_vel[1] ** 2)
-
-        # --- PID sur la vitesse (Kp_pos, Kd_pos) ---
-        # erreur = consigne - mesuré
         speed_error = target_speed - measured_speed
         deriv_speed = speed_error - self.prev_speed_error
-        # commande continue - peut être négative si il faut freiner
-        forward_cmd = self.Kp_pos * speed_error + self.Kd_pos * deriv_speed
-        # si on est en train de fortement tourner, ne pas avancer
-        if abs(angle_error) > 0.2:
-            forward_cmd = 0.0
-        # normaliser la commande dans [-1, 1]
+        Kp_f = self.Kp_pos
+        Kd_f = self.Kd_pos * (0.7 if carrying else 1.0)
+        forward_cmd = Kp_f * speed_error + Kd_f * deriv_speed
+        # reduce forward when sharp turns to avoid overshoot
+        if abs(angle_error) > 0.4:
+            forward_cmd *= 0.5
         forward_cmd = float(np.clip(forward_cmd, -1.0, 1.0))
         self.prev_speed_error = speed_error
 
-        # Si proche du waypoint → passer au suivant (seuil réduit pour précision)
+        # Advance waypoints when close to any early segment
+        close_thresh = 30.0 if not carrying else 25.0
+        if len(self.path) > 0:
+            # compute distances to first few waypoints and drop those already reached
+            drop_until = -1
+            max_check = min(5, len(self.path))
+            for i in range(max_check):
+                d = np.linalg.norm(self.path[i] - self.current_pose[:2])
+                if d < close_thresh:
+                    drop_until = i
+                else:
+                    break
+            if drop_until >= 0:
+                # prevent overshoot by easing commands when switching waypoints
+                forward_cmd *= 0.5
+                lateral_cmd *= 0.5
+                # remove all reached waypoints up to drop_until
+                self.path = self.path[drop_until+1:]
+
+        # Optional damping on lateral during very small angles
+        if abs(angle_error) < 0.1:
+            lateral_cmd *= 0.7
+
+        return {"forward": forward_cmd, "lateral": lateral_cmd, "rotation": rotation_speed}
+
+    def go_to_point(self, lidar_data) -> CommandsDict:
+        """Pure pursuit navigation with path densification for smoother following.
+        Densifies waypoints to provide more intermediate targets for better tracking.
+        """
+        if not self.path:
+            print("No path to follow in go_to_point.")
+            return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
+
+        # --- Path densification: interpolate between waypoints ---
+        # Add intermediate points between waypoints for smoother pursuit
+        if not hasattr(self, '_densified_path') or not hasattr(self, '_last_path_length') or self._last_path_length != len(self.path):
+            densified = []
+            density_spacing = 15.0  # Add point every 15 units
+            
+            for i in range(len(self.path)):
+                densified.append(self.path[i])
+                if i < len(self.path) - 1:
+                    # Interpolate between current and next waypoint
+                    start = self.path[i]
+                    end = self.path[i + 1]
+                    segment_vec = end - start
+                    segment_len = np.linalg.norm(segment_vec)
+                    
+                    if segment_len > density_spacing:
+                        # Add intermediate points
+                        num_points = int(segment_len / density_spacing)
+                        for j in range(1, num_points):
+                            alpha = j / num_points
+                            interp_point = start + alpha * segment_vec
+                            densified.append(interp_point)
+            
+            self._densified_path = densified
+            self._last_path_length = len(self.path)
+        
+        # Use densified path for pure pursuit
+        path_to_follow = self._densified_path if hasattr(self, '_densified_path') else self.path
+        
+        # --- Pure pursuit lookahead ---
+        lookahead_dist = 35.0
+        lookahead_idx = 0
+        
+        for i, wp in enumerate(path_to_follow):
+            if np.linalg.norm(wp - self.current_pose[:2]) > lookahead_dist:
+                lookahead_idx = i
+                break
+        
+        target_pos = path_to_follow[min(lookahead_idx, len(path_to_follow)-1)]
+        delta_pos = target_pos - self.current_pose[:2]
+        heading = self.current_pose[2]
+        target_angle = math.atan2(delta_pos[1], delta_pos[0])
+        distance_to_target = np.linalg.norm(delta_pos)
+        
+        # --- Rotation control ---
+        angle_error = normalize_angle(target_angle - heading)
+        deriv_error = angle_error - self.prev_angle_error
+        
+        Kp_rot = self.Kp
+        Kd_rot = self.Kd
+        rotation_speed = Kp_rot * angle_error + Kd_rot * deriv_error
+        rotation_speed = float(np.clip(rotation_speed, -1.0, 1.0))
+        self.prev_angle_error = angle_error
+        
+        # --- Forward speed control (proportional to distance and angle alignment) ---
+        # Speed profile: faster when aligned, slower on sharp turns
+        max_speed = 12.0
+        
+        # Distance-based speed
         if distance_to_target < 30:
-        # on arrête le mouvement frontal pour éviter dépassement
-            forward_cmd = 0.0
-            self.path.pop(0)
-
-        # Si proche du but final
-        dist_to_goal = np.linalg.norm(self.goal_position - self.current_pose[:2])
-
+            speed_factor = distance_to_target / 30.0
+        else:
+            speed_factor = 1.0
+        
+        # Angle-based speed reduction
+        if abs(angle_error) > 0.5:
+            angle_factor = 0.4
+        elif abs(angle_error) > 0.3:
+            angle_factor = 0.7
+        else:
+            angle_factor = 1.0
+        
+        target_speed = max_speed * speed_factor * angle_factor
+        target_speed = max(0.3, target_speed)  # Minimum speed
+        
+        # PID on speed
+        measured_vel = self.measured_velocity()
+        measured_speed = math.sqrt(measured_vel[0] ** 2 + measured_vel[1] ** 2)
+        speed_error = target_speed - measured_speed
+        deriv_speed = speed_error - self.prev_speed_error
+        
+        forward_cmd = self.Kp_pos * speed_error + self.Kd_pos * deriv_speed
+        forward_cmd = float(np.clip(forward_cmd, -1.0, 1.0))
+        self.prev_speed_error = speed_error
+        
+        # --- Waypoint advancement ---
+        # Remove waypoints from original path when passed
+        close_thresh = 25.0
+        if len(self.path) > 0:
+            drop_until = -1
+            max_check = min(3, len(self.path))
+            for i in range(max_check):
+                d = np.linalg.norm(self.path[i] - self.current_pose[:2])
+                if d < close_thresh:
+                    drop_until = i
+                else:
+                    break
+            if drop_until >= 0:
+                self.path = self.path[drop_until+1:]
+                # Force re-densification on next iteration
+                if hasattr(self, '_last_path_length'):
+                    delattr(self, '_last_path_length')
+        
         return {"forward": forward_cmd, "lateral": 0.0, "rotation": rotation_speed}
 
     def display_pose(self) :
@@ -790,6 +959,25 @@ class MyDronePrototype(DroneAbstract):
                               current_pose[1],
                               radius=radius,
                               color=red)
+        
+        # Draw orientation arrow
+        arrow_length = 25
+        heading = self.current_pose[2]
+        end_x = current_pose[0] + arrow_length * math.cos(heading)
+        end_y = current_pose[1] + arrow_length * math.sin(heading)
+        arcade.draw_line(current_pose[0], current_pose[1], 
+                        end_x, end_y, 
+                        (255, 255, 0), 3)  # Yellow arrow
+        # Draw arrowhead
+        arrow_size = 8
+        left_angle = heading + 2.6
+        right_angle = heading - 2.6
+        left_x = end_x + arrow_size * math.cos(left_angle)
+        left_y = end_y + arrow_size * math.sin(left_angle)
+        right_x = end_x + arrow_size * math.cos(right_angle)
+        right_y = end_y + arrow_size * math.sin(right_angle)
+        arcade.draw_line(end_x, end_y, left_x, left_y, (255, 255, 0), 3)
+        arcade.draw_line(end_x, end_y, right_x, right_y, (255, 255, 0), 3)
 
     # --------------------------------------------------------------------------
     # FONCTIONS PRINCIPALES (Localisation, Cartographie Binaire)
