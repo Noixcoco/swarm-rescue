@@ -34,7 +34,7 @@ scipy==1.16.3
 shiboken6==6.10.0
 six==1.17.0
 # Editable install with no version control (swarm-rescue==5.1.0)
--e /home/jacques/code/swarm-rescue
+-e /home/comeg/code/swarm-rescue
 tifffile==2025.10.16
 typing_extensions==4.15.0
 tzdata==2025.2
