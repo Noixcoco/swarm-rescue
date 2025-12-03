@@ -9,6 +9,7 @@ from swarm_rescue.simulation.drone.controller import CommandsDict
 import arcade
 import sys
 from pathlib import Path
+from swarm_rescue.simulation.drone.communicator import *
 
 # Ensure examples can be imported when running from the repository root
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent.parent))
@@ -217,9 +218,6 @@ class MyDronePrototype(DroneAbstract):
         self.kf_last_time = 0
         self.kf_initialized = False
 
-    def define_message_for_all(self) -> None:
-        pass 
-
     def control(self) -> CommandsDict:
         """
         Cerveau : Logique de test simplifiée.
@@ -230,6 +228,13 @@ class MyDronePrototype(DroneAbstract):
         
         # --- 1. PERCEPTION ---
         self.update_pose()
+
+        # Traiter les messages reçus des autres drones
+        
+        list_com = self.communicator.update_list_comms_in_range()
+        if list_com!=None:
+            self.receive_and_process_messages()
+
         
         # Mise à jour de la grille probabiliste self.grid.grid (utilisée pour l'exploration)
         self.estimated_pose = Pose(np.asarray(self.measured_gps_position()),
@@ -384,6 +389,11 @@ class MyDronePrototype(DroneAbstract):
         else:
             command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
 
+        # Préparer et envoyer le message pour les autres drones
+        list_com = self.communicator.update_list_comms_in_range()
+        if list_com!=None:
+            self.define_message_for_all()
+
         command["grasper"] = 1
         
         # Store last command for display
@@ -398,6 +408,97 @@ class MyDronePrototype(DroneAbstract):
                               title="zoomed occupancy grid")
 
         return command
+
+    def define_message_for_all(self) -> None:
+        """
+        Prépare et envoie un message contenant les informations du drone à diffuser
+        aux autres membres de l'essaim.
+        """
+        if not hasattr(self, 'last_sent_grid'):
+            self.last_sent_grid = np.copy(self.grid.grid)
+
+        # Calculer les changements dans la grille
+        # On ne transmet que les cellules qui ont changé pour économiser la bande passante
+        grid_diff = self.grid.grid - self.last_sent_grid
+        changed_indices = np.where(grid_diff != 0)
+        
+        # Si des changements significatifs ont eu lieu, on les envoie
+        if changed_indices[0].size > 0:
+            # Crée une liste de (index, valeur) pour les changements
+            grid_updates = list(zip(
+                list(zip(changed_indices[0], changed_indices[1])),
+                self.grid.grid[changed_indices].tolist()
+            ))
+
+            message = {
+                #"id": self.id,
+                "grid_updates": grid_updates,
+                "wounded": self.wounded_to_rescue,
+                "rescue_center": self.rescue_zone_points
+            }
+
+            self.communicator.send(message)
+            
+            # Mettre à jour la grille de référence pour le prochain envoi
+            self.last_sent_grid = np.copy(self.grid.grid)
+
+    def receive_and_process_messages(self) -> None:
+        """
+        Récupère et traite les messages reçus des autres drones.
+        """
+        list_com = self.communicator.update_list_comms_in_range()
+        messages=[self.communicator.receive(sender) for sender in list_com]
+        for msg in messages:
+            # if msg.get("id") == self.id:
+            #     continue  # Ignorer ses propres messages
+
+            # 1. Fusionner les mises à jour de la grille
+            if "grid_updates" in msg:
+                for (y, x), value in msg["grid_updates"]:
+                    # Simple fusion : on prend la valeur la plus "certaine" (loin de 0)
+                    # Une meilleure approche serait de fusionner les log-odds.
+                    if abs(value) > abs(self.grid.grid[y, x]):
+                        self.grid.grid[y, x] = value
+
+            # 2. Mettre à jour la liste des blessés
+            if "wounded" in msg:
+                for wounded_pos in msg["wounded"]:
+                    self._add_or_update_detection(
+                        wounded_pos, 
+                        self.wounded_to_rescue, 
+                        self._wounded_memory_meta
+                    )
+
+            # 3. Mettre à jour la position du centre de secours
+            if "rescue_center" in msg and msg["rescue_center"]:
+                # On suppose qu'il n'y a qu'un seul centre de secours
+                rescue_pos = msg["rescue_center"][0]
+                self._add_or_update_detection(
+                    rescue_pos,
+                    self.rescue_zone_points,
+                    self._rescue_memory_meta,
+                    is_rescue_center=True
+                )
+
+    def _add_or_update_detection(self, new_pos, target_list, meta_dict, is_rescue_center=False):
+        """
+        Ajoute une nouvelle détection à une liste ou met à jour une détection existante
+        si elle est suffisamment proche.
+        """
+        dedup_radius = 30.0
+        alpha_update = 0.5  # Moyenne simple pour la fusion
+
+        merged = False
+        for i, pos in enumerate(target_list):
+            if math.hypot(pos[0] - new_pos[0], pos[1] - new_pos[1]) < dedup_radius:
+                # Mettre à jour la position existante avec une moyenne
+                updated_pos = ((1 - alpha_update) * pos[0] + alpha_update * new_pos[0],
+                               (1 - alpha_update) * pos[1] + alpha_update * new_pos[1])
+                target_list[i] = updated_pos
+                merged = True
+                break
+        if not merged:
+            target_list.append(new_pos)
 
     def detect_semantic_entities(self):
         """Populate `self.wounded_to_rescue` and `self.rescue_zone_points`.

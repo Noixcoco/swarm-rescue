@@ -129,6 +129,15 @@ class MyDroneMapping(DroneAbstract):
         self.grid = OccupancyGrid(size_area_world=self.size_area,
                                   resolution=resolution,
                                   lidar=self.lidar())
+        
+        if self.iteration % 5 == 0:
+            self.grid.display(self.grid.grid,
+                            self.estimated_pose,
+                            title="occupancy grid")
+            self.grid.display(self.grid.zoomed_grid,
+                            self.estimated_pose,
+                            title="zoomed occupancy grid")
+
 
     def define_message_for_all(self):
         """
