@@ -283,17 +283,78 @@ class MyDronePrototype(DroneAbstract):
                     self.path = self.creer_chemin(self.current_pose[:2], self.rescue_zone_points[0], explored_only=True)
                     self.last_replan_iteration = self.iteration
             elif self.current_target_wounded is not None:
-                # Check if target still exists (within radius, not exact match due to EMA smoothing)
-                target_still_exists = False
-                check_radius = 30.0  # tolerance radius for target identification
-                for (wx, wy) in self.wounded_to_rescue:
-                    if math.hypot(self.current_target_wounded[0] - wx, self.current_target_wounded[1] - wy) < check_radius:
-                        target_still_exists = True
-                        break
-                if not target_still_exists:
-                    # Target truly lost, return to exploring
-                    self.state = self.Activity.EXPLORING
-                    self.current_target_wounded = None
+                # Check distance to target
+                distance_to_target = np.linalg.norm(np.array(self.current_target_wounded) - self.current_pose[:2])
+                
+                # If we're close enough, verify the wounded is actually here via semantic sensor
+                if distance_to_target < 40.0:
+                    wounded_detected = False
+                    detection_radius = 60.0
+                    
+                    try:
+                        detections = self.semantic_values()
+                        if detections:
+                            px = float(self.current_pose[0])
+                            py = float(self.current_pose[1])
+                            ptheta = float(self.current_pose[2])
+                            
+                            for data in detections:
+                                try:
+                                    etype = getattr(data, 'entity_type', None)
+                                    name = etype.name if hasattr(etype, 'name') else str(etype)
+                                    
+                                    if 'WOUNDED' in name.upper():
+                                        angle = float(getattr(data, 'angle', 0.0))
+                                        dist = float(getattr(data, 'distance', 0.0))
+                                        
+                                        # Convert to world coordinates
+                                        global_angle = normalize_angle(ptheta + angle)
+                                        xw = px + dist * math.cos(global_angle)
+                                        yw = py + dist * math.sin(global_angle)
+                                        
+                                        dist_to_detected = math.hypot(self.current_target_wounded[0] - xw, 
+                                                                      self.current_target_wounded[1] - yw)
+                                        
+                                        if dist_to_detected < detection_radius:
+                                            wounded_detected = True
+                                            break
+                                except Exception:
+                                    continue
+                    except Exception:
+                        pass
+                    
+                    # If wounded not detected on site, remove from list and return to exploring
+                    if not wounded_detected:
+                        print(f"WARNING: Wounded not found at expected location {self.current_target_wounded}. Removing from list.")
+                        check_radius = 50.0
+                        self.wounded_to_rescue = [
+                            (wx, wy) for (wx, wy) in self.wounded_to_rescue
+                            if math.hypot(self.current_target_wounded[0] - wx, 
+                                        self.current_target_wounded[1] - wy) > check_radius
+                        ]
+                        
+                        # Clean up metadata
+                        def _key_of(pt):
+                            return (round(float(pt[0]), 1), round(float(pt[1]), 1))
+                        key = _key_of(self.current_target_wounded)
+                        self._wounded_memory_meta.pop(key, None)
+                        
+                        # Return to exploring
+                        self.state = self.Activity.EXPLORING
+                        self.current_target_wounded = None
+                        self.path = []
+                elif self.current_target_wounded is not None:
+                    # Still far from target, check if target still exists in wounded list (in case another drone rescued it)
+                    target_still_exists = False
+                    check_radius = 30.0  # tolerance radius for target identification
+                    for (wx, wy) in self.wounded_to_rescue:
+                        if math.hypot(self.current_target_wounded[0] - wx, self.current_target_wounded[1] - wy) < check_radius:
+                            target_still_exists = True
+                            break
+                    if not target_still_exists:
+                        # Target truly lost from list, return to exploring
+                        self.state = self.Activity.EXPLORING
+                        self.current_target_wounded = None
             else:
                 # No target defined, return to exploring
                 self.state = self.Activity.EXPLORING
