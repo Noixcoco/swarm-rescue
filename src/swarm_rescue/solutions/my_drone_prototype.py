@@ -459,6 +459,17 @@ class MyDronePrototype(DroneAbstract):
 
         return command
 
+    def filter_position(self, old_pos, new_pos, alpha=0.3):
+        """
+        Apply Exponential Moving Average (EMA) filtering to smooth positions.
+        alpha: smoothing factor (0 < alpha < 1). 
+               Lower alpha = more smoothing (slower response).
+               Higher alpha = less smoothing (faster response).
+        """
+        x = (1.0 - alpha) * old_pos[0] + alpha * new_pos[0]
+        y = (1.0 - alpha) * old_pos[1] + alpha * new_pos[1]
+        return (x, y)
+
     def detect_semantic_entities(self):
         """Populate `self.wounded_to_rescue` and `self.rescue_zone_points`.
 
@@ -528,10 +539,8 @@ class MyDronePrototype(DroneAbstract):
             merged = False
             for i, (wx, wy) in enumerate(self.wounded_to_rescue):
                 if math.hypot(wx - nx, wy - ny) < dedup_radius:
-                    # weighted update
-                    newx = (1.0 - alpha_update) * wx + alpha_update * nx
-                    newy = (1.0 - alpha_update) * wy + alpha_update * ny
-                    self.wounded_to_rescue[i] = (newx, newy)
+                    # Use filter to smooth position instead of direct replacement
+                    self.wounded_to_rescue[i] = self.filter_position(self.wounded_to_rescue[i], (nx, ny), alpha=alpha_update)
                     self._wounded_memory_meta[_key_of(self.wounded_to_rescue[i])] = self.iteration
                     merged = True
                     break
@@ -545,9 +554,7 @@ class MyDronePrototype(DroneAbstract):
             merged = False
             for i, (rx, ry) in enumerate(self.rescue_zone_points):
                 if math.hypot(rx - nx, ry - ny) < dedup_radius:
-                    newx = (1.0 - alpha_update) * rx + alpha_update * nx
-                    newy = (1.0 - alpha_update) * ry + alpha_update * ny
-                    self.rescue_zone_points[i] = (newx, newy)
+                    self.rescue_zone_points[i] = self.filter_position(self.rescue_zone_points[i], (nx, ny), alpha=alpha_update)
                     self._rescue_memory_meta[_key_of(self.rescue_zone_points[i])] = self.iteration
                     merged = True
                     break
@@ -565,9 +572,7 @@ class MyDronePrototype(DroneAbstract):
                     merged = False
                     for i, (wx, wy) in enumerate(self.wounded_to_rescue):
                         if math.hypot(wx - pt[0], wy - pt[1]) < dedup_radius:
-                            newx = (1.0 - alpha_update) * wx + alpha_update * pt[0]
-                            newy = (1.0 - alpha_update) * wy + alpha_update * pt[1]
-                            self.wounded_to_rescue[i] = (newx, newy)
+                            self.wounded_to_rescue[i] = self.filter_position(self.wounded_to_rescue[i], pt, alpha=0.5)
                             self._wounded_memory_meta[_key_of(self.wounded_to_rescue[i])] = tr.get('last_seen', self.iteration)
                             merged = True
                             break
@@ -582,9 +587,7 @@ class MyDronePrototype(DroneAbstract):
                 merged = False
                 for i, (rx, ry) in enumerate(self.rescue_zone_points):
                     if math.hypot(rx - pt[0], ry - pt[1]) < dedup_radius:
-                        newx = (1.0 - alpha_update) * rx + alpha_update * pt[0]
-                        newy = (1.0 - alpha_update) * ry + alpha_update * pt[1]
-                        self.rescue_zone_points[i] = (newx, newy)
+                        self.rescue_zone_points[i] = self.filter_position(self.rescue_zone_points[i], pt, alpha=0.3)
                         self._rescue_memory_meta[_key_of(self.rescue_zone_points[i])] = tr.get('last_seen', self.iteration)
                         merged = True
                         break
