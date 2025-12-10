@@ -399,13 +399,12 @@ class MyDronePrototype(DroneAbstract):
         elif self.state == self.Activity.GOING_TO_WOUNDED:
             # Navigate to wounded
             if self.current_target_wounded:
-                # Only replan if path is empty AND enough iterations have passed (avoid constant replanning)
-                # OR if this is the first time (last_replan_iteration == 0)
+                # Replan regularly (every 10 iterations)
                 should_replan = False
                 if not self.path or len(self.path) == 0:
-                    iterations_since_replan = self.iteration - self.last_replan_iteration
-                    if iterations_since_replan >= 30 or self.last_replan_iteration == 0:
-                        should_replan = True
+                    should_replan = True
+                elif self.iteration % 10 == 0:
+                    should_replan = True
                 
                 if should_replan:
                     self.path = self.creer_chemin(self.current_pose[:2], self.current_target_wounded)
@@ -473,7 +472,7 @@ class MyDronePrototype(DroneAbstract):
             detections = None
 
         # parameters
-        dedup_radius = 20.0         # close detections considered same
+        dedup_radius = 50.0         # close detections considered same
         alpha_update = 0.3          # mixing factor when updating an existing entry
         memory_max_age = 50000        # iterations before forgetting an unseen entry
 
