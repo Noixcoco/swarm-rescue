@@ -235,6 +235,11 @@ class Launcher:
             # Clean up resources even in case of crash
             if hasattr(the_map, 'playground') and the_map.playground:
                 the_map.playground.cleanup()
+                # ensure window is closed as well (safe no-op if already closed)
+                try:
+                    the_map.playground.close_window()
+                except Exception:
+                    pass
 
             has_crashed = True
         finally:
@@ -260,10 +265,11 @@ class Launcher:
         # Clean up resources after the round to prevent memory leaks
         if hasattr(the_map, 'playground') and the_map.playground:
             the_map.playground.cleanup()
-
-        # Clean up GUI resources
-        if my_gui:
-            my_gui.close()
+            # explicitly close the GUI window associated with the playground
+            try:
+                the_map.playground.close_window()
+            except Exception:
+                pass
 
         return (my_gui.percent_drones_destroyed,
                 my_gui.mean_drones_health,
