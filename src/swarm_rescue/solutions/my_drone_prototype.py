@@ -410,10 +410,7 @@ class MyDronePrototype(DroneAbstract):
                     self.path = self.creer_chemin(self.current_pose[:2], self.current_target_wounded)
                     self.last_replan_iteration = self.iteration
                 
-                if self.path:
-                    command = self.follow_path(lidar_data)
-                else:
-                    command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
+                command = self.go_to_wounded(lidar_data)
             else:
                 command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
 
@@ -898,6 +895,81 @@ class MyDronePrototype(DroneAbstract):
             lateral_cmd *= 0.7
 
         return {"forward": forward_cmd, "lateral": lateral_cmd, "rotation": rotation_speed}
+
+    def emergency_stop(self) -> CommandsDict:
+        """
+        Arrêt d'urgence : freine le drone le plus rapidement possible.
+        """
+        measured_vel = self.measured_velocity()
+        compass_angle = self.measured_compass_angle()
+        
+        if measured_vel is None or compass_angle is None:
+            return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
+            
+        vx_world, vy_world = measured_vel
+        
+        # Rotation vers le repère du drone
+        cos_a = math.cos(compass_angle)
+        sin_a = math.sin(compass_angle)
+        
+        vx_body = vx_world * cos_a + vy_world * sin_a
+        vy_body = -vx_world * sin_a + vy_world * cos_a
+        
+        # Freinage "à fond" (bang-bang)
+        # On applique la commande maximale opposée à la vitesse tant qu'elle est significative
+        
+        if abs(vx_body) > 0.1:
+            forward_cmd = -1.0 if vx_body > 0 else 1.0
+        else:
+            forward_cmd = -vx_body * 5.0  # Freinage final doux
+            
+        if abs(vy_body) > 0.1:
+            lateral_cmd = -1.0 if vy_body > 0 else 1.0
+        else:
+            lateral_cmd = -vy_body * 5.0
+
+        # Clip final
+        forward_cmd = float(np.clip(forward_cmd, -1.0, 1.0))
+        lateral_cmd = float(np.clip(lateral_cmd, -1.0, 1.0))
+        
+        return {"forward": forward_cmd, "lateral": lateral_cmd, "rotation": 0.0}
+
+    def go_to_wounded(self, lidar_data) -> CommandsDict:
+        """
+        Navigation vers le blessé.
+        - Si distance > 40 pixels : utilise follow_path (suivi de chemin A*)
+        - Si distance < 40 pixels : s'arrête, s'oriente vers le blessé, et fonce tout droit.
+        """
+        if self.current_target_wounded is None:
+            return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
+
+        # Calcul de la distance au blessé
+        dist_to_wounded = np.linalg.norm(np.array(self.current_target_wounded) - self.current_pose[:2])
+
+        if dist_to_wounded > 40.0:
+            return self.follow_path(lidar_data)
+        else:
+            # Comportement proche : orientation puis charge
+            delta_pos = np.array(self.current_target_wounded) - self.current_pose[:2]
+            target_angle = math.atan2(delta_pos[1], delta_pos[0])
+            heading = self.current_pose[2]
+            angle_error = normalize_angle(target_angle - heading)
+
+            # PID Rotation
+            deriv_error = angle_error - self.prev_angle_error
+            rotation_speed = self.Kp * angle_error + self.Kd * deriv_error
+            rotation_speed = float(np.clip(rotation_speed, -1.0, 1.0))
+            self.prev_angle_error = angle_error
+
+            # Seuil d'alignement (1 degré)
+            ALIGNMENT_THRESHOLD = math.radians(1.0)
+
+            if abs(angle_error) > ALIGNMENT_THRESHOLD:
+                # Phase 1 : S'arrêter et s'orienter
+                return {"forward": 0.0, "lateral": 0.0, "rotation": rotation_speed}
+            else:
+                # Phase 2 : Fonce tout droit
+                return {"forward": 1.0, "lateral": 0.0, "rotation": rotation_speed}
 
     def go_to_point(self, lidar_data) -> CommandsDict:
         """Pure pursuit navigation with path densification for smoother following.
