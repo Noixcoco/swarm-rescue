@@ -221,25 +221,24 @@ class MyDronePrototype(DroneAbstract):
         self.stuck_timer = 0
         self.last_pos = None
 
+        if not hasattr(self, "rescued_wounded"):
+            self.rescued_wounded = []
+
+        self.wounded_assignments = {}  # {wounded_pos: drone_id}
 
     def define_message_for_all(self) -> None:
-        """
-        Définit le message à envoyer à tous les coéquipiers proches.
-        Nous partageons la pose et les cibles (blessés et zone de sauvetage).
-        """
-        # Note: L'attribut self.message est le dictionnaire qui sera envoyé.
         self.message = {
-            # Partager la pose estimée (utile pour l'exploration coordonnée future)
             "drone_pose": self.current_pose.tolist(),
-            # Partager les cibles découvertes
             "wounded_list": self.wounded_to_rescue,
             "rescue_list": self.rescue_zone_points,
-            # Ajouter une information sur le statut (facultatif mais utile)
-            "state": self.state.name
+            "state": self.state.name,
+            "rescued_wounded": getattr(self, "rescued_wounded", []),
+            "wounded_assignments": self.wounded_assignments,
+            "grasped_wounded": [
+                (w.position[0], w.position[1]) if hasattr(w, "position") else None
+                for w in getattr(self.grasper, "grasped_wounded_persons", [])
+            ]
         }
-
-
-
 
 
     def control(self) -> CommandsDict:
@@ -250,6 +249,10 @@ class MyDronePrototype(DroneAbstract):
         # increment the iteration counter
         self.iteration += 1
         
+   
+        for msg in getattr(self, "received_messages", []):
+            self.merge_wounded_list(msg)
+
         # --- 1. PERCEPTION ---
         self.update_pose()
         
@@ -269,14 +272,23 @@ class MyDronePrototype(DroneAbstract):
         except Exception:
             pass
 
+
         # STATE MACHINE LOGIC
         # Transitions
         if self.state == self.Activity.EXPLORING:
-            if self.wounded_to_rescue:
-                # Choose closest wounded
-                distances = [np.linalg.norm(np.array(w) - self.current_pose[:2]) for w in self.wounded_to_rescue]
+            # Only consider wounded not already assigned or grasped
+            grasped = getattr(self, "other_grasped_wounded", set())
+            available_wounded = [
+                w for w in self.wounded_to_rescue
+                if w not in self.wounded_assignments and w not in grasped
+            ]
+            if available_wounded:
+                # Choose closest available wounded
+                distances = [np.linalg.norm(np.array(w) - self.current_pose[:2]) for w in available_wounded]
                 closest_idx = int(np.argmin(distances))
-                self.current_target_wounded = self.wounded_to_rescue[closest_idx]
+                self.current_target_wounded = available_wounded[closest_idx]
+                # Assign this wounded to self (first-come, first-served)
+                self.wounded_assignments[self.current_target_wounded] = self.identifier
                 self.state = self.Activity.GOING_TO_WOUNDED
                 self.path = self.creer_chemin(self.current_pose[:2], self.current_target_wounded)
                 self.last_replan_iteration = self.iteration
@@ -284,6 +296,9 @@ class MyDronePrototype(DroneAbstract):
         elif self.state == self.Activity.GOING_TO_WOUNDED:
             if self.grasper.grasped_wounded_persons:
                 # Successfully grasped, go to rescue center
+                # Mark as rescued
+                if self.current_target_wounded is not None:
+                    self.rescued_wounded.append(self.current_target_wounded)
                 self.state = self.Activity.GOING_TO_RESCUE_CENTER
                 
                 # Remove the grasped wounded from the list
@@ -397,6 +412,9 @@ class MyDronePrototype(DroneAbstract):
 
             if not self.grasper.grasped_wounded_persons:
                 # Dropped wounded, return to exploring
+                if self.current_target_wounded is not None:
+                    # Remove assignment so other drones don't try to grab it
+                    self.wounded_assignments.pop(self.current_target_wounded, None)
                 self.state = self.Activity.EXPLORING
                 self.current_target_wounded = None
                 self.stuck_timer = 0
@@ -406,7 +424,7 @@ class MyDronePrototype(DroneAbstract):
                 distance_to_rescue = np.linalg.norm(np.array(self.rescue_zone_points[0]) - self.current_pose[:2])
                 self.last_pos = self.current_pose[:2].copy()
                 # Near rescue center - check if stuck
-                if distance_to_rescue < 100.0:
+                if distance_to_rescue < 10.0:
                     if self.last_pos is not None:
                         movement = np.linalg.norm(self.current_pose[:2] - self.last_pos)
                         if movement < 3.0:
@@ -416,8 +434,11 @@ class MyDronePrototype(DroneAbstract):
                     self.last_pos = self.current_pose[:2].copy()
                     
                     # Rotate if stuck
-                    if self.stuck_timer > 15:
-                        command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.5}  # Add rotation
+                    while self.stuck_timer > 15 and self.stuck_timer <25:
+                        command = {"forward": -1.0, "lateral": 0.0, "rotation": 0.5}
+                        command["grasper"] = 1
+                        self.stuck_timer += 1
+                        return command 
 
         # --- 2. STRATÉGIE ---
         # Replanification for exploration (only when in EXPLORING state)
@@ -1004,4 +1025,41 @@ class MyDronePrototype(DroneAbstract):
                 dy = dist_traveled * math.sin(self.current_pose[2])
                 self.current_pose[0] += dx
                 self.current_pose[1] += dy
+
+    def merge_wounded_list(self, other_message):
+        """
+        Merge wounded list from another drone's message.
+        Adds new wounded positions not already in self.wounded_to_rescue.
+        """
+        if "wounded_list" not in other_message:
+            return
+        dedup_radius = 60
+        # Add new wounded
+        for w in other_message["wounded_list"]:
+            if all(math.hypot(w[0] - wx, w[1] - wy) > dedup_radius for (wx, wy) in self.wounded_to_rescue):
+                self.wounded_to_rescue.append(tuple(w))
+        # Remove rescued wounded shared by other drone
+        for rw in other_message.get("rescued_wounded", []):
+            self.wounded_to_rescue = [
+                (wx, wy) for (wx, wy) in self.wounded_to_rescue
+                if math.hypot(rw[0] - wx, rw[1] - wy) > dedup_radius
+            ]
+        # Merge assignments (first-come, first-served: keep existing assignment)
+        for w, drone_id in other_message.get("wounded_assignments", {}).items():
+            if w not in self.wounded_assignments:
+                self.wounded_assignments[w] = drone_id
+        # Collect grasped wounded from other drones
+        if not hasattr(self, "other_grasped_wounded"):
+            self.other_grasped_wounded = set()
+        for w in other_message.get("grasped_wounded", []):
+            if w is not None:
+                print(f"Detected another drone has grasped wounded at {w}")
+                self.other_grasped_wounded.add(tuple(w))
+
+        # Deduplicate wounded list
+        deduped = []
+        for w in self.wounded_to_rescue:
+            if all(math.hypot(w[0] - wx, w[1] - wy) > dedup_radius for (wx, wy) in deduped):
+                deduped.append(w)
+        self.wounded_to_rescue = deduped
 
