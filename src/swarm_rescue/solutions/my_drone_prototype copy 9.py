@@ -25,10 +25,11 @@ class MyDronePrototype(DroneAbstract):
         GOING_TO_WOUNDED = 2
         GOING_TO_RESCUE_CENTER = 3
 
-    def creer_chemin(self, start_world, goal_world, explored_only=False):
+    def creer_chemin(self, start_world, goal_world, explored_only=False ):
         """
         Calcule un chemin entre start_world et goal_world en évitant les murs et les zones proches des murs (moins de 4 pixels) avec A*.
         Si explored_only=True, le chemin ne passera que par des zones explorées.
+        Évite automatiquement les positions des autres drones UNIQUEMENT s'ils sont devant.
         Retourne une liste de points (en coordonnées monde).
         """
         import heapq
@@ -52,6 +53,51 @@ class MyDronePrototype(DroneAbstract):
         struct = np.ones((5, 5), dtype=bool)  # carré 5x5 ~ rayon 2
         danger_zone = binary_dilation(is_wall, structure=struct, iterations=1)
         
+        # --- MODIFIED DRONE AVOIDANCE ZONE - ONLY AVOID DRONES IN FRONT ---
+        drone_danger_zone = np.zeros_like(grid, dtype=bool)
+
+        if hasattr(self, 'other_drones_positions') and self.other_drones_positions:
+            drone_avoidance_radius = 20  # Adjust as needed
+            my_pos = np.array(self.current_pose[:2])
+            my_heading = float(self.current_pose[2])
+
+            # Precompute patch size in grid units
+            patch_radius = int(drone_avoidance_radius / self.grid.resolution)
+            patch_diam = patch_radius * 2 + 1
+            y_indices, x_indices = np.ogrid[-patch_radius:patch_radius+1, -patch_radius:patch_radius+1]
+            patch_mask = (x_indices**2 + y_indices**2) <= patch_radius**2
+
+            for drone_pos in self.other_drones_positions:
+                other_pos = np.array(drone_pos[:2])
+                vec_to_drone = other_pos - my_pos
+                dist_to_drone = np.linalg.norm(vec_to_drone)
+                if dist_to_drone < 1e-3:
+                    continue  # Skip self or overlapping positions
+
+                angle_to_drone = math.atan2(vec_to_drone[1], vec_to_drone[0])
+                relative_angle = normalize_angle(angle_to_drone - my_heading)
+
+                # Only avoid if drone is in front (within ±90 degrees of heading)
+                if abs(relative_angle) < math.pi / 2:
+                    # Convert world coordinates to grid coordinates
+                    drone_grid_pos = self.grid._conv_world_to_grid(drone_pos[0], drone_pos[1])
+                    drone_y, drone_x = int(drone_grid_pos[0]), int(drone_grid_pos[1])
+
+                    # Patch bounds
+                    y0 = max(0, drone_y - patch_radius)
+                    y1 = min(grid.shape[0], drone_y + patch_radius + 1)
+                    x0 = max(0, drone_x - patch_radius)
+                    x1 = min(grid.shape[1], drone_x + patch_radius + 1)
+
+                    # Patch mask slice
+                    patch_y0 = y0 - (drone_y - patch_radius)
+                    patch_y1 = patch_y0 + (y1 - y0)
+                    patch_x0 = x0 - (drone_x - patch_radius)
+                    patch_x1 = patch_x0 + (x1 - x0)
+
+                    # Apply mask only in patch
+                    drone_danger_zone[y0:y1, x0:x1] |= patch_mask[patch_y0:patch_y1, patch_x0:patch_x1]
+# ...existing code...
         # Si explored_only=True, ajouter les zones non explorées à danger_zone
         if explored_only:
             danger_zone = danger_zone | (~is_explored)
@@ -150,6 +196,10 @@ class MyDronePrototype(DroneAbstract):
                     heapq.heappush(oheap, (fscore[neighbor], neighbor))
         # Pas de chemin trouvé
         return []
+    
+
+
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         
@@ -162,22 +212,18 @@ class MyDronePrototype(DroneAbstract):
                                   lidar=self.lidar())
         
         # --- Sécurité et Inflation ---
-        self.robot_radius_pixels = 30 
+        self.robot_radius_pixels = 15 
         # Le rayon d'inflation utilise maintenant la résolution de self.grid
         self.inflation_radius_cells = int(self.robot_radius_pixels / self.grid.resolution)
         if self.inflation_radius_cells < 1:
             self.inflation_radius_cells = 1
         
-
-
         # parametre PID rotation
-
         self.prev_angle_error = 0.0
         self.Kp = 3
         self.Kd = 2
 
         # PID translation
-
         self.Kp_pos = 1.6
         self.Kd_pos = 11.0
         # Pour le PID de vitesse
@@ -188,7 +234,7 @@ class MyDronePrototype(DroneAbstract):
 
         # `wounded_to_rescue`: list of (x,y) tuples for detected wounded persons
         # `rescue_zone_points`: list of (x,y) tuples representing detected rescue area points
-        self.wounded_to_rescue = [(0,0)]
+        self.wounded_to_rescue = []
         self.rescue_zone_points = []
 
         # internal metadata to remember when a detection was last seen
@@ -216,16 +262,19 @@ class MyDronePrototype(DroneAbstract):
         self.kf_last_time = 0
         self.kf_initialized = False
 
-        #deblocage blessé face au rescue center
-        self.stuck_timer = 0
-        self.last_pos = None
 
-        if not hasattr(self, "rescued_wounded"):
-            self.rescued_wounded = []
+
+  
 
         self.wounded_assignments = {}  # {wounded_pos: drone_id}
 
+        self.removed_wounded = []  # Liste des wounded explicitement supprimées ce tour
         
+        # --- NEW: General unstuck mechanism ---
+        self.general_stuck_counter = 0
+        self.last_unstuck_check_pos = None
+        self.unstuck_target = None
+        self.is_unstucking = False
 
     def define_message_for_all(self):
         # Get positions of currently grasped wounded
@@ -240,13 +289,20 @@ class MyDronePrototype(DroneAbstract):
         message = {
             "drone_id": self.identifier,  
             "drone_pose": self.current_pose.tolist(),
-            "wounded_list": wounded_list,
+            "wounded_list": [
+                w for w in self.wounded_to_rescue
+                if w not in getattr(self.grasper, "grasped_wounded_persons", [])
+            ],
             "rescue_list": self.rescue_zone_points,
             "state": self.state.name,
-            "rescued_wounded": getattr(self, "rescued_wounded", []),
             "wounded_assignments": self.wounded_assignments,
-            "grasped_wounded": list(grasped_positions)
+            "grasped_wounded": list(
+                (w.position[0], w.position[1]) for w in getattr(self.grasper, "grasped_wounded_persons", []) if hasattr(w, "position")
+            ),
+            "removed_wounded": self.removed_wounded  # <-- Ajout ici
         }
+        # Reset removed_wounded after sending
+        self.removed_wounded = []
         return message
 
     def control(self) -> CommandsDict:
@@ -257,16 +313,8 @@ class MyDronePrototype(DroneAbstract):
         # increment the iteration counter
         self.iteration += 1
 
-        # Process received messages sent from my drone
-        
-       
-          
-
         # Process received messages from other drones
-        
         self.process_communication_sensor()
-
-        
 
         # --- 1. PERCEPTION ---
         self.update_pose()
@@ -287,6 +335,16 @@ class MyDronePrototype(DroneAbstract):
         except Exception:
             pass
 
+        # --- NEW: Check for general stuck condition FIRST ---
+        if self.check_and_handle_general_stuck():
+            # If unstucking, follow the unstuck path
+            if self.path:
+                command = self.follow_path(lidar_data)
+                command["grasper"] = 1
+                return command
+            else:
+                # Unstuck path failed, try simple reverse maneuver
+                return {"forward": -0.5, "lateral": 0.3, "rotation": 0.4, "grasper": 1}
 
         # STATE MACHINE LOGIC
         # Transitions
@@ -294,8 +352,7 @@ class MyDronePrototype(DroneAbstract):
             # Only consider wounded not already assigned or grasped
             grasped = getattr(self, "other_grasped_wounded", set())
 
-        
-            exclusion_radius = 100.0  # You can adjust this value as needed
+            exclusion_radius = 20.0  # You can adjust this value as needed
 
             def is_near_grasped(w):
                 return any(math.hypot(w[0] - gx, w[1] - gy) < exclusion_radius for (gx, gy) in grasped)
@@ -309,7 +366,7 @@ class MyDronePrototype(DroneAbstract):
                 distances = [np.linalg.norm(np.array(w) - self.current_pose[:2]) for w in available_wounded]
                 closest_idx = int(np.argmin(distances))
                 self.current_target_wounded = available_wounded[closest_idx]
-                # Assign this wounded to self (first-come, first-served)
+                # Assign this wounded to self (optimistic assignment)
                 self.wounded_assignments[self.current_target_wounded] = self.identifier
                 self.state = self.Activity.GOING_TO_WOUNDED
                 self.path = self.creer_chemin(self.current_pose[:2], self.current_target_wounded)
@@ -317,10 +374,57 @@ class MyDronePrototype(DroneAbstract):
 
         elif self.state == self.Activity.GOING_TO_WOUNDED:
             grasped = getattr(self, "other_grasped_wounded", set())
-            exclusion_radius = 100.0  # Same as in EXPLORING
+            exclusion_radius = 20.0  # Same as in EXPLORING
 
             def is_near_grasped(w):
                 return any(math.hypot(w[0] - gx, w[1] - gy) < exclusion_radius for (gx, gy) in grasped)
+
+            # --- Check before grasping: if drone is near a grasped wounded, abort and explore ---
+            # If the drone's current position is near any grasped wounded, abort and go back to exploring
+            for (gx, gy) in grasped:
+                if math.hypot(self.current_pose[0] - gx, self.current_pose[1] - gy) < exclusion_radius:
+                    self.state = self.Activity.EXPLORING
+                    self.current_target_wounded = None
+                    self.path = []
+                    
+
+            # --- Optimisme contrôlé : résolution de conflit d'assignation ---
+            if self.current_target_wounded is not None:
+                # Cherche tous les drones assignés à cette wounded
+                assigned_drones = [
+                    drone_id for w, drone_id in self.wounded_assignments.items()
+                    if np.allclose(w, self.current_target_wounded, atol=1e-2)
+                ]
+                # Si plusieurs drones assignés, appliquer la règle de priorité : le plus proche garde la cible
+                if len(assigned_drones) > 1:
+                    # Récupère la position de chaque drone assigné (si possible)
+                    my_dist = np.linalg.norm(np.array(self.current_target_wounded) - self.current_pose[:2])
+                    min_dist = my_dist
+                    winner_id = self.identifier
+                    # On suppose que les autres positions de drones sont dans les messages reçus
+                    # (à adapter si tu as une structure pour stocker les positions des autres drones)
+                    for msg in getattr(self.communicator, "received_messages", []):
+                        other = msg[1] if isinstance(msg, tuple) else msg
+                        other_id = other.get("drone_id")
+                        other_pose = np.array(other.get("drone_pose", [None, None, None]))
+                        if other_id in assigned_drones and other_pose[0] is not None:
+                            dist = np.linalg.norm(np.array(self.current_target_wounded) - other_pose[:2])
+                            if dist < min_dist:
+                                min_dist = dist
+                                winner_id = other_id
+                    # Si je ne suis pas le plus proche, j'abandonne la cible
+                    if winner_id != self.identifier:
+                        self.state = self.Activity.EXPLORING
+                        self.current_target_wounded = None
+                        self.path = []
+                        # Retirer l'assignation locale
+                        for w in list(self.wounded_assignments):
+                            if np.allclose(w, self.current_target_wounded, atol=1e-2):
+                                self.wounded_assignments.pop(w, None)
+                        return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0, "grasper": 1}
+                    else:
+                        # Je suis le plus proche, je garde l'assignation
+                        self.wounded_assignments[self.current_target_wounded] = self.identifier
 
             # Abort if target is now grasped by another drone (within exclusion radius)
             if self.current_target_wounded is not None and is_near_grasped(self.current_target_wounded):
@@ -329,111 +433,153 @@ class MyDronePrototype(DroneAbstract):
                 self.path = []
             elif self.grasper.grasped_wounded_persons:
                 # Successfully grasped, go to rescue center
-                # Mark as rescued
                 if self.current_target_wounded is not None:
-                    self.rescued_wounded.append(self.current_target_wounded)
+
+                    self.removed_wounded.append(self.current_target_wounded)
+
+
+
                 self.state = self.Activity.GOING_TO_RESCUE_CENTER
-                
-                # Remove the grasped wounded from the list
                 if self.current_target_wounded is not None:
-                    # Find and remove the wounded within check_radius
                     check_radius = 50.0
                     self.wounded_to_rescue = [
                         (wx, wy) for (wx, wy) in self.wounded_to_rescue
                         if math.hypot(self.current_target_wounded[0] - wx, self.current_target_wounded[1] - wy) >= check_radius
                     ]
-                    # Also clean up metadata
+
+                    print(f"[{self.identifier}] STEP 2: Removed wounded at {self.current_target_wounded} from wounded_to_rescue. Current list: {self.wounded_to_rescue}")
+
                     def _key_of(pt):
                         return (round(float(pt[0]), 1), round(float(pt[1]), 1))
                     if self.current_target_wounded:
                         key = _key_of(self.current_target_wounded)
                         self._wounded_memory_meta.pop(key, None)
-                
                 if self.rescue_zone_points:
                     self.path = self.creer_chemin(self.current_pose[:2], self.rescue_zone_points[0], explored_only=True)
                     self.last_replan_iteration = self.iteration
 
-
             elif self.current_target_wounded is not None:
-                    # Check if we've arrived at the target location
-                    distance_to_target = np.linalg.norm(np.array(self.current_target_wounded) - self.current_pose[:2])
-                    
-                    if distance_to_target < 30.0:  # Within 30 units of target
-                        
-                        # Check if wounded is currently detected by semantic sensor
-                        wounded_detected = False
-                        detection_radius = 50.0
-                        
-                        try:
-                            detections = self.semantic_values()
-                            if detections:
-                                px = float(self.current_pose[0])
-                                py = float(self.current_pose[1])
-                                ptheta = float(self.current_pose[2])
-                                
+                distance_to_target = np.linalg.norm(np.array(self.current_target_wounded) - self.current_pose[:2])
+                
+                # --- Stuck detection logic ---
+                if not hasattr(self, "stuck_counter"):
+                    self.stuck_counter = 0
+                    self.last_stuck_target = None
+                    self.last_stuck_pos = None
+
+                # Check if wounded is currently detected by semantic sensor
+                wounded_detected = False
+                detection_radius = 50.0
+                
+                if distance_to_target < 30.0:
+                    try:
+                        detections = self.semantic_values()
+                        if detections:
+                            px = float(self.current_pose[0])
+                            py = float(self.current_pose[1])
+                            ptheta = float(self.current_pose[2])
                             
-                                
-                                for data in detections:
-                                    try:
-                                        etype = getattr(data, 'entity_type', None)
-                                        name = etype.name if hasattr(etype, 'name') else str(etype)
+                            for data in detections:
+                                try:
+                                    etype = getattr(data, 'entity_type', None)
+                                    name = etype.name if hasattr(etype, 'name') else str(etype)
+                                    
+                                    if 'WOUNDED' in name.upper():
+                                        angle = float(getattr(data, 'angle', 0.0))
+                                        dist = float(getattr(data, 'distance', 0.0))
                                         
-                                        if 'WOUNDED' in name.upper():
-                                            angle = float(getattr(data, 'angle', 0.0))
-                                            dist = float(getattr(data, 'distance', 0.0))
-                                            
-                                            # Convert to world coordinates
-                                            global_angle = normalize_angle(ptheta + angle)
-                                            xw = px + dist * math.cos(global_angle)
-                                            yw = py + dist * math.sin(global_angle)
-                                            
-                                            dist_to_target = math.hypot(self.current_target_wounded[0] - xw, 
-                                                                       self.current_target_wounded[1] - yw)
-                                           
-                                            
-                                            if dist_to_target < detection_radius:
-                                                wounded_detected = True
-                                                
-                                                break
-                                    except Exception as e:
-                                        print(f"  Error processing detection: {e}")
-                                        continue
+                                        # Convert to world coordinates
+                                        global_angle = normalize_angle(ptheta + angle)
+                                        xw = px + dist * math.cos(global_angle)
+                                        yw = py + dist * math.sin(global_angle)
+                                        
+                                        dist_to_target = math.hypot(self.current_target_wounded[0] - xw, 
+                                                                   self.current_target_wounded[1] - yw)
+                                        
+                                        if dist_to_target < detection_radius:
+                                            wounded_detected = True
+                                            break
+                                except Exception as e:
+                                    print(f"  Error processing detection: {e}")
+                                    continue
+                        else:
+                            print("No semantic detections available")
+                    except Exception as e:
+                        print(f"Error reading semantic sensor: {e}")
+                    
+                    print(f"Wounded detected: {wounded_detected}")
+                    
+                    # --- INCREMENT STUCK COUNTER ---
+                    if wounded_detected:
+                        # Check if drone is making progress
+                        if self.last_stuck_pos is not None:
+                            movement = np.linalg.norm(self.current_pose[:2] - self.last_stuck_pos)
+                            if movement < 2.0:  # Not moving much
+                                self.stuck_counter += 1
                             else:
-                                print("No semantic detections available")
-                        except Exception as e:
-                            print(f"Error reading semantic sensor: {e}")
+                                self.stuck_counter = 0  # Reset if moving
+                        else:
+                            self.stuck_counter += 1
                         
-                        print(f"Wounded detected: {wounded_detected}")
+                        self.last_stuck_pos = self.current_pose[:2].copy()
                         
-                        if not wounded_detected:
-                            print(f"\n*** WOUNDED NOT FOUND - REMOVING FROM LIST ***")
-                            check_radius = 50.0
+                        # If stuck for more than 10 cycles, try to unstuck
+                        if self.stuck_counter > 10:
+                            print(f"Stuck detected (counter={self.stuck_counter}), performing unstuck maneuver.")
+                            # Alternate between different unstuck maneuvers
+                            if self.stuck_counter % 20 < 10:
+                                # First try: back up and rotate
+                                return {"forward": -0.5, "lateral": 0.0, "rotation": 0.3, "grasper": 1}
+                            else:
+                                # Second try: strafe and rotate opposite direction
+                                return {"forward": -0.3, "lateral": 0.5, "rotation": -0.3, "grasper": 1}
                             
-                            count_before = len(self.wounded_to_rescue)
-                            print(f"Wounded list before removal: {self.wounded_to_rescue}")
-                            
-                            # Remove wounded persons close to the target location
-                            self.wounded_to_rescue = [
-                                (wx, wy) for (wx, wy) in self.wounded_to_rescue
-                                if math.hypot(self.current_target_wounded[0] - wx, 
-                                            self.current_target_wounded[1] - wy) > check_radius
-                            ]
-                            
-                            count_after = len(self.wounded_to_rescue)
-                            print(f"Removed {count_before - count_after} wounded from list")
-                            print(f"Wounded list after removal: {self.wounded_to_rescue}")
-                            
-                            # Clean up metadata
-                            def _key_of(pt):
-                                return (round(float(pt[0]), 1), round(float(pt[1]), 1))
-                            key = _key_of(self.current_target_wounded)
-                            self._wounded_memory_meta.pop(key, None)
-                            
-                            # Return to exploring
+                        # Reset counter if we've been stuck too long (give up after 50 iterations)
+                        if self.stuck_counter > 50:
+                            print(f"Giving up on wounded at {self.current_target_wounded} after {self.stuck_counter} stuck iterations.")
+                            self.removed_wounded.append(self.current_target_wounded)
                             self.state = self.Activity.EXPLORING
                             self.current_target_wounded = None
                             self.path = []
-                            print(f"Switched to EXPLORING state\n")
+                            self.stuck_counter = 0
+                            return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0, "grasper": 0}
+                    else:
+                        # Reset stuck counter if wounded not detected
+                        self.stuck_counter = 0
+                        self.last_stuck_pos = None
+
+                    if not wounded_detected:
+                        print(f"\n*** WOUNDED NOT FOUND - REMOVING FROM LIST ***")
+                        check_radius = 50.0
+                        
+                        count_before = len(self.wounded_to_rescue)
+                        print(f"Wounded list before removal: {self.wounded_to_rescue}")
+                        
+                        # Remove wounded persons close to the target location
+                        self.wounded_to_rescue = [
+                            (wx, wy) for (wx, wy) in self.wounded_to_rescue
+                            if math.hypot(self.current_target_wounded[0] - wx, 
+                                        self.current_target_wounded[1] - wy) > check_radius
+                        ]
+                        
+                        count_after = len(self.wounded_to_rescue)
+                        print(f"Removed {count_before - count_after} wounded from list")
+                        print(f"Wounded list after removal: {self.wounded_to_rescue}")
+                        self.removed_wounded.append(self.current_target_wounded)
+                        
+
+                        # Clean up metadata
+                        def _key_of(pt):
+                            return (round(float(pt[0]), 1), round(float(pt[1]), 1))
+                        key = _key_of(self.current_target_wounded)
+                        self._wounded_memory_meta.pop(key, None)
+                        
+                        # Return to exploring
+                        self.state = self.Activity.EXPLORING
+                        self.current_target_wounded = None
+                        self.path = []
+                        self.stuck_counter = 0
+                        print(f"Switched to EXPLORING state\n")
 
 
             else:
@@ -450,7 +596,7 @@ class MyDronePrototype(DroneAbstract):
                     self.wounded_assignments.pop(self.current_target_wounded, None)
                 self.state = self.Activity.EXPLORING
                 self.current_target_wounded = None
-                self.stuck_timer = 0
+             
 
 
             else:
@@ -460,18 +606,9 @@ class MyDronePrototype(DroneAbstract):
                 if distance_to_rescue < 10.0:
                     if self.last_pos is not None:
                         movement = np.linalg.norm(self.current_pose[:2] - self.last_pos)
-                        if movement < 3.0:
-                            self.stuck_timer += 1
-                        else:
-                            self.stuck_timer = 0
-                    self.last_pos = self.current_pose[:2].copy()
+                 
+     
                     
-                    # Rotate if stuck
-                    while self.stuck_timer > 15 and self.stuck_timer <25:
-                        command = {"forward": -1.0, "lateral": 0.0, "rotation": 0.5}
-                        command["grasper"] = 1
-                        self.stuck_timer += 1
-                        return command 
 
         # --- 2. STRATÉGIE ---
         # Replanification for exploration (only when in EXPLORING state)
@@ -555,6 +692,53 @@ class MyDronePrototype(DroneAbstract):
         command["grasper"] = 1
 
 
+
+        # --- NEW: Smart grasper control based on proximity to other drones ---
+        # Default: grasper always active
+        grasper_command = 1
+        
+        # Check if currently holding a wounded person
+        has_wounded = bool(self.grasper.grasped_wounded_persons)
+        
+        # If not holding wounded, check proximity to other drones
+        if not has_wounded and hasattr(self, 'other_drones_positions') and self.other_drones_positions:
+            proximity_threshold = 80.0  # Distance threshold for deactivating grasper
+            
+            for drone_pos in self.other_drones_positions:
+                distance_to_drone = math.hypot(
+                    self.current_pose[0] - drone_pos[0],
+                    self.current_pose[1] - drone_pos[1]
+                )
+                
+                if distance_to_drone < proximity_threshold:
+                    grasper_command = 0  # Deactivate grasper when near another drone
+                    break
+        
+        command["grasper"] = grasper_command
+        # --- END SMART GRASPER CONTROL ---
+
+        # Dynamic replanning if other drones are too close to current path
+        if self.path and hasattr(self, 'other_drones_positions') and self.other_drones_positions:
+            replan_needed = False
+            for drone_pos in self.other_drones_positions:
+                for waypoint in self.path[:min(3, len(self.path))]:  # Check first 3 waypoints
+                    dist_to_waypoint = math.hypot(waypoint[0] - drone_pos[0], waypoint[1] - drone_pos[1])
+                    if dist_to_waypoint < 60.0:  # Threshold for replanning
+                        replan_needed = True
+                        break
+                if replan_needed:
+                    break
+            
+            if replan_needed and (self.iteration - self.last_replan_iteration) > 10:
+                # Replan path avoiding the drone
+                if self.state == self.Activity.GOING_TO_WOUNDED and self.current_target_wounded:
+                    self.path = self.creer_chemin(self.current_pose[:2], self.current_target_wounded)
+                    self.last_replan_iteration = self.iteration
+                elif self.state == self.Activity.GOING_TO_RESCUE_CENTER and self.rescue_zone_points:
+                    self.path = self.creer_chemin(self.current_pose[:2], self.rescue_zone_points[0], explored_only=True)
+                    self.last_replan_iteration = self.iteration
+
+        command = self.rvo_avoidance(command)
         return command
 
     def detect_semantic_entities(self):
@@ -570,9 +754,9 @@ class MyDronePrototype(DroneAbstract):
             detections = None
 
         # parameters
-        dedup_radius = 40.0         # close detections considered same
+        dedup_radius = 30.0         # close detections considered same
         alpha_update = 0.3          # mixing factor when updating an existing entry
-        memory_max_age = 50000        # iterations before forgetting an unseen entry
+        memory_max_age = 10000        # iterations before forgetting an unseen entry
 
         # helper to round keys to reduce float-key issues
         def _key_of(pt):
@@ -622,6 +806,7 @@ class MyDronePrototype(DroneAbstract):
                     )
                     if not is_grasped:
                         newly_seen_wounded.append((xw, yw))
+                        
                 elif 'RESCUE' in name.upper():
                     newly_seen_rescue.append((xw, yw))
 
@@ -822,7 +1007,22 @@ class MyDronePrototype(DroneAbstract):
     
     def draw_bottom_layer(self):
         """ Dessine le chemin calculé (tous les points) """
-    
+
+        # Define a palette of colors (extend as needed)
+        palette = [
+            (200, 60, 60),   # Red
+            (60, 200, 60),   # Green
+            (60, 60, 200),   # Blue
+            (200, 200, 60),  # Yellow
+            (200, 60, 200),  # Magenta
+            (60, 200, 200),  # Cyan
+            (255, 128, 0),   # Orange
+            (128, 0, 255),   # Purple
+        ]
+        # Assign a color based on the drone's identifier (hash to index)
+        color_idx = int(self.identifier) % len(palette)
+        detection_color = palette[color_idx]
+
         if hasattr(self, 'frontier_clusters') and self.frontier_clusters:
             # dessin des cellules de chaque cluster (petits points rouges)
             for cluster in self.frontier_clusters:
@@ -831,22 +1031,21 @@ class MyDronePrototype(DroneAbstract):
                     continue
                 for c in cells:
                     pt = c + self._half_size_array
-                    arcade.draw_circle_filled(pt[0], pt[1], radius=3, color=(255,0,0))
+                    arcade.draw_circle_filled(pt[0], pt[1], radius=3,color=(60, 60, 200) )
                 # barycentre (jaune)
                 bc = cluster.get('barycenter')
                 ptb = bc + self._half_size_array
-                arcade.draw_circle_filled(ptb[0], ptb[1], radius=6, color=(255,255,0))
-        # --- DEBUG VISUALISATION DES FRONTIERES (END) ---
-
+                arcade.draw_circle_filled(ptb[0], ptb[1], radius=6, color=(200, 200, 60))
+      
         # Draw wounded detected via new simple API (wounded_to_rescue)
         try:
             if hasattr(self, 'wounded_to_rescue') and self.wounded_to_rescue:
                 for (xw, yw) in self.wounded_to_rescue:
                     pt = np.array([xw, yw]) + self._half_size_array
                     # visible marker (outline + small filled center)
-                    arcade.draw_circle_outline(pt[0], pt[1], radius=18, color=(200,60,60), border_width=2)
-                    arcade.draw_circle_filled(pt[0], pt[1], radius=4, color=(255,80,80))
-                    arcade.draw_text("det", pt[0] + 14, pt[1] + 14, (200, 60, 60), 10)
+                    arcade.draw_circle_outline(pt[0], pt[1], radius=18, color=detection_color, border_width=2)
+                    arcade.draw_circle_filled(pt[0], pt[1], radius=4, color=detection_color)
+                    arcade.draw_text("det", pt[0] + 14, pt[1] + 14, detection_color, 10)
         except Exception:
             pass
 
@@ -874,22 +1073,9 @@ class MyDronePrototype(DroneAbstract):
                 p2 = self.path[i+1] + self._half_size_array
                 arcade.draw_line(p1[0], p1[1], p2[0], p2[1], color=green, line_width=3)
 
-        self.display_pose()
+    
         
-        # Display state machine status above drone
-        try:
-            current_pose_screen = self.current_pose[:2] + self._half_size_array
-            # Get state name
-            state_name = self.state.name if hasattr(self.state, 'name') else str(self.state)
-            # Display above drone (offset +25 pixels above)
-            arcade.draw_text(state_name, 
-                           current_pose_screen[0] - 30, 
-                           current_pose_screen[1] + 25, 
-                           (255, 255, 255), 
-                           12, 
-                           bold=True)
-        except Exception:
-            pass
+
 
 
     # --------------------------------------------------------------------------
@@ -915,7 +1101,7 @@ class MyDronePrototype(DroneAbstract):
 
         # --- Profil de vitesse souhaitée (tunable) ---
         # Augmenter max_speed pour rendre le drone plus rapide
-        max_speed = 10.0
+        max_speed = 50.0
         # profil proportionnel à la distance, coef augmenté pour plus de vitesse
         target_speed = max(0.0, min(max_speed, distance_to_target * 0.12 + 0.3))
 
@@ -929,7 +1115,7 @@ class MyDronePrototype(DroneAbstract):
         # commande continue - peut être négative si il faut freiner
         forward_cmd = self.Kp_pos * speed_error + self.Kd_pos * deriv_speed
         # si on est en train de fortement tourner, ne pas avancer
-        if abs(angle_error) > 0.2:
+        if abs(angle_error) > 0.4:
             forward_cmd = 0.0
         # normaliser la commande dans [-1, 1]
         forward_cmd = float(np.clip(forward_cmd, -1.0, 1.0))
@@ -944,17 +1130,7 @@ class MyDronePrototype(DroneAbstract):
         
 
         return {"forward": forward_cmd, "lateral": 0.0, "rotation": rotation_speed}
-
-    def display_pose(self) :
-        radius = 10
-        red = (0,0,255)
-        green = (0,255,0)
-
-        current_pose = self.current_pose[:2] + self._half_size_array
-        arcade.draw_circle_filled(current_pose[0],
-                              current_pose[1],
-                              radius=radius,
-                              color=red)
+    
 
     # --------------------------------------------------------------------------
     # FONCTIONS PRINCIPALES (Localisation, Cartographie Binaire)
@@ -1064,26 +1240,28 @@ class MyDronePrototype(DroneAbstract):
         if not self.communicator:
             return
 
-        dedup_radius = 60.0
+        dedup_radius = 50.0
         received_messages = self.communicator.received_messages
 
         # Collect all wounded from messages
         all_wounded = []
-        all_rescued = []
         all_assignments = {}
         all_grasped = set()
         all_rescue_zones = []
-        other_drone_positions = []
+        all_removed_wounded = []
 
         for msg in received_messages:
             other_message = msg[1] if isinstance(msg, tuple) else msg
+            # Skip processing own messages to avoid double removal
+            if other_message.get("drone_id") == self.identifier:
+                continue
+                
             all_wounded.extend(other_message.get("wounded_list", []))
-            all_rescued.extend(other_message.get("rescued_wounded", []))
             all_assignments.update(other_message.get("wounded_assignments", {}))
             all_grasped.update(tuple(w) for w in other_message.get("grasped_wounded", []) if w is not None)
             all_rescue_zones.extend(other_message.get("rescue_list", []))
+            all_removed_wounded.extend(other_message.get("removed_wounded", []))
        
-
         # Merge wounded positions (deduplicate)
         merged_wounded = list(self.wounded_to_rescue)
         for w in all_wounded:
@@ -1092,12 +1270,15 @@ class MyDronePrototype(DroneAbstract):
         self.wounded_to_rescue = merged_wounded
         
 
-        # Remove rescued wounded
-        for rw in all_rescued:
+        # Remove wounded explicitly removed by others
+        for rw in all_removed_wounded:
+            print(f"[{self.identifier}] Received removed_wounded from OTHER drone: {rw}")
+            print(f"[{self.identifier}] wounded_to_rescue BEFORE removal: {len(self.wounded_to_rescue)}")
             self.wounded_to_rescue = [
                 (wx, wy) for (wx, wy) in self.wounded_to_rescue
                 if math.hypot(rw[0] - wx, rw[1] - wy) > dedup_radius
             ]
+            print(f"[{self.identifier}] wounded_to_rescue AFTER removal: {len(self.wounded_to_rescue)}")
 
         # Merge assignments (keep existing assignment)
         for w, drone_id in all_assignments.items():
@@ -1108,9 +1289,6 @@ class MyDronePrototype(DroneAbstract):
         if not hasattr(self, "other_grasped_wounded"):
             self.other_grasped_wounded = set()
         self.other_grasped_wounded = set(all_grasped) 
-
-        print("grasped guy", self.other_grasped_wounded)
-    
 
 
         # Deduplicate wounded list again
@@ -1124,6 +1302,172 @@ class MyDronePrototype(DroneAbstract):
         for r in all_rescue_zones:
             if r not in self.rescue_zone_points:
                 self.rescue_zone_points.append(r)
+
+        # Update other drones' positions (for conflict resolution)
+        other_drones_positions = []
+        for msg in received_messages:
+            other_message = msg[1] if isinstance(msg, tuple) else msg
+            if "drone_id" in other_message and other_message["drone_id"] != self.identifier:
+                pos = other_message.get("drone_pose", None)
+                if pos is not None:
+                    other_drones_positions.append(tuple(pos))
+        self.other_drones_positions = other_drones_positions
+
+    def find_free_position_for_unstuck(self):
+        """
+        Find the first safe free position at a medium distance to escape when stuck.
+        Returns a position (x, y) in world coordinates, or None if not found.
+        """
+        grid_map = self.grid.grid
+        SEUIL_FREE = -10.0
+        SEUIL_MUR = 5.0
+
+        is_free = (grid_map < SEUIL_FREE)
+        is_wall = (grid_map >= SEUIL_MUR)
+        struct = np.ones((5, 5), dtype=bool)
+        danger_zone = binary_dilation(is_wall, structure=struct, iterations=2)
+        safe_free = is_free & (~danger_zone)
+
+        if not np.any(safe_free):
+            return None
+
+        current_grid_pos = self.grid._conv_world_to_grid(self.current_pose[0], self.current_pose[1])
+        current_y, current_x = int(current_grid_pos[0]), int(current_grid_pos[1])
+
+        safe_positions = np.argwhere(safe_free)
+        if len(safe_positions) == 0:
+            return None
+
+        distances = np.sqrt(
+            (safe_positions[:, 0] - current_y) ** 2 +
+            (safe_positions[:, 1] - current_x) ** 2
+        )
+
+        min_dist = 10
+        max_dist = 20
+        for idx, d in enumerate(distances):
+            if min_dist <= d <= max_dist:
+                chosen_pos = safe_positions[idx]
+                x_free, y_free = self.grid._conv_grid_to_world(chosen_pos[0], chosen_pos[1])
+                return (x_free, y_free)
+
+        return None  # No suitable cell found
+
+    def check_and_handle_general_stuck(self):
+        """
+        Check if the drone is stuck (not making progress) and handle it by
+        finding a new target position and creating a path to it.
+        Returns True if currently unstucking, False otherwise.
+        """
+        # Check position every 10 iterations
+        if self.iteration % 10 != 0:
+            if self.is_unstucking and self.path:
+                return True
+            return False
+        
+        # Initialize tracking variables if needed
+        if self.last_unstuck_check_pos is None:
+            self.last_unstuck_check_pos = self.current_pose[:2].copy()
+            return False
+        
+        # Calculate movement since last check
+        movement = np.linalg.norm(self.current_pose[:2] - self.last_unstuck_check_pos)
+        self.last_unstuck_check_pos = self.current_pose[:2].copy()
+        
+        # If moving normally, reset counter
+        if movement > 5.0:  # Threshold for "good movement"
+            self.general_stuck_counter = 0
+            self.is_unstucking = False
+            return False
+        
+        # Increment stuck counter
+        self.general_stuck_counter += 1
+        
+        # If stuck for too long, trigger unstuck behavior
+        if self.general_stuck_counter > 5:  # 50 iterations of being stuck
+            print(f"[{self.identifier}] General stuck detected! Counter: {self.general_stuck_counter}")
+            
+            # Find a free position to navigate to
+            if self.unstuck_target is None or self.general_stuck_counter % 10 == 0:
+                self.unstuck_target = self.find_free_position_for_unstuck()
+                
+                if self.unstuck_target:
+                    print(f"[{self.identifier}] Found unstuck target: {self.unstuck_target}")
+                    # Create path to unstuck target
+                    self.path = self.creer_chemin(self.current_pose[:2], self.unstuck_target)
+                    self.is_unstucking = True
+                else:
+                    print(f"[{self.identifier}] No unstuck target found")
+                    self.is_unstucking = False
+            
+            return True
+        
+        return False
+
+    def rvo_avoidance(self, command):
+        """
+        Adjusts the forward/lateral command using a simple RVO approach.
+        Each drone assumes others will also avoid, and chooses a velocity away from predicted collisions.
+        """
+        if not hasattr(self, 'other_drones_positions') or not self.other_drones_positions:
+            return command
+
+        # Parameters
+        safe_radius = 10.0  # Minimum allowed distance to other drones
+        time_horizon = 2.0  # Seconds to look ahead
+        max_speed = 1.0
+
+        # Current velocity in world frame (estimate)
+        vx = command["forward"] * math.cos(self.current_pose[2])
+        vy = command["forward"] * math.sin(self.current_pose[2])
+
+        # Compute preferred velocity (from path following)
+        pref_vx, pref_vy = vx, vy
+
+        # Sum up avoidance velocities
+        avoid_vx, avoid_vy = 0.0, 0.0
+        for drone_pos in self.other_drones_positions:
+            ox, oy = drone_pos[0], drone_pos[1]
+            dx = ox - self.current_pose[0]
+            dy = oy - self.current_pose[1]
+            dist = math.hypot(dx, dy)
+            if dist < 1e-3 or dist > 200.0:
+                continue  # Ignore self or far drones
+
+            # Predict where the other drone will be (assume constant velocity, or static)
+            # For simplicity, assume other drone is static
+            rel_vx = pref_vx
+            rel_vy = pref_vy
+
+            # Compute time to collision
+            closing_speed = (dx * rel_vx + dy * rel_vy) / (dist + 1e-6)
+            if closing_speed <= 0:
+                continue  # Not moving towards each other
+
+            ttc = (dist - safe_radius) / (closing_speed + 1e-6)
+            if 0 < ttc < time_horizon:
+                # Compute a perpendicular avoidance vector
+                perp_x = -dy / dist
+                perp_y = dx / dist
+                strength = (time_horizon - ttc) / time_horizon
+                avoid_vx += perp_x * strength * max_speed
+                avoid_vy += perp_y * strength * max_speed
+
+        # Combine preferred and avoidance velocities
+        new_vx = pref_vx + avoid_vx
+        new_vy = pref_vy + avoid_vy
+
+        # Convert back to drone's local frame
+        heading = self.current_pose[2]
+        forward = new_vx * math.cos(heading) + new_vy * math.sin(heading)
+        lateral = -new_vx * math.sin(heading) + new_vy * math.cos(heading)
+
+        # Clip to allowed range
+        command["forward"] = float(np.clip(forward, -1.0, 1.0))
+        command["lateral"] = float(np.clip(lateral, -1.0, 1.0))
+        return command
+
+
 
 
 
