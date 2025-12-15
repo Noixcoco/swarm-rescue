@@ -228,25 +228,20 @@ class MyDronePrototype(DroneAbstract):
         
 
     def define_message_for_all(self):
-        # Get positions of currently grasped wounded
-        grasped_positions = set(
-            (w.position[0], w.position[1]) for w in getattr(self.grasper, "grasped_wounded_persons", []) if hasattr(w, "position")
-        )
-        # Only broadcast wounded not currently grasped
-        wounded_list = [
-            w for w in self.wounded_to_rescue
-            if w not in grasped_positions
-        ]
         message = {
             "drone_id": self.identifier,  
             "drone_pose": self.current_pose.tolist(),
-            "wounded_list": wounded_list,
+            "wounded_list": self.wounded_to_rescue,
             "rescue_list": self.rescue_zone_points,
             "state": self.state.name,
             "rescued_wounded": getattr(self, "rescued_wounded", []),
             "wounded_assignments": self.wounded_assignments,
-            "grasped_wounded": list(grasped_positions)
+            "grasped_wounded": [
+                (w.position[0], w.position[1]) if hasattr(w, "position") else None
+                for w in getattr(self.grasper, "grasped_wounded_persons", [])
+            ]
         }
+
         return message
 
     def control(self) -> CommandsDict:
@@ -265,8 +260,6 @@ class MyDronePrototype(DroneAbstract):
         # Process received messages from other drones
         
         self.process_communication_sensor()
-
-        
 
         # --- 1. PERCEPTION ---
         self.update_pose()
@@ -293,16 +286,9 @@ class MyDronePrototype(DroneAbstract):
         if self.state == self.Activity.EXPLORING:
             # Only consider wounded not already assigned or grasped
             grasped = getattr(self, "other_grasped_wounded", set())
-
-        
-            exclusion_radius = 100.0  # You can adjust this value as needed
-
-            def is_near_grasped(w):
-                return any(math.hypot(w[0] - gx, w[1] - gy) < exclusion_radius for (gx, gy) in grasped)
-
             available_wounded = [
                 w for w in self.wounded_to_rescue
-                if w not in self.wounded_assignments and not is_near_grasped(w)
+                if w not in self.wounded_assignments and w not in grasped
             ]
             if available_wounded:
                 # Choose closest available wounded
@@ -317,13 +303,9 @@ class MyDronePrototype(DroneAbstract):
 
         elif self.state == self.Activity.GOING_TO_WOUNDED:
             grasped = getattr(self, "other_grasped_wounded", set())
-            exclusion_radius = 100.0  # Same as in EXPLORING
-
-            def is_near_grasped(w):
-                return any(math.hypot(w[0] - gx, w[1] - gy) < exclusion_radius for (gx, gy) in grasped)
-
-            # Abort if target is now grasped by another drone (within exclusion radius)
-            if self.current_target_wounded is not None and is_near_grasped(self.current_target_wounded):
+            print("--------GRAPSED-----------",grasped)
+            # Abort if target is now grasped by another drone
+            if self.current_target_wounded in grasped:
                 self.state = self.Activity.EXPLORING
                 self.current_target_wounded = None
                 self.path = []
@@ -554,6 +536,10 @@ class MyDronePrototype(DroneAbstract):
 
         command["grasper"] = 1
 
+        if self.iteration % 5 == 0:
+            self.grid.display(self.grid.zoomed_grid,
+                              self.estimated_pose,
+                              title="zoomed occupancy grid")
 
         return command
 
@@ -593,8 +579,6 @@ class MyDronePrototype(DroneAbstract):
             py = float(self.current_pose[1])
             ptheta = float(self.current_pose[2])
 
-        
-
             for data in detections:
                 try:
                     etype = getattr(data, 'entity_type', None)
@@ -613,15 +597,9 @@ class MyDronePrototype(DroneAbstract):
                 except Exception:
                     name = str(etype)
 
-                # Only add if not close to any grasped wounded
+                # This is where wounded persons are detected and added
                 if 'WOUNDED' in name.upper():
-                    
-                    is_grasped = any(
-                        math.hypot(xw - gx, yw - gy) < dedup_radius
-                        for (gx, gy) in self.other_grasped_wounded
-                    )
-                    if not is_grasped:
-                        newly_seen_wounded.append((xw, yw))
+                    newly_seen_wounded.append((xw, yw))
                 elif 'RESCUE' in name.upper():
                     newly_seen_rescue.append((xw, yw))
 
@@ -1059,7 +1037,6 @@ class MyDronePrototype(DroneAbstract):
         Merge wounded list from other drones' messages.
         Adds new wounded positions not already in self.wounded_to_rescue.
         Removes rescued wounded. Merges assignments.
-       
         """
         if not self.communicator:
             return
@@ -1073,7 +1050,6 @@ class MyDronePrototype(DroneAbstract):
         all_assignments = {}
         all_grasped = set()
         all_rescue_zones = []
-        other_drone_positions = []
 
         for msg in received_messages:
             other_message = msg[1] if isinstance(msg, tuple) else msg
@@ -1082,7 +1058,6 @@ class MyDronePrototype(DroneAbstract):
             all_assignments.update(other_message.get("wounded_assignments", {}))
             all_grasped.update(tuple(w) for w in other_message.get("grasped_wounded", []) if w is not None)
             all_rescue_zones.extend(other_message.get("rescue_list", []))
-       
 
         # Merge wounded positions (deduplicate)
         merged_wounded = list(self.wounded_to_rescue)
@@ -1090,7 +1065,6 @@ class MyDronePrototype(DroneAbstract):
             if all(math.hypot(w[0] - wx, w[1] - wy) > dedup_radius for (wx, wy) in merged_wounded):
                 merged_wounded.append(tuple(w))
         self.wounded_to_rescue = merged_wounded
-        
 
         # Remove rescued wounded
         for rw in all_rescued:
@@ -1107,10 +1081,7 @@ class MyDronePrototype(DroneAbstract):
         # Merge grasped wounded
         if not hasattr(self, "other_grasped_wounded"):
             self.other_grasped_wounded = set()
-        self.other_grasped_wounded = set(all_grasped) 
-
-        print("grasped guy", self.other_grasped_wounded)
-    
+        self.other_grasped_wounded = set(all_grasped)  # <-- ADD THIS LINE
 
 
         # Deduplicate wounded list again
@@ -1124,9 +1095,6 @@ class MyDronePrototype(DroneAbstract):
         for r in all_rescue_zones:
             if r not in self.rescue_zone_points:
                 self.rescue_zone_points.append(r)
-
-        print("final victime list",deduped)
-
 
 
 

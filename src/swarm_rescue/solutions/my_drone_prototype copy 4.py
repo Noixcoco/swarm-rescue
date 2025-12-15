@@ -1125,8 +1125,6 @@ class MyDronePrototype(DroneAbstract):
             if r not in self.rescue_zone_points:
                 self.rescue_zone_points.append(r)
 
-        print("final victime list",deduped)
-
 
 
 

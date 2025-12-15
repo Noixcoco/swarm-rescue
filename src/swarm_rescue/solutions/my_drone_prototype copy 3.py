@@ -266,8 +266,6 @@ class MyDronePrototype(DroneAbstract):
         
         self.process_communication_sensor()
 
-        
-
         # --- 1. PERCEPTION ---
         self.update_pose()
         
@@ -293,9 +291,7 @@ class MyDronePrototype(DroneAbstract):
         if self.state == self.Activity.EXPLORING:
             # Only consider wounded not already assigned or grasped
             grasped = getattr(self, "other_grasped_wounded", set())
-
-        
-            exclusion_radius = 100.0  # You can adjust this value as needed
+            exclusion_radius = 60.0  # You can adjust this value as needed
 
             def is_near_grasped(w):
                 return any(math.hypot(w[0] - gx, w[1] - gy) < exclusion_radius for (gx, gy) in grasped)
@@ -317,7 +313,7 @@ class MyDronePrototype(DroneAbstract):
 
         elif self.state == self.Activity.GOING_TO_WOUNDED:
             grasped = getattr(self, "other_grasped_wounded", set())
-            exclusion_radius = 100.0  # Same as in EXPLORING
+            exclusion_radius = 60.0  # Same as in EXPLORING
 
             def is_near_grasped(w):
                 return any(math.hypot(w[0] - gx, w[1] - gy) < exclusion_radius for (gx, gy) in grasped)
@@ -554,6 +550,10 @@ class MyDronePrototype(DroneAbstract):
 
         command["grasper"] = 1
 
+        if self.iteration % 5 == 0:
+            self.grid.display(self.grid.zoomed_grid,
+                              self.estimated_pose,
+                              title="zoomed occupancy grid")
 
         return command
 
@@ -593,8 +593,6 @@ class MyDronePrototype(DroneAbstract):
             py = float(self.current_pose[1])
             ptheta = float(self.current_pose[2])
 
-        
-
             for data in detections:
                 try:
                     etype = getattr(data, 'entity_type', None)
@@ -613,15 +611,9 @@ class MyDronePrototype(DroneAbstract):
                 except Exception:
                     name = str(etype)
 
-                # Only add if not close to any grasped wounded
+                # This is where wounded persons are detected and added
                 if 'WOUNDED' in name.upper():
-                    
-                    is_grasped = any(
-                        math.hypot(xw - gx, yw - gy) < dedup_radius
-                        for (gx, gy) in self.other_grasped_wounded
-                    )
-                    if not is_grasped:
-                        newly_seen_wounded.append((xw, yw))
+                    newly_seen_wounded.append((xw, yw))
                 elif 'RESCUE' in name.upper():
                     newly_seen_rescue.append((xw, yw))
 
@@ -1059,7 +1051,6 @@ class MyDronePrototype(DroneAbstract):
         Merge wounded list from other drones' messages.
         Adds new wounded positions not already in self.wounded_to_rescue.
         Removes rescued wounded. Merges assignments.
-       
         """
         if not self.communicator:
             return
@@ -1073,7 +1064,6 @@ class MyDronePrototype(DroneAbstract):
         all_assignments = {}
         all_grasped = set()
         all_rescue_zones = []
-        other_drone_positions = []
 
         for msg in received_messages:
             other_message = msg[1] if isinstance(msg, tuple) else msg
@@ -1082,7 +1072,6 @@ class MyDronePrototype(DroneAbstract):
             all_assignments.update(other_message.get("wounded_assignments", {}))
             all_grasped.update(tuple(w) for w in other_message.get("grasped_wounded", []) if w is not None)
             all_rescue_zones.extend(other_message.get("rescue_list", []))
-       
 
         # Merge wounded positions (deduplicate)
         merged_wounded = list(self.wounded_to_rescue)
@@ -1108,8 +1097,6 @@ class MyDronePrototype(DroneAbstract):
         if not hasattr(self, "other_grasped_wounded"):
             self.other_grasped_wounded = set()
         self.other_grasped_wounded = set(all_grasped) 
-
-        print("grasped guy", self.other_grasped_wounded)
     
 
 
@@ -1124,8 +1111,6 @@ class MyDronePrototype(DroneAbstract):
         for r in all_rescue_zones:
             if r not in self.rescue_zone_points:
                 self.rescue_zone_points.append(r)
-
-        print("final victime list",deduped)
 
 
 
