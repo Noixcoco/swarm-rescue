@@ -4,7 +4,7 @@ video_capture_enabled: false  # Enable video recording of the mission (true/fals
 
 evaluation_plan:
   # Scenario 1: Intermediate map with 2 rounds, no special zones
-  - map_name: MapIntermediate02
+  - map_name: MapMedium01
     nb_rounds: 1
     config_weight: 1
     zones_config: []

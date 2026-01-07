@@ -152,60 +152,45 @@ class MyDronePrototype(DroneAbstract):
         is_unexplored = (grid >= SEUIL_UNEXPLORED_MIN) & (grid <= SEUIL_UNEXPLORED_MAX)
         
         # Dilate les murs pour éviter les zones proches
-        struct = np.ones((6, 6), dtype=bool)
+        struct = np.ones((8, 8), dtype=bool)
         danger_zone = binary_dilation(is_wall, structure=struct, iterations=1)
         
         # --- MODIFIED DRONE AVOIDANCE ZONE - ONLY AVOID DRONES IN FRONT ---
         # Cache drone danger zone for a few iterations if positions haven't changed
        
-# --- MODIFIED DRONE AVOIDANCE ZONE ---
-        # Fix 1: Removed the crash causing comparison (self._last_drone_positions == ...)
-        cache_valid = (
-            self._last_drone_danger_zone is not None and
-            self._last_danger_zone_iter >= self.iteration - 5
-        )
-
-        if cache_valid:
-            drone_danger_zone = self._last_drone_danger_zone
-        else:
-            drone_danger_zone = np.zeros_like(grid, dtype=bool)
-            if hasattr(self, 'other_drones_positions') and self.other_drones_positions:
-                drone_avoidance_radius = 20
-                my_pos = np.array(self.current_pose[:2])
-                my_heading = float(self.current_pose[2])
-
-                for drone_info in self.other_drones_positions:
-                    # Fix 2: Unpack the tuple correctly (Position, ID)
-                    other_pos_full = drone_info[0] 
-                    other_pos = np.array(other_pos_full[:2])
-                    
-                    vec_to_drone = other_pos - my_pos
-                    dist_to_drone = np.linalg.norm(vec_to_drone)
-                    
-                    if dist_to_drone < 1e-3 or dist_to_drone > 100.0:
-                        continue
-                    
-                    angle_to_drone = math.atan2(vec_to_drone[1], vec_to_drone[0])
-                    relative_angle = normalize_angle(angle_to_drone - my_heading)
-                    
-                    if abs(relative_angle) < math.pi / 2:
-                        # Fix 3: Use correct coordinates (other_pos_full), not the ID!
-                        drone_grid_pos = self.grid._conv_world_to_grid(other_pos_full[0], other_pos_full[1])
-                        
-                        drone_y, drone_x = int(drone_grid_pos[0]), int(drone_grid_pos[1])
-                        
-                        radius_cells = int(drone_avoidance_radius / self.grid.resolution)
-                        y0 = max(0, drone_y - radius_cells)
-                        y1 = min(grid.shape[0], drone_y + radius_cells + 1)
-                        x0 = max(0, drone_x - radius_cells)
-                        x1 = min(grid.shape[1], drone_x + radius_cells + 1)
-                        drone_danger_zone[y0:y1, x0:x1] = True
+        # --- NEW: ADD OTHER DRONES AS TEMPORARY OBSTACLES ---
+        # This treats other drones as "walls" for the pathfinder
+        if hasattr(self, 'other_drones_positions') and self.other_drones_positions:
+            # Radius to block around each drone (40px = ~40cm)
+            DRONE_OBSTACLE_RADIUS = 40.0 
+            radius_cells = int(DRONE_OBSTACLE_RADIUS / self.grid.resolution)
             
-            self._last_drone_danger_zone = drone_danger_zone
-            self._last_danger_zone_iter = self.iteration
+            for other_info in self.other_drones_positions:
+                other_pos = other_info[0]
+                
+                # Only consider drones that are somewhat close (optimization)
+                # e.g., within 300 pixels. Far away drones don't matter.
+                if math.hypot(other_pos[0] - start_world[0], other_pos[1] - start_world[1]) > 300.0:
+                    continue
 
+                try:
+                    # Convert drone world pos to grid
+                    p_grid = self.grid._conv_world_to_grid(other_pos[0], other_pos[1])
+                    py, px = int(p_grid[0]), int(p_grid[1])
+                    
+                    # Define a square around the drone
+                    y0 = max(0, py - radius_cells)
+                    y1 = min(grid.shape[0], py + radius_cells + 1)
+                    x0 = max(0, px - radius_cells)
+                    x1 = min(grid.shape[1], px + radius_cells + 1)
+                    
+                    # Mark this area as BLOCKED
+                    danger_zone[y0:y1, x0:x1] = True
+                    
+                except Exception:
+                    continue
 
-        danger_zone = danger_zone | drone_danger_zone
+    
 
         # Si explored_only=True, ajouter les zones non explorées à danger_zone
         if explored_only:
@@ -474,7 +459,6 @@ class MyDronePrototype(DroneAbstract):
             # If unstucking, follow the unstuck path
             if self.path:
                 command = self.follow_path(lidar_data)
-                command["grasper"] = 1
                 return command
             else:
                 # Unstuck path failed, try simple reverse maneuver
@@ -608,9 +592,16 @@ class MyDronePrototype(DroneAbstract):
 
                     
 
+
                 if self.rescue_zone_points:
-                    self.path = self.creer_chemin(self.current_pose[:2], self.rescue_zone_points[0], explored_only=True)
+                    # ATTRIBUTE RESCUE ZONE BASED ON DRONE ID
+                    # Drone 0 -> Zone 0, Drone 1 -> Zone 1, etc.
+                    target_index = int(self.identifier) % len(self.rescue_zone_points)
+                    target_zone = self.rescue_zone_points[target_index]
+    
+                    self.path = self.creer_chemin(self.current_pose[:2], target_zone, explored_only=True)
                     self.last_replan_iteration = self.iteration
+
 
             elif self.current_target_wounded is not None:
                 distance_to_target = np.linalg.norm(np.array(self.current_target_wounded) - self.current_pose[:2])
@@ -700,6 +691,7 @@ class MyDronePrototype(DroneAbstract):
                 if self.current_target_wounded is not None:
                     # Remove assignment so other drones don't try to grab it
                     self.wounded_assignments.pop(self.current_target_wounded, None)
+               
                 self.state = self.Activity.EXPLORING
                 self.current_target_wounded = None
                 
@@ -840,6 +832,7 @@ class MyDronePrototype(DroneAbstract):
                 dist_to_target = np.linalg.norm(np.array(self.current_target_wounded) - self.current_pose[:2])
                 
                 if dist_to_target < 40.0:
+
                     # Calculate angle directly to the person
                     diff = np.array(self.current_target_wounded) - self.current_pose[:2]
                     target_angle = math.atan2(diff[1], diff[0])
@@ -851,6 +844,7 @@ class MyDronePrototype(DroneAbstract):
                     # Slow approach to ensure the front-mounted grasper makes contact
                     command = {"forward": 0.3, "lateral": 0.0, "rotation": rotation_speed, "grasper": 1}
                     return self.wall_avoidance(command, lidar_data)
+                
             
     
             if self.path:
@@ -936,10 +930,14 @@ class MyDronePrototype(DroneAbstract):
                     self.path = self.creer_chemin(self.current_pose[:2], self.rescue_zone_points[0], explored_only=True)
                     self.last_replan_iteration = self.iteration
 
-        command = self.rvo_avoidance(command)
+
 
         # Apply this LAST to prevent hitting walls while dodging drones
         command = self.wall_avoidance(command, lidar_data)
+
+        # 2. Apply Drone Repulsion (Safety against other agents)
+        # This will override/modify the command to push us away from collisions
+        command = self.drone_repulsion(command)
 
         if self.iteration % 50 == 0:
             self.grid.display(self.grid.zoomed_grid,
@@ -961,10 +959,11 @@ class MyDronePrototype(DroneAbstract):
 
         # Parameters
         dedup_radius = 60.0
+        rescue_dedup_radius = 100.0
         alpha_update = 0.3
+        MAX_RESCUE_POINTS = 5
  
 
-    
 
         newly_seen_wounded = []
         newly_seen_rescue = []
@@ -995,7 +994,7 @@ class MyDronePrototype(DroneAbstract):
                 name = str(etype)
 
             if 'WOUNDED' in name.upper():
-                # ✅ Now fast - other_grasped_wounded already initialized
+                # Now fast - other_grasped_wounded already initialized
                 is_grasped = any(
                     math.hypot(xw - gx, yw - gy) < dedup_radius
                     for (gx, gy) in self.other_grasped_wounded
@@ -1023,26 +1022,10 @@ class MyDronePrototype(DroneAbstract):
                 self.wounded_to_rescue.append(pt)
 
 
-
-# --- MODIFIED: Keep multiple rescue zone points instead of merging ---
-        rescue_dedup_radius = 150.0  # Larger radius to identify distinct entry points
-        
-        for nx, ny in newly_seen_rescue:
-            merged = False
-            for i, (rx, ry) in enumerate(self.rescue_zone_points):
-                if math.hypot(rx - nx, ry - ny) < rescue_dedup_radius:
-                    newx = (1.0 - alpha_update) * rx + alpha_update * nx
-                    newy = (1.0 - alpha_update) * ry + alpha_update * ny
-                    self.rescue_zone_points[i] = (newx, newy)
-                    merged = True
-                    break
-            if not merged:
-                pt = (nx, ny)
-                self.rescue_zone_points.append(pt)
-
- 
-   
-
+# --- NEW RESCUE ZONE LOGIC: 5 EVENLY SPACED POINTS ---
+        for nx, ny in newly_seen_rescue: 
+            pt = (nx, ny)
+            self._add_or_merge_rescue_point(pt)
 
 
     # --------------------------------------------------------------------------
@@ -1080,7 +1063,7 @@ class MyDronePrototype(DroneAbstract):
         frontier_mask = is_free & (~is_heavily_explored) & unknown_neighbors
 
         # Safety margin around walls
-        struct = np.ones((6, 6), dtype=bool)
+        struct = np.ones((8, 8), dtype=bool)
         danger_zone = binary_dilation(is_wall, structure=struct, iterations=2)
         frontier_mask = frontier_mask & (~danger_zone)
 
@@ -1261,79 +1244,85 @@ class MyDronePrototype(DroneAbstract):
     # --------------------------------------------------------------------------
  
     def follow_path(self, lidar_data) -> CommandsDict:
-        """
-        IMPROVED path following with lookahead for smoother motion
-        NO adaptive speed control - constant speed profile
-        """
-        if not self.path:
-            return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
+            if not self.path:
+                return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
+            
+            # NEW: Reduce lookahead when near walls
+            min_lidar_dist = min(lidar_data) if lidar_data is not None and len(lidar_data) > 0 else 999
+
+            if min_lidar_dist < 40.0:  # Close to wall
+                adaptive_lookahead = 15.0  # Short lookahead = tighter following
+            else:
+                adaptive_lookahead = self.path_lookahead_distance
+            
+            # --- LOOKAHEAD MECHANISM FOR SMOOTHER TURNS ---
+            lookahead_target = self.path[0]
+            accumulated_distance = 0.0
+
+            for i in range(len(self.path)):
+                if i > 0:
+                    segment_length = np.linalg.norm(self.path[i] - self.path[i-1])
+                    accumulated_distance += segment_length
+            
+                if accumulated_distance >= adaptive_lookahead:
+                    lookahead_target = self.path[i]
+                    break
+                
+                elif i == len(self.path) - 1:
+                    lookahead_target = self.path[i]
         
-        # --- LOOKAHEAD MECHANISM FOR SMOOTHER TURNS ---
-        lookahead_target = self.path[0]
-        accumulated_distance = 0.0
-        
-        for i in range(len(self.path)):
-            if i > 0:
-                segment_length = np.linalg.norm(self.path[i] - self.path[i-1])
-                accumulated_distance += segment_length
-        
-            if accumulated_distance >= self.path_lookahead_distance:
-                lookahead_target = self.path[i]
-                break
-            elif i == len(self.path) - 1:
-                lookahead_target = self.path[i]
-        
-        # Calculate target angle to lookahead point
-        delta_pos = lookahead_target - self.current_pose[:2]
-        target_angle = math.atan2(delta_pos[1], delta_pos[0])
-    
-        # --- PID sur la rotation avec DAMPING amélioré ---
-        angle_error = normalize_angle(target_angle - self.current_pose[2])
-        deriv_error = angle_error - self.prev_angle_error
-    
-        # Reduce rotation gain when angle error is small (smoother motion)
-        if abs(angle_error) < math.radians(10):
-            Kp_active = self.Kp * 0.6
-            Kd_active = self.Kd * 0.8
-        else:
-            Kp_active = self.Kp
-            Kd_active = self.Kd
-    
-        rotation_speed = Kp_active * angle_error + Kd_active * deriv_error
-        rotation_speed = float(np.clip(rotation_speed, -1.0, 1.0))
-        self.prev_angle_error = angle_error
-    
-        # Distance to immediate waypoint (for waypoint removal)
-        distance_to_waypoint = np.linalg.norm(self.path[0] - self.current_pose[:2])
-    
-        # --- CONSTANT SPEED PROFILE (NO ADAPTIVE CONTROL) ---
-        max_speed = 100.0
-        target_speed = max(0.0, min(max_speed, distance_to_waypoint * 0.12 + 0.3))
-    
-        measured_vel = self.measured_velocity()
-        measured_speed = math.sqrt(measured_vel[0] ** 2 + measured_vel[1] ** 2)
-    
-        # --- PID sur la vitesse ---
-        speed_error = target_speed - measured_speed
-        deriv_speed = speed_error - self.prev_speed_error
-        forward_cmd = self.Kp_pos * speed_error + self.Kd_pos * deriv_speed
-    
-        # Slow down if large angle error
-        if abs(angle_error) > 1.0:  # Changed from 0.4 to 1.0 radians
-            forward_cmd *= 0.3  # Reduce speed instead of stopping
-    
-        forward_cmd = float(np.clip(forward_cmd, -1.0, 1.0))
-        self.prev_speed_error = speed_error
-    
-        # Remove waypoint when close
-        if distance_to_waypoint < 30.0:
-            self.path.pop(0)
-        elif len(self.path) > 1:
-            dist_to_next = np.linalg.norm(self.path[1] - self.current_pose[:2])
-            if dist_to_next < distance_to_waypoint:
+            # Calculate target angle to lookahead point
+            delta_pos = lookahead_target - self.current_pose[:2]
+            target_angle = math.atan2(delta_pos[1], delta_pos[0])
+
+            # --- PID sur la rotation avec DAMPING amélioré ---
+            angle_error = normalize_angle(target_angle - self.current_pose[2])
+            deriv_error = angle_error - self.prev_angle_error
+
+            # Reduce rotation gain when angle error is small (smoother motion)
+            if abs(angle_error) < math.radians(10):
+                Kp_active = self.Kp * 0.6
+                Kd_active = self.Kd * 0.8
+            else:
+                Kp_active = self.Kp
+                Kd_active = self.Kd
+
+            rotation_speed = Kp_active * angle_error + Kd_active * deriv_error
+            rotation_speed = float(np.clip(rotation_speed, -1.0, 1.0))
+            self.prev_angle_error = angle_error
+
+            # Distance to immediate waypoint (for waypoint removal)
+            distance_to_waypoint = np.linalg.norm(self.path[0] - self.current_pose[:2])
+
+            # --- CONSTANT SPEED PROFILE ---
+            max_speed = 300.0
+            target_speed = max(0.0, min(max_speed, distance_to_waypoint * 0.12 + 0.3))
+
+            measured_vel = self.measured_velocity()
+            measured_speed = math.sqrt(measured_vel[0] ** 2 + measured_vel[1] ** 2)
+
+            # --- PID sur la vitesse ---
+            speed_error = target_speed - measured_speed
+            deriv_speed = speed_error - self.prev_speed_error
+            forward_cmd = self.Kp_pos * speed_error + self.Kd_pos * deriv_speed
+
+            # Slow down if large angle error (>1.0 radians ≈ 57 degrees)
+            if abs(angle_error) > 1.0:
+                forward_cmd *= 0.5  # Reduce speed instead of stopping
+
+            forward_cmd = float(np.clip(forward_cmd, -1.0, 1.0))
+            self.prev_speed_error = speed_error
+
+            # Remove waypoint when close
+            if distance_to_waypoint < 30.0:
                 self.path.pop(0)
-        return {"forward": forward_cmd, "lateral": 0.0, "rotation": rotation_speed}
-    
+            elif len(self.path) > 1:
+                dist_to_next = np.linalg.norm(self.path[1] - self.current_pose[:2])
+                if dist_to_next < distance_to_waypoint:
+                    self.path.pop(0)
+        
+            return {"forward": forward_cmd, "lateral": 0.0, "rotation": rotation_speed}
+        
 
     # --------------------------------------------------------------------------
     # FONCTIONS PRINCIPALES (Localisation, Cartographie Binaire)
@@ -1480,7 +1469,8 @@ class MyDronePrototype(DroneAbstract):
             
             # Rescue zones (only if present)
             if "rescue_list" in other_message:
-                all_rescue_zones.extend(other_message["rescue_list"])
+                for r in all_rescue_zones:
+                    self._add_or_merge_rescue_point(r)
         
 
             if "removed_wounded" in other_message:
@@ -1574,7 +1564,7 @@ class MyDronePrototype(DroneAbstract):
 
         is_free = (grid_map < SEUIL_FREE)
         is_wall = (grid_map >= SEUIL_MUR)
-        struct = np.ones((6, 6), dtype=bool)
+        struct = np.ones((8, 8), dtype=bool)
         danger_zone = binary_dilation(is_wall, structure=struct, iterations=1)
         safe_free = is_free & (~danger_zone)
 
@@ -1654,88 +1644,6 @@ class MyDronePrototype(DroneAbstract):
         
         return False
 
-    def rvo_avoidance(self, command):
-
-
-        if not hasattr(self, 'other_drones_positions') or not self.other_drones_positions:
-            return command
-
-        # Tuning Parameters
-        EMERGENCY_DIST = 35.0  # Stop immediately (sim units)
-        YIELD_DIST = 70.0      # Start yielding
-        REPULSION_DIST = 90.0  # Start sliding away
-        REPULSION_FORCE = 1.5  # Strength of sliding
-
-        my_pos = self.current_pose[:2]
-        
-        # Accumulate avoidance forces
-        avoid_vector = np.array([0.0, 0.0])
-        should_stop = False
-        
-        for other_pos, other_id in self.other_drones_positions:
-            dist_vector = my_pos - other_pos[:2]
-            dist = np.linalg.norm(dist_vector)
-
-            # Ignore distant drones
-            if dist > REPULSION_DIST or dist == 0:
-                continue
-
-            # 1. EMERGENCY BRAKE
-            if dist < EMERGENCY_DIST:
-                # If we are head-on, just stop to prevent crash
-                should_stop = True
-                break
-
-            # 2. PRIORITY SYSTEM (Yield to lower IDs)
-            # If I have a higher ID, I am "secondary" and must give way
-            if dist < YIELD_DIST and self.identifier > other_id:
-                # If the other drone is roughly in front of me, I stop/reverse
-                # Calculate angle to other drone
-                angle_to_other = math.atan2(-dist_vector[1], -dist_vector[0])
-                relative_angle = normalize_angle(angle_to_other - self.current_pose[2])
-                
-                # If it's in front (-90 to +90 degrees), I yield
-                if abs(relative_angle) < math.pi / 2:
-                    should_stop = True
-            
-            # 3. LATERAL REPULSION (Potential Field)
-            # Push away: stronger as we get closer
-            strength = (REPULSION_DIST - dist) / REPULSION_DIST
-            normalized_vec = dist_vector / dist
-            avoid_vector += normalized_vec * strength * REPULSION_FORCE
-
-        # Apply Actions
-        if should_stop:
-            # STOP and slightly reverse
-            command["forward"] = -0.1
-            command["lateral"] = 0.0
-            command["rotation"] = 0.0
-            return command
-
-        # Apply Repulsion
-        if np.linalg.norm(avoid_vector) > 0.1:
-            # Convert world repulsion vector to local drone frame (Forward/Lateral)
-            dx = avoid_vector[0]
-            dy = avoid_vector[1]
-            heading = self.current_pose[2]
-            
-            # Rotation matrix to convert world vector to body frame
-            local_x = dx * math.cos(heading) + dy * math.sin(heading)  # Forward component
-            local_y = -dx * math.sin(heading) + dy * math.cos(heading) # Lateral component
-
-            # Add to existing command (blend it)
-            command["forward"] += local_x
-            command["lateral"] += local_y
-
-            # Clip values
-            command["forward"] = float(np.clip(command["forward"], -1.0, 1.0))
-            command["lateral"] = float(np.clip(command["lateral"], -1.0, 1.0))
-
-        return command
-
-
-
-
 
     def wall_avoidance(self, command, lidar_data):
             """
@@ -1774,6 +1682,85 @@ class MyDronePrototype(DroneAbstract):
                 command["lateral"] += repulsion_lateral * GAIN
                 
                 # Clip to valid range [-1, 1]
+                command["forward"] = float(np.clip(command["forward"], -1.0, 1.0))
+                command["lateral"] = float(np.clip(command["lateral"], -1.0, 1.0))
+                
+            return command
+    
+    def _add_or_merge_rescue_point(self, new_point):
+            """
+            STABILIZATION LOGIC:
+            Only add a point if it is FAR from all existing points.
+            If it is close to an existing point, IGNORE IT (keep the original stable).
+            """
+            nx, ny = new_point
+            MAX_RESCUE_POINTS = 5
+            # Radius to consider a point "already known"
+            # 100.0 is safe to ensure we don't accidentally add the same zone twice
+            DEDUP_RADIUS = 20.0 
+
+            # 1. Check against ALL existing points
+            for (rx, ry) in self.rescue_zone_points:
+                dist = math.hypot(rx - nx, ry - ny)
+                if dist < DEDUP_RADIUS:
+                    # We already have a point roughly here. 
+                    # Do NOT update it. Do NOT add a new one.
+                    # Just return to keep the existing point stable.
+                    return
+
+            # 2. If we are here, it is a completely NEW area.
+            if len(self.rescue_zone_points) < MAX_RESCUE_POINTS:
+                self.rescue_zone_points.append((nx, ny))
+                print(f"[{self.identifier}] Secured new Rescue Point {len(self.rescue_zone_points)}/5 at ({nx:.0f}, {ny:.0f})")
+
+
+    def drone_repulsion(self, command):
+            """
+            Simple Potential Field Repulsion for Drones.
+            Pushes the drone away from others if they get too close.
+            """
+            if not hasattr(self, 'other_drones_positions') or not self.other_drones_positions:
+                return command
+
+            # SETTINGS
+            SAFE_DIST = 80.0  # Start pushing away at 70 pixels (approx 0.7 meter)
+            GAIN = 2.0         # Strong push (Stronger than walls to prevent tangling)
+
+            repulsion_forward = 0.0
+            repulsion_lateral = 0.0
+            
+            my_pos = self.current_pose[:2]
+            my_theta = self.current_pose[2]
+
+            for other_info in self.other_drones_positions:
+                # Extract position (format is usually (pos_array, id))
+                other_pos = other_info[0]
+                
+                # Vector: From THEM -> to ME (We want to be pushed AWAY)
+                dx = my_pos[0] - other_pos[0]
+                dy = my_pos[1] - other_pos[1]
+                dist = math.hypot(dx, dy)
+
+                if 0 < dist < SAFE_DIST:
+                    # 1. Magnitude: Stronger as we get closer (0.0 to 1.0)
+                    force = (SAFE_DIST - dist) / SAFE_DIST
+                    
+                    # 2. Direction: Global angle of the push
+                    angle_global = math.atan2(dy, dx)
+                    
+                    # 3. Local Projection: Convert to Forward/Lateral relative to head
+                    angle_local = normalize_angle(angle_global - my_theta)
+                    
+                    repulsion_forward += force * math.cos(angle_local)
+                    repulsion_lateral += force * math.sin(angle_local)
+
+            # Apply to command
+            if abs(repulsion_forward) > 0.01 or abs(repulsion_lateral) > 0.01:
+                # Add to existing movement command
+                command["forward"] += repulsion_forward * GAIN
+                command["lateral"] += repulsion_lateral * GAIN
+                
+                # Clip to ensure we don't exceed motor limits
                 command["forward"] = float(np.clip(command["forward"], -1.0, 1.0))
                 command["lateral"] = float(np.clip(command["lateral"], -1.0, 1.0))
                 
