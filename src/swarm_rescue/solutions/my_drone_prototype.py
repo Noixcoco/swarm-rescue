@@ -739,8 +739,8 @@ class MyDronePrototype(DroneAbstract):
             need_replan = False
             if not self.path or len(self.path) < 1:
                 need_replan = True
-            # Met à jour le chemin tous les 20 itérations (si cible existante)
-            if self.path and hasattr(self, 'target_point') and self.iteration % 20 == 0:
+            # Met à jour le chemin tous les 50 itérations (si cible existante)
+            if self.path and hasattr(self, 'target_point') and self.iteration % 50 == 0:
                 need_replan = True
 
             if need_replan:
@@ -839,17 +839,39 @@ class MyDronePrototype(DroneAbstract):
             if self.current_target_wounded:
                 dist_to_target = np.linalg.norm(np.array(self.current_target_wounded) - self.current_pose[:2])
                 
-                if dist_to_target < 40.0:
+                if dist_to_target < 100.0:
                     # Calculate angle directly to the person
                     diff = np.array(self.current_target_wounded) - self.current_pose[:2]
                     target_angle = math.atan2(diff[1], diff[0])
                     
-                    # Rotate to face the person before the grasper 'clicks'
-                    angle_error = normalize_angle(target_angle - self.current_pose[2])
+                    # # Rotate to face the person before the grasper 'clicks'
+                    # angle_error = normalize_angle(target_angle - self.current_pose[2])
+                    
+                    # We want to approach backwards, so we aim for the opposite angle
+                    target_heading = normalize_angle(target_angle + math.pi)
+                    
+                    # Calculate angle error relative to the BACK of the drone
+                    angle_error = normalize_angle(target_heading - self.current_pose[2])
+                    
+                    #on veut prendre le blessé par l'arrière donc on fait demi-tour
+                    #on gère le fait où l'angle est proche de pi ou -pi
+                    if angle_error > np.pi:
+                        angle_error -= 2.0 * np.pi
+                    elif angle_error < -np.pi:
+                        angle_error += 2.0 * np.pi
+
                     rotation_speed = float(np.clip(self.Kp * angle_error, -1.0, 1.0))
                     
+
+
                     # Slow approach to ensure the front-mounted grasper makes contact
-                    command = {"forward": 0.3, "lateral": 0.0, "rotation": rotation_speed, "grasper": 1}
+                    # Logic: Stop and rotate if not aligned, then back up
+                    if abs(angle_error) > 0.2:
+                        # Stop and rotate
+                        command = {"forward": 0.0, "lateral": 0.0, "rotation": rotation_speed, "grasper": 0}
+                    else:
+                        # Aligned (back facing target), move backwards
+                        command = {"forward": -0.3, "lateral": 0.0, "rotation": rotation_speed, "grasper": 1}
                     return self.wall_avoidance(command, lidar_data)
             
     
@@ -878,7 +900,25 @@ class MyDronePrototype(DroneAbstract):
                     command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
 
         elif self.state == self.Activity.GOING_TO_RESCUE_CENTER:
-            if self.path:
+            dist_to_rescue = float('inf')
+            if self.rescue_zone_points:
+                dist_to_rescue = np.linalg.norm(np.array(self.rescue_zone_points[0]) - self.current_pose[:2])
+            
+            if dist_to_rescue < 100.0 and self.rescue_zone_points:
+                 target_pos = np.array(self.rescue_zone_points[0])
+                 diff = target_pos - self.current_pose[:2]
+                 target_angle = math.atan2(diff[1], diff[0])
+                 
+                 target_heading = normalize_angle(target_angle + math.pi)
+                 
+                 angle_error = normalize_angle(target_heading - self.current_pose[2])
+                 rotation_speed = float(np.clip(self.Kp * angle_error, -1.0, 1.0))
+                 
+                 if abs(angle_error) > 0.2:
+                     command = {"forward": 0.0, "lateral": 0.0, "rotation": rotation_speed}
+                 else:
+                     command = {"forward": -0.5, "lateral": 0.0, "rotation": rotation_speed}
+            elif self.path:
                 command = self.follow_path(lidar_data)
             else:
                 command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}

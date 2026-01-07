@@ -17,7 +17,7 @@ from examples.example_mapping import OccupancyGrid
 from swarm_rescue.simulation.utils.pose import Pose
 
 
-class MyDronePrototype(DroneAbstract):
+class MyDronePrototype1(DroneAbstract):
     class Activity(Enum):
         """
         All the states of the drone as a state machine
