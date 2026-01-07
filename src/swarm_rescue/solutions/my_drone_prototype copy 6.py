@@ -58,7 +58,7 @@ class MyDronePrototype(DroneAbstract):
 
         # NEW: Path smoothing parameters
         self.path_smoothing_enabled = True
-        self.path_lookahead_distance = 20.0  # Look ahead for smoother turns
+        self.path_lookahead_distance = 35.0  # Look ahead for smoother turns
 
         # `wounded_to_rescue`: list of (x,y) tuples for detected wounded persons
         # `rescue_zone_points`: list of (x,y) tuples representing detected rescue area points
@@ -141,7 +141,7 @@ class MyDronePrototype(DroneAbstract):
         SEUIL_MUR = 30.0
         SEUIL_FREE = -5.0  # Free cells are BELOW this threshold
         SEUIL_UNEXPLORED_MAX = 4.0  # Unexplored cells are near 0 (between -4 and +4)
-        SEUIL_UNEXPLORED_MIN = -4.0
+        SEUIL_UNEXPLORED_MIN = -4.99
     
         # Masque des murs (high positive values)
         is_wall = (grid >= SEUIL_MUR)
@@ -153,7 +153,7 @@ class MyDronePrototype(DroneAbstract):
         is_unexplored = (grid >= SEUIL_UNEXPLORED_MIN) & (grid <= SEUIL_UNEXPLORED_MAX)
         
         # Dilate les murs pour éviter les zones proches
-        struct = np.ones((7, 7), dtype=bool)
+        struct = np.ones((6, 6), dtype=bool)
         danger_zone = binary_dilation(is_wall, structure=struct, iterations=1)
         
         # --- MODIFIED DRONE AVOIDANCE ZONE - ONLY AVOID DRONES IN FRONT ---
@@ -488,7 +488,7 @@ class MyDronePrototype(DroneAbstract):
             # Only consider wounded not already assigned or grasped
             grasped = getattr(self, "other_grasped_wounded", set())
 
-            exclusion_radius = 20.0
+            exclusion_radius = 50.0
 
             def is_near_grasped(w):
                 return any(math.hypot(w[0] - gx, w[1] - gy) < exclusion_radius for (gx, gy) in grasped)
@@ -841,8 +841,29 @@ class MyDronePrototype(DroneAbstract):
                 command = {"forward": 0.5, "lateral": 0.0, "rotation": 0.0}
 
         elif self.state == self.Activity.GOING_TO_WOUNDED:
+
+            #rotate to face wounded when close enough
+            if self.current_target_wounded:
+                dist_to_target = np.linalg.norm(np.array(self.current_target_wounded) - self.current_pose[:2])
+                
+                if dist_to_target < 40.0:
+                    # Calculate angle directly to the person
+                    diff = np.array(self.current_target_wounded) - self.current_pose[:2]
+                    target_angle = math.atan2(diff[1], diff[0])
+                    
+                    # Rotate to face the person before the grasper 'clicks'
+                    angle_error = normalize_angle(target_angle - self.current_pose[2])
+                    rotation_speed = float(np.clip(self.Kp * angle_error, -1.0, 1.0))
+                    
+                    # Slow approach to ensure the front-mounted grasper makes contact
+                    command = {"forward": 0.3, "lateral": 0.0, "rotation": rotation_speed, "grasper": 1}
+                    return self.wall_avoidance(command, lidar_data)
+            
+    
             if self.path:
                 command = self.follow_path(lidar_data)
+            
+
             else:
                 # Replan if needed
                 if self.current_target_wounded:
@@ -946,7 +967,7 @@ class MyDronePrototype(DroneAbstract):
             return
 
         # Parameters
-        dedup_radius = 30.0
+        dedup_radius = 60.0
         alpha_update = 0.3
         memory_max_age = 10000
 
@@ -1133,7 +1154,7 @@ class MyDronePrototype(DroneAbstract):
         frontier_mask = is_free & (~is_heavily_explored) & unknown_neighbors
 
         # Safety margin around walls
-        struct = np.ones((7, 7), dtype=bool)
+        struct = np.ones((6, 6), dtype=bool)
         danger_zone = binary_dilation(is_wall, structure=struct, iterations=2)
         frontier_mask = frontier_mask & (~danger_zone)
 
@@ -1230,8 +1251,41 @@ class MyDronePrototype(DroneAbstract):
                 for (xw, yw) in self.wounded_to_rescue:
                     pt = np.array([xw, yw]) + self._half_size_array
                     # visible marker (outline + small filled center)
-                    arcade.draw_circle_outline(pt[0], pt[1], radius=18, color=detection_color, border_width=2)
-                    arcade.draw_text("det", pt[0] + 14, pt[1] + 14, detection_color, 10)
+                    #arcade.draw_circle_outline(pt[0], pt[1], radius=18, color=detection_color, border_width=2)
+                    #arcade.draw_text("det", pt[0] + 14, pt[1] + 14, detection_color, 10)
+
+
+                   # Match the wounded to an assignment using a distance threshold
+                    assigned_drone_id = None
+                    
+                    # Iterate through assignments to find a match for this (xw, yw)
+                    for w_pos, drone_id in self.wounded_assignments.items():
+                        # Handle potential string keys from communication
+                        if isinstance(w_pos, str):
+                            try:
+                                # Convert "(1.2, 3.4)" -> [1.2, 3.4]
+                                coords = [float(x) for x in w_pos.strip("()").split(",")]
+                                kx, ky = coords[0], coords[1]
+                            except: continue
+                        else:
+                            kx, ky = w_pos[0], w_pos[1]
+                        
+                        # Distance threshold check (must be the same person)
+                        if math.hypot(xw - kx, yw - ky) < 10.0:
+                            assigned_drone_id = drone_id
+                            break
+                    
+                    # Set color based on assigned drone
+                    if assigned_drone_id is not None:
+                        color = palette[int(assigned_drone_id) % len(palette)]
+                        label = f"ASSIGNED: DRONE {assigned_drone_id}"
+                    else:
+                        color = (255, 255, 255) # White if unassigned
+                        label = "AVAILABLE"
+
+                    # Draw the marker and the text
+                    arcade.draw_circle_outline(pt[0], pt[1], 20, color, 2)
+                    arcade.draw_text(label, pt[0] + 25, pt[1] - 10, color, 11, bold=True)
         except Exception:
             pass
 
@@ -1346,7 +1400,7 @@ class MyDronePrototype(DroneAbstract):
         self.prev_speed_error = speed_error
     
         # Remove waypoint when close
-        if distance_to_waypoint < 30:
+        if distance_to_waypoint < 30.0:
             self.path.pop(0)
         elif len(self.path) > 1:
             dist_to_next = np.linalg.norm(self.path[1] - self.current_pose[:2])
@@ -1585,7 +1639,7 @@ class MyDronePrototype(DroneAbstract):
 
         is_free = (grid_map < SEUIL_FREE)
         is_wall = (grid_map >= SEUIL_MUR)
-        struct = np.ones((10, 10), dtype=bool)
+        struct = np.ones((6, 6), dtype=bool)
         danger_zone = binary_dilation(is_wall, structure=struct, iterations=1)
         safe_free = is_free & (~danger_zone)
 
