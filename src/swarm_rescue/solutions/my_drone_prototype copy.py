@@ -149,32 +149,15 @@ class MyDronePrototype(DroneAbstract):
         # Masque des murs (high positive values)
         is_wall = (grid >= SEUIL_MUR)
         
-        # CORRECT: Only cells with NEGATIVE values are explored free space
+        # ✅ CORRECT: Only cells with NEGATIVE values are explored free space
         is_explored_free = (grid < SEUIL_FREE)
         
-        # CORRECT: Unexplored cells are near zero
+        # ✅ CORRECT: Unexplored cells are near zero
         is_unexplored = (grid >= SEUIL_UNEXPLORED_MIN) & (grid <= SEUIL_UNEXPLORED_MAX)
         
         # Dilate les murs pour éviter les zones proches
         struct = np.ones((9, 9), dtype=bool)
         danger_zone = binary_dilation(is_wall, structure=struct, iterations=1)
-
-
-        # --- 4. SOFT CONSTRAINT SETUP (Distance Map) ---
-        # Calculate distance from every pixel to the nearest wall (IN CELLS)
-        # This creates the "Gradient" that pushes the drone to the center.
-        # We invert is_wall because we want distance to the WALLS.
-        dist_map = ndimage.distance_transform_edt(~is_wall)
-
-        # DEFINITION: How far (in world units) do we want to be?
-        COMFORT_DISTANCE_WORLD = 100.0  # e.g., 60cm or 60px
-        
-        # CONVERSION: Convert that to grid cells so we can compare with dist_map
-        comfort_dist_cells = COMFORT_DISTANCE_WORLD / self.grid.resolution
-        
-        # Max penalty to apply if we are right next to the wall
-        MAX_PENALTY = 50.0
-
         
         # --- MODIFIED DRONE AVOIDANCE ZONE - ONLY AVOID DRONES IN FRONT ---
         # Cache drone danger zone for a few iterations if positions haven't changed
@@ -182,7 +165,7 @@ class MyDronePrototype(DroneAbstract):
         # --- NEW: ADD OTHER DRONES AS TEMPORARY OBSTACLES ---
         # This treats other drones as "walls" for the pathfinder
         if hasattr(self, 'other_drones_positions') and self.other_drones_positions:
-        
+            # Radius to block around each drone (40px = ~40cm)
             DRONE_OBSTACLE_RADIUS = 40.0 
             radius_cells = int(DRONE_OBSTACLE_RADIUS / self.grid.resolution)
             
@@ -320,39 +303,28 @@ class MyDronePrototype(DroneAbstract):
                 if danger_zone[neighbor]:
                     continue
 
+                if abs(dx) == 1 and abs(dy) == 1:
+                    neigh1 = (current[0] + dx, current[1])
+                    neigh2 = (current[0], current[1] + dy)
+                    if (0 <= neigh1[0] < grid.shape[0] and 0 <= neigh1[1] < grid.shape[1]):
+                        if danger_zone[neigh1]:
+                            continue
+                    if (0 <= neigh2[0] < grid.shape[0] and 0 <= neigh2[1] < grid.shape[1]):
+                        if danger_zone[neigh2]:
+                            continue
 
-                # --- NEW: COST CALCULATION (Soft Constraints) ---
-                base_cost = math.hypot(dx, dy)
-                # Retrieve distance to nearest wall (in CELLS)
-                dist_to_wall_cells = dist_map[neighbor[0], neighbor[1]]
-                
-                penalty = 0.0
-
-                # Apply penalty if closer than comfort distance
-                if dist_to_wall_cells < comfort_dist_cells:
-                    # Linear gradient: closer to wall = higher cost
-                    # 0 penalty at comfort distance, MAX_PENALTY at wall
-                    factor = 1.0 - (dist_to_wall_cells / comfort_dist_cells)
-                    penalty = MAX_PENALTY * factor
-                
-                move_cost = base_cost + penalty
-                # -----------------------------------------------
-
+                move_cost = math.hypot(dx, dy)
                 tentative_g_score = gscore[current] + move_cost
 
                 if neighbor in close_set and tentative_g_score >= gscore.get(neighbor, float('inf')):
                     continue
-                            
                 if tentative_g_score < gscore.get(neighbor, float('inf')):
                     came_from[neighbor] = current
                     gscore[neighbor] = tentative_g_score
                     fscore[neighbor] = tentative_g_score + heuristic(neighbor, goal)
                     heapq.heappush(oheap, (fscore[neighbor], neighbor))
-                    
+        
         return []
-
-
-         
 
     def smooth_path(self, path_grid, danger_zone):
         """
