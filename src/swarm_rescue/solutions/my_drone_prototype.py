@@ -32,7 +32,7 @@ class MyDronePrototype(DroneAbstract):
         self.current_pose = np.array([0.0, 0.0, 0.0])
 
         self.iteration: int = 0
-        resolution = 8
+        resolution = 10
         self.grid = OccupancyGrid(size_area_world=self.size_area,
                                   resolution=resolution,
                                   lidar=self.lidar())
@@ -54,7 +54,7 @@ class MyDronePrototype(DroneAbstract):
         self.prev_speed_error = 0.0
 
         self.path = []
-        self.frontiers_world = []
+
 
         # NEW: Path smoothing parameters
         self.path_smoothing_enabled = True
@@ -90,7 +90,6 @@ class MyDronePrototype(DroneAbstract):
 
         self.evaluated_wounded = set() # pour l'attribution des blessés aux drones
         
-
         self.wounded_assignments = {}  # {wounded_pos: drone_id}
 
         self.removed_wounded = []  # Liste des wounded supprimés
@@ -116,12 +115,12 @@ class MyDronePrototype(DroneAbstract):
     # --- HANSEL & GRETEL pour retourner a la rescue zone si find explored path fail ---
         self.breadcrumbs = [] # Stores (x, y) tuples
         self.last_breadcrumb_pos = None
-        self.breadcrumb_spacing = 500.0 # Distance between crumbs (pixels)
+        self.breadcrumb_spacing = 100.0 # Distance between crumbs (pixels)
 
 
     def creer_chemin(self, start_world, goal_world, explored_only=False):
         """
-        Calcule un chemin avec LISSAGE pour des mouvements plus linéaires
+        Calcule un chemin avec lissage pour des mouvements plus linéaires
         """
         #cache
         start_key = (round(start_world[0] / 10) * 10, round(start_world[1] / 10) * 10)
@@ -141,7 +140,7 @@ class MyDronePrototype(DroneAbstract):
         goal = tuple(map(int, goal))
 
         # --- FIXED THRESHOLDS ---
-        SEUIL_MUR = 30.0
+        SEUIL_MUR = 4.01
         SEUIL_FREE = -5.0  # Free cells are BELOW this threshold
         SEUIL_UNEXPLORED_MAX = 4.0  # Unexplored cells are near 0 (between -4 and +4)
         SEUIL_UNEXPLORED_MIN = -4.99
@@ -156,7 +155,7 @@ class MyDronePrototype(DroneAbstract):
         is_unexplored = (grid >= SEUIL_UNEXPLORED_MIN) & (grid <= SEUIL_UNEXPLORED_MAX)
         
         # Dilate les murs pour éviter les zones proches
-        struct = np.ones((9, 9), dtype=bool)
+        struct = np.ones((5, 5), dtype=bool)
         danger_zone = binary_dilation(is_wall, structure=struct, iterations=1)
 
 
@@ -167,7 +166,7 @@ class MyDronePrototype(DroneAbstract):
         dist_map = ndimage.distance_transform_edt(~is_wall)
 
         # DEFINITION: How far (in world units) do we want to be?
-        COMFORT_DISTANCE_WORLD = 100.0  # e.g., 60cm or 60px
+        COMFORT_DISTANCE_WORLD = 40.0  # e.g., 60cm or 60px
         
         # CONVERSION: Convert that to grid cells so we can compare with dist_map
         comfort_dist_cells = COMFORT_DISTANCE_WORLD / self.grid.resolution
@@ -190,8 +189,8 @@ class MyDronePrototype(DroneAbstract):
                 other_pos = other_info[0]
                 
                 # Only consider drones that are somewhat close (optimization)
-                # e.g., within 300 pixels. Far away drones don't matter.
-                if math.hypot(other_pos[0] - start_world[0], other_pos[1] - start_world[1]) > 300.0:
+                # e.g., within 200 pixels. Far away drones don't matter.
+                if math.hypot(other_pos[0] - start_world[0], other_pos[1] - start_world[1]) > 200.0:
                     continue
 
                 try:
@@ -221,21 +220,21 @@ class MyDronePrototype(DroneAbstract):
         # Si le start ou le goal sont dans la danger_zone (par ex. drone collé au mur),
         # on autorise une petite zone autour d'eux pour permettre à A* de s'extraire.
         try:
-            radius_clear = 2
-            sy, sx = start
-            gy, gx = goal
-            y0 = max(0, sy - radius_clear)
-            y1 = min(grid.shape[0], sy + radius_clear + 1)
+            radius_clear = 1
+            sx, sy = start
+            gx, gy = goal
             x0 = max(0, sx - radius_clear)
-            x1 = min(grid.shape[1], sx + radius_clear + 1)
-            danger_zone[y0:y1, x0:x1] = False
+            x1 = min(grid.shape[0], sx + radius_clear + 1)
+            y0 = max(0, sy - radius_clear)
+            y1 = min(grid.shape[1], sy + radius_clear + 1)
+            danger_zone[x0:x1, y0:y1] = False
             # Clear zone autour du goal avec un rayon plus grand pour le rescue center
             radius_clear_goal = 5  # Plus grand rayon pour le goal (rescue center)
             y0 = max(0, gy - radius_clear_goal)
-            y1 = min(grid.shape[0], gy + radius_clear_goal + 1)
+            y1 = min(grid.shape[1], gy + radius_clear_goal + 1)
             x0 = max(0, gx - radius_clear_goal)
-            x1 = min(grid.shape[1], gx + radius_clear_goal + 1)
-            danger_zone[y0:y1, x0:x1] = False
+            x1 = min(grid.shape[0], gx + radius_clear_goal + 1)
+            danger_zone[x0:x1, y0:y1] = False
         except Exception:
             # en cas de problème d'indices, on ignore et laisse danger_zone inchangé
             pass
@@ -256,53 +255,33 @@ class MyDronePrototype(DroneAbstract):
 
         while oheap:
             current = heapq.heappop(oheap)[1]
+
             if current == goal:
-                # Reconstruct path
+                # --- 1. FULL PATH RECONSTRUCTION ---
                 path = [current]
                 while current in came_from:
                     current = came_from[current]
                     path.append(current)
                 path.reverse()
                 
-                # --- IMPROVED PATH COMPRESSION WITH ANGLE-BASED SMOOTHING ---
-                if len(path) <= 2:
-                    compressed = path
-                else:
-                    compressed = [path[0]]
-                    
-                    for i in range(1, len(path) - 1):
-                        prev_v = np.array([path[i][0] - path[i-1][0], path[i][1] - path[i-1][1]])
-                        next_v = np.array([path[i+1][0] - path[i][0], path[i+1][1] - path[i][1]])
-                        
-                        # Normalize vectors
-                        prev_norm = np.linalg.norm(prev_v)
-                        next_norm = np.linalg.norm(next_v)
-                        
-                        if prev_norm > 0 and next_norm > 0:
-                            prev_v = prev_v / prev_norm
-                            next_v = next_v / next_norm
-                            
-                            # Calculate angle between vectors
-                            dot_product = np.clip(np.dot(prev_v, next_v), -1.0, 1.0)
-                            angle_diff = math.acos(dot_product)
-                            
-                            # Only keep waypoint if angle change is significant (>15 degrees)
-                            if angle_diff > math.radians(15):
-                                compressed.append(path[i])
-                        else:
-                            if prev_v.tolist() != next_v.tolist():
-                                compressed.append(path[i])
-                
-                    compressed.append(path[-1])
+                # --- 2. FIXED-STEP SUBSAMPLING ---
+                # Keep 1 point every 4 steps to maintain a stable trail.
+                STEP = 7 
+                if len(path) > STEP:
+                    reduced_path = path[::STEP]
+                    if path[-1] not in reduced_path:
+                        reduced_path.append(path[-1])
+                    path = reduced_path
             
-                # --- APPLY SMOOTHING FILTER ---
-                if len(compressed) > 2 and self.path_smoothing_enabled:
-                    smoothed = self.smooth_path(compressed, danger_zone)
+                # --- 3. APPLY SMOOTHING ---
+                if len(path) > 2 and self.path_smoothing_enabled:
+                    smoothed = self.smooth_path(path, danger_zone)
                 else:
-                    smoothed = compressed
+                    smoothed = path
                 
-                # Convert grid -> world
+                #Convert grid -> world
                 world_path = [np.array(self.grid._conv_grid_to_world(*pt)) for pt in smoothed]
+
                 
                 self.path_cache[cache_key] = (world_path, self.iteration)
                 if len(self.path_cache) > self.path_cache_max_size:
@@ -387,15 +366,17 @@ class MyDronePrototype(DroneAbstract):
                 deduplicated.append(pt)
         
         return deduplicated
+    
 
     def is_point_safe(self, point, danger_zone):
         """Check if a point is in a safe region"""
-        y, x = int(round(point[0])), int(round(point[1]))
+        x, y = int(round(point[0])), int(round(point[1]))
         
-        if not (0 <= y < danger_zone.shape[0] and 0 <= x < danger_zone.shape[1]):
+        if not (0 <= y < danger_zone.shape[1] and 0 <= x < danger_zone.shape[0]):
             return False
         
-        return not danger_zone[y, x]
+        return not danger_zone[x, y]
+    
 
     def define_message_for_all(self):
         """Optimized communication - only send essential data at appropriate frequencies"""
@@ -857,12 +838,12 @@ class MyDronePrototype(DroneAbstract):
                             self.path = self.creer_chemin(self.current_pose[:2], self.target_point)
                 
                 else:
-                    # ✅ FALLBACK: Use local frontier detection
-                    self.frontiers_world = self.find_safe_frontier_points()
-                    if self.frontiers_world:
-                        distances = [np.linalg.norm(f - self.current_pose[:2]) for f in self.frontiers_world]
+                    # FALLBACK: Use local frontier detection
+                    local_frontiers = self.find_safe_frontier_points() 
+                    if local_frontiers: 
+                        distances = [np.linalg.norm(f - self.current_pose[:2]) for f in local_frontiers]
                         target_index = np.argmin(distances)
-                        target_point = self.frontiers_world[target_index]
+                        target_point = local_frontiers[target_index]
                         self.target_point = target_point
                         self.path = self.creer_chemin(self.current_pose[:2], target_point)
                        
@@ -1008,12 +989,8 @@ class MyDronePrototype(DroneAbstract):
 
         # Parameters
         dedup_radius = 60.0
-        rescue_dedup_radius = 100.0
         alpha_update = 0.3
-        MAX_RESCUE_POINTS = 5
  
-
-
         newly_seen_wounded = []
         newly_seen_rescue = []
 
@@ -1064,6 +1041,8 @@ class MyDronePrototype(DroneAbstract):
                     newx = (1.0 - alpha_update) * wx + alpha_update * nx
                     newy = (1.0 - alpha_update) * wy + alpha_update * ny
                     self.wounded_to_rescue[i] = (newx, newy)
+
+                 
                     merged = True
                     break
             if not merged:
@@ -1078,18 +1057,18 @@ class MyDronePrototype(DroneAbstract):
 
 
     # --------------------------------------------------------------------------
-    # FONCTION DE DÉTECTION DES FRONTIÈRES SÛRES (Mise à jour pour self.frontiers_world)
+    # FONCTION DE DÉTECTION DES FRONTIÈRES SÛRES 
     # --------------------------------------------------------------------------
 
     def find_safe_frontier_points(self) -> list:
         
         grid_map = self.grid.grid 
         
-        # ✅ RELAXED THRESHOLDS - Encourage exploring unexplored areas
-        SEUIL_FREE = -2.0        # Lightly explored (was -7.0)
-        SEUIL_MUR = 3.0         
-        SEUIL_UNEXPLORED_MIN = -1.0  # Wider unexplored range
-        SEUIL_UNEXPLORED_MAX = 1.0
+        # RELAXED THRESHOLDS - Encourage exploring unexplored areas
+        SEUIL_FREE = -3.0        # Lightly explored (was -7.0)
+        SEUIL_MUR = 6.0         
+        SEUIL_UNEXPLORED_MIN = -2.99  # Wider unexplored range
+        SEUIL_UNEXPLORED_MAX = 5.99
     
         frontiers = []
 
@@ -1098,8 +1077,8 @@ class MyDronePrototype(DroneAbstract):
         is_wall = (grid_map >= SEUIL_MUR)  
         is_free = (grid_map < SEUIL_FREE) # Lightly explored areas
         
-        # ✅ KEY: Exclude heavily explored dark blue corridor
-        is_heavily_explored = (grid_map < -15.0)
+        # KEY: Exclude heavily explored dark blue corridor
+        is_heavily_explored = (grid_map < -40.0)
 
         # Frontier detection
         structure = np.array([[0,1,0],
@@ -1108,11 +1087,11 @@ class MyDronePrototype(DroneAbstract):
 
         unknown_neighbors = binary_dilation(is_unknown, structure=structure)
         
-        # ✅ FIXED: Find free cells near unexplored, but NOT in heavily explored corridor
+        # FIXED: Find free cells near unexplored, but NOT in heavily explored corridor
         frontier_mask = is_free & (~is_heavily_explored) & unknown_neighbors
 
         # Safety margin around walls
-        struct = np.ones((9, 9), dtype=bool)
+        struct = np.ones((5, 5), dtype=bool)
         danger_zone = binary_dilation(is_wall, structure=struct, iterations=2)
         frontier_mask = frontier_mask & (~danger_zone)
 
@@ -1134,7 +1113,7 @@ class MyDronePrototype(DroneAbstract):
             x_world, y_world = self.grid._conv_grid_to_world(mean_x, mean_y)
             barycenter = np.array([x_world, y_world])
             
-            # ✅ VALIDATION: Ensure nearby unexplored cells exist
+            # VALIDATION: Ensure nearby unexplored cells exist
             bc_grid = self.grid._conv_world_to_grid(x_world, y_world)
             bc_y, bc_x = int(bc_grid[0]), int(bc_grid[1])
             
@@ -1186,15 +1165,6 @@ class MyDronePrototype(DroneAbstract):
         color_idx = int(self.identifier) % len(palette)
         detection_color = palette[color_idx]
     
-
-        
-        # --- NEW: DRAW BREADCRUMBS ---
-        if hasattr(self, 'breadcrumbs') and self.breadcrumbs:
-            crumb_color = (197, 137, 23) 
-            for pt in self.breadcrumbs:
-                # Convert world coords to screen coords
-                pt_screen = np.array(pt) + self._half_size_array
-                arcade.draw_circle_filled(pt_screen[0], pt_screen[1], radius=6, color=crumb_color)
 
         if hasattr(self, 'frontier_clusters') and self.frontier_clusters :
             # Only draw the 5 closest clusters to reduce rendering overhead
@@ -1622,7 +1592,7 @@ class MyDronePrototype(DroneAbstract):
 
         is_free = (grid_map < SEUIL_FREE)
         is_wall = (grid_map >= SEUIL_MUR)
-        struct = np.ones((9, 9), dtype=bool)
+        struct = np.ones((5, 5), dtype=bool)
         danger_zone = binary_dilation(is_wall, structure=struct, iterations=1)
         safe_free = is_free & (~danger_zone)
 
@@ -1712,7 +1682,7 @@ class MyDronePrototype(DroneAbstract):
                 return command
                 
             # 1. SETTINGS
-            SAFE_DIST = 20.0   # Distance to start pushing back (pixels)
+            SAFE_DIST = 30.0   # Distance to start pushing back (pixels)
             GAIN = 2.0         # Strength of the repulsion
             
             # 2. CALCULATE FORCES
@@ -1755,7 +1725,7 @@ class MyDronePrototype(DroneAbstract):
             MAX_RESCUE_POINTS = 5
             # Radius to consider a point "already known"
             # 100.0 is safe to ensure we don't accidentally add the same zone twice
-            DEDUP_RADIUS = 20.0 
+            DEDUP_RADIUS = 80.0 
 
             # 1. Check against ALL existing points
             for (rx, ry) in self.rescue_zone_points:
@@ -1847,5 +1817,4 @@ class MyDronePrototype(DroneAbstract):
         if dist >= self.breadcrumb_spacing:
             self.breadcrumbs.append(current_pos_tuple)
             self.last_breadcrumb_pos = current_pos_tuple
-
 
