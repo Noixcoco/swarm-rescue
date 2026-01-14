@@ -226,9 +226,10 @@ class MyDronePrototype(DroneAbstract):
 
     def define_message_for_all(self):
         """
-        Broadcast 'I am alive' message with position.
+        Broadcast 'I am alive' message with position and current target.
         """
-        return (self.identifier, "ALIVE", self.measured_gps_position())
+        target = self.current_target_wounded if hasattr(self, 'current_target_wounded') else None
+        return (self.identifier, "STATUS", self.measured_gps_position(), target)
 
     def control(self) -> CommandsDict:
         """
@@ -238,14 +239,27 @@ class MyDronePrototype(DroneAbstract):
         # increment the iteration counter
         self.iteration += 1
         
-        # --- Kill Zone Update ---
-        # Process incoming messages to track who is alive
+        # --- Kill Zone & Reservation Update ---
+        # Process incoming messages to track who is alive and what they are doing
+        self.reserved_targets = {}  # id -> target
+        
         if self.communicator:
             for comm, msg in self.communicator.received_messages:
-                if isinstance(msg, tuple) and len(msg) == 3 and msg[1] == "ALIVE":
-                    sender_id, status, pos = msg
-                    # Update record: ID -> (timestamp, position)
-                    self.last_alive_time[sender_id] = (self.iteration, pos)
+                if isinstance(msg, tuple) and len(msg) >= 3:
+                     # Support both old ALIVE format and new STATUS format if needed, 
+                     # but here we standardize to STATUS
+                     if msg[1] == "STATUS":
+                        sender_id = msg[0]
+                        pos = msg[2]
+                        # Handling optional target if message length varies, though it shouldn't with new code
+                        target = msg[3] if len(msg) > 3 else None
+                        
+                        # Update alive tracking
+                        self.last_alive_time[sender_id] = (self.iteration, pos)
+                        
+                        # Update reservations
+                        if target is not None:
+                            self.reserved_targets[sender_id] = target
 
         
         # --- 1. PERCEPTION ---
@@ -271,15 +285,43 @@ class MyDronePrototype(DroneAbstract):
         # Transitions
         if self.state == self.Activity.EXPLORING:
             if self.wounded_to_rescue:
-                # Choose closest wounded
-                distances = [np.linalg.norm(np.array(w) - self.current_pose[:2]) for w in self.wounded_to_rescue]
-                closest_idx = int(np.argmin(distances))
-                self.current_target_wounded = self.wounded_to_rescue[closest_idx]
-                self.state = self.Activity.GOING_TO_WOUNDED
-                self.path = self.creer_chemin(self.current_pose[:2], self.current_target_wounded)
-                self.last_replan_iteration = self.iteration
+                # Filter out wounded that are reserved by others
+                available_wounded = []
+                for w in self.wounded_to_rescue:
+                    is_reserved = False
+                    for other_id, reserved_pt in self.reserved_targets.items():
+                        # Don't consider it reserved if *I* am the one reserving it (though state is Exploring so I shouldn't be)
+                        if other_id == self.identifier:
+                            continue
+                        if math.hypot(w[0]-reserved_pt[0], w[1]-reserved_pt[1]) < 100.0: # Tolerance
+                            is_reserved = True
+                            break
+                    if not is_reserved:
+                        available_wounded.append(w)
+                
+                if available_wounded:
+                    # Choose closest wounded from AVAILABLE ones
+                    distances = [np.linalg.norm(np.array(w) - self.current_pose[:2]) for w in available_wounded]
+                    closest_idx = int(np.argmin(distances))
+                    self.current_target_wounded = available_wounded[closest_idx]
+                    self.state = self.Activity.GOING_TO_WOUNDED
+                    self.path = self.creer_chemin(self.current_pose[:2], self.current_target_wounded)
+                    self.last_replan_iteration = self.iteration
 
         elif self.state == self.Activity.GOING_TO_WOUNDED:
+            # Conflict Resolution: Check if someone else with lower ID is targeting the same wounded
+            if self.current_target_wounded:
+                 for other_id, other_target in self.reserved_targets.items():
+                     if other_id < self.identifier: # Higher priority
+                         if math.hypot(other_target[0] - self.current_target_wounded[0], 
+                                     other_target[1] - self.current_target_wounded[1]) < 20.0:
+                             print(f"Drone {self.identifier} yielding target to Drone {other_id}")
+                             # Give up target
+                             self.current_target_wounded = None
+                             self.state = self.Activity.EXPLORING
+                             self.path = []
+                             break
+
             if self.grasper.grasped_wounded_persons:
                 # Successfully grasped, go to rescue center
                 self.state = self.Activity.GOING_TO_RESCUE_CENTER
@@ -583,11 +625,6 @@ class MyDronePrototype(DroneAbstract):
                         self.grid.grid[y_min:y_max, x_min:x_max] = 100.0
                         # Also update zoomed grid for visualization if needed
                         self.grid.zoomed_grid[y_min:y_max, x_min:x_max] = 100.0
-                        
-                        # Store for visualization
-                        if not hasattr(self, 'dead_drones_locations'):
-                            self.dead_drones_locations = []
-                        self.dead_drones_locations.append((xw, yw))
 
                 if 'WOUNDED' in name.upper():
                     newly_seen_wounded.append((xw, yw))
@@ -823,16 +860,6 @@ class MyDronePrototype(DroneAbstract):
                     pt = np.array([xr, yr]) + self._half_size_array
                     arcade.draw_rectangle_outline(pt[0], pt[1], width=30, height=30, color=(0,160,0), border_width=2)
                     arcade.draw_text("RZ", pt[0] + 12, pt[1] + 12, (0,120,0), 10)
-        except Exception:
-            pass
-            
-        # Draw detected dead drones
-        try:
-            if hasattr(self, 'dead_drones_locations') and self.dead_drones_locations:
-                for (dx, dy) in self.dead_drones_locations:
-                    pt = np.array([dx, dy]) + self._half_size_array
-                    arcade.draw_circle_filled(pt[0], pt[1], radius=8, color=(0, 0, 0)) # Black dot
-                    arcade.draw_text("DEAD", pt[0] + 10, pt[1] + 10, (0, 0, 0), 10)
         except Exception:
             pass
 
