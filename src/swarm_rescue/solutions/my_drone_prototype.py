@@ -450,7 +450,13 @@ class MyDronePrototype(DroneAbstract):
 
         # --- RECORD HISTORY ---
         self.update_breadcrumbs()
-        
+
+         # ---Check if lidar is available before updating grid, if drone killed  ---
+        lidar_data = self.lidar_values()
+        if lidar_data is None:
+            # Drone is destroyed - cannot continue
+            return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0, "grasper": 0}
+            
         # Mise à jour de la grille probabiliste self.grid.grid (utilisée pour l'exploration)
         self.estimated_pose = Pose(np.asarray(self.measured_gps_position()),
                                    self.measured_compass_angle())
@@ -1359,7 +1365,12 @@ class MyDronePrototype(DroneAbstract):
     def update_pose(self):
         gps_pos = self.measured_gps_position()
         compass_angle = self.measured_compass_angle()
-
+        
+        # Check if GPS data is None (drone destroyed by kill zone) ---
+        if gps_pos is None:
+            # Drone is destroyed - stop processing
+            return
+        
         # Calculate dt for Kalman filter
         current_time = self.iteration * 0.1  # Assuming 10 Hz
         if self.kf_last_time > 0:
