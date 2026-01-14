@@ -216,9 +216,19 @@ class MyDronePrototype(DroneAbstract):
         self.kf_dt = 0.1
         self.kf_last_time = 0
         self.kf_initialized = False
+        
+        # --- Kill Zone Detection ---
+        # Track last time we heard from other drones
+        self.last_alive_time = {}
+        # Timeout to consider a drone effectively "silent" (and potentially dead if seen)
+        # Increased to 60 steps (6 seconds) to avoid false positives due to lag
+        self.ALIVE_TIMEOUT_STEPS = 60
 
-    def define_message_for_all(self) -> None:
-        pass 
+    def define_message_for_all(self):
+        """
+        Broadcast 'I am alive' message with position.
+        """
+        return (self.identifier, "ALIVE", self.measured_gps_position())
 
     def control(self) -> CommandsDict:
         """
@@ -228,18 +238,28 @@ class MyDronePrototype(DroneAbstract):
         # increment the iteration counter
         self.iteration += 1
         
+        # --- Kill Zone Update ---
+        # Process incoming messages to track who is alive
+        if self.communicator:
+            for comm, msg in self.communicator.received_messages:
+                if isinstance(msg, tuple) and len(msg) == 3 and msg[1] == "ALIVE":
+                    sender_id, status, pos = msg
+                    # Update record: ID -> (timestamp, position)
+                    self.last_alive_time[sender_id] = (self.iteration, pos)
+
+        
         # --- 1. PERCEPTION ---
         self.update_pose()
         
-        # Mise à jour de la grille probabiliste self.grid.grid (utilisée pour l'exploration)
-        self.estimated_pose = Pose(np.asarray(self.measured_gps_position()),
-                                   self.measured_compass_angle())
-        self.grid.update_grid(pose=self.estimated_pose) # Mise à jour de la carte utilisée!
-        #print("grid :", self.grid.grid > 0.0)
-
         lidar_data = self.lidar_values()
         if lidar_data is None:
             return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0, "grasper": 0}
+        
+        # Mise à jour de la grille probabiliste self.grid.grid (utilisée pour l'exploration)
+        # Utilisation de la pose filtrée au lieu de la mesure GPS brute qui peut être None
+        self.estimated_pose = Pose(self.current_pose[:2], self.current_pose[2])
+        self.grid.update_grid(pose=self.estimated_pose) # Mise à jour de la carte utilisée!
+        #print("grid :", self.grid.grid > 0.0)
 
         # Also populate the simpler public lists requested by the user
         try:
@@ -520,6 +540,55 @@ class MyDronePrototype(DroneAbstract):
                 except Exception:
                     name = str(etype)
 
+                # --- Kill Zone Logic: Detect Silent (Dead) Drones ---
+                # Only active after a grace period (e.g. 10 iterations) to let everyone spawn and broadcast
+                if 'DRONE' in name.upper() and self.iteration > 10:
+                    # Check if this detected drone corresponds to a known ALIVE drone
+                    is_alive = False
+                    for d_id, (t_seen, d_pos) in self.last_alive_time.items():
+                        # Consider alive if msg received recently
+                        if self.iteration - t_seen < self.ALIVE_TIMEOUT_STEPS:
+                            # And if position matches the visual detection (approx tolerance)
+                            # Large tolerance (100px) because GPS and estimation can be noisy
+                            if d_pos is not None:
+                                d_dist = math.hypot(d_pos[0] - xw, d_pos[1] - yw)
+                                if d_dist < 100.0:  # Increased Tolerance radius
+                                    is_alive = True
+                                    break
+                            else:
+                                # Fallback: if a drone is alive but has no GPS (scrambled), 
+                                # and we see a drone, we give it the benefit of the doubt 
+                                # if it's the only one around? 
+                                # For safety, if we hear ANY alive drone without GPS, 
+                                # we assume the one we see might be it.
+                                is_alive = True
+                                break
+                    
+                    if not is_alive:
+                        print("not alive drone detected at ", (xw, yw))
+                        # Drone seen but not heard -> DEAD -> Kill Zone
+                        # Convert to grid coordinates
+                        gx, gy = self.grid._conv_world_to_grid(xw, yw)
+                        # Create a "bubble" of walls. 50 pixels diameter -> 25 radius.
+                        # Grid resolution is 8 (from __init__). 25/8 ~= 3 cells radius.
+                        bubble_radius_cells = 4 
+                        
+                        y_center, x_center = int(gy), int(gx)
+                        y_min = max(0, y_center - bubble_radius_cells)
+                        y_max = min(self.grid.grid.shape[0], y_center + bubble_radius_cells + 1)
+                        x_min = max(0, x_center - bubble_radius_cells)
+                        x_max = min(self.grid.grid.shape[1], x_center + bubble_radius_cells + 1)
+                        
+                        # Mark as obstacle (high value)
+                        self.grid.grid[y_min:y_max, x_min:x_max] = 100.0
+                        # Also update zoomed grid for visualization if needed
+                        self.grid.zoomed_grid[y_min:y_max, x_min:x_max] = 100.0
+                        
+                        # Store for visualization
+                        if not hasattr(self, 'dead_drones_locations'):
+                            self.dead_drones_locations = []
+                        self.dead_drones_locations.append((xw, yw))
+
                 if 'WOUNDED' in name.upper():
                     newly_seen_wounded.append((xw, yw))
                 elif 'RESCUE' in name.upper():
@@ -754,6 +823,16 @@ class MyDronePrototype(DroneAbstract):
                     pt = np.array([xr, yr]) + self._half_size_array
                     arcade.draw_rectangle_outline(pt[0], pt[1], width=30, height=30, color=(0,160,0), border_width=2)
                     arcade.draw_text("RZ", pt[0] + 12, pt[1] + 12, (0,120,0), 10)
+        except Exception:
+            pass
+            
+        # Draw detected dead drones
+        try:
+            if hasattr(self, 'dead_drones_locations') and self.dead_drones_locations:
+                for (dx, dy) in self.dead_drones_locations:
+                    pt = np.array([dx, dy]) + self._half_size_array
+                    arcade.draw_circle_filled(pt[0], pt[1], radius=8, color=(0, 0, 0)) # Black dot
+                    arcade.draw_text("DEAD", pt[0] + 10, pt[1] + 10, (0, 0, 0), 10)
         except Exception:
             pass
 
@@ -1128,7 +1207,7 @@ class MyDronePrototype(DroneAbstract):
             self.kf_dt = current_time - self.kf_last_time
         self.kf_last_time = current_time
         
-        if not np.isnan(gps_pos[0]):
+        if gps_pos is not None and not np.isnan(gps_pos[0]):
             # GPS available - use Kalman filter
             
             # Initialize filter on first GPS measurement
@@ -1181,7 +1260,8 @@ class MyDronePrototype(DroneAbstract):
             # Use filtered position
             self.current_pose[0] = self.kf_state[0]
             self.current_pose[1] = self.kf_state[1]
-            self.current_pose[2] = compass_angle
+            if compass_angle is not None:
+                self.current_pose[2] = compass_angle
         else:
             # GPS unavailable - use odometry with Kalman prediction
             odom_data = self.odometer_values() 

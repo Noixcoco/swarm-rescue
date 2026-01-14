@@ -47,7 +47,7 @@ class MapMedium01(MapAbstract):
         self._no_gps_zone_pos = ((-538, 42), 0)
 
         self._kill_zone = KillZone(size=(89, 77))
-        self._kill_zone_pos = ((-576, 112), 0)
+        self._kill_zone_pos = ((0, -425), 0)
 
         self._wounded_persons_pos = [(-261, -257), (-145, -256), (-770, -254),
                                      (766, 252), (-479, 406), (-487, 477),
@@ -57,7 +57,7 @@ class MapMedium01(MapAbstract):
         self._wounded_persons: List[WoundedPerson] = []
 
         # POSITIONS OF THE DRONES
-        self._number_drones = 1
+        self._number_drones = 2
         # They are positioned in a square whose side size depends on the total number of drones.
         start_area_drones = (-580, -400)
         nb_per_side = math.ceil(math.sqrt(float(self._number_drones)))
