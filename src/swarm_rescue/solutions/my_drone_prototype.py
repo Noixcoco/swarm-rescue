@@ -117,6 +117,12 @@ class MyDronePrototype(DroneAbstract):
         self.last_breadcrumb_pos = None
         self.breadcrumb_spacing = 100.0 # Distance between crumbs (pixels)
 
+        # --- KILL ZONE DETECTION ---
+        self.drone_last_heard = {}  # {drone_id: {"iteration": int, "position": (x,y)}}
+        self.known_kill_zones = []  # List of (x, y) tuples marking death locations
+        self.DEATH_TIMEOUT = 65 # 100 iterations = ~10 seconds of silence
+        self.KILL_ZONE_RADIUS = 200.0  # Safety margin around death location
+
 
     def creer_chemin(self, start_world, goal_world, explored_only=False):
         """
@@ -380,6 +386,17 @@ class MyDronePrototype(DroneAbstract):
 
     def define_message_for_all(self):
         """Optimized communication - only send essential data at appropriate frequencies"""
+    
+        # CRITICAL: If we're in a kill zone, send emergency death warning
+        if self.base._is_in_kill_zone:
+            print(f"{self.identifier} im dead")
+            return {
+                "drone_id": self.identifier,
+                "drone_pose": self.current_pose.tolist(),
+                "IN_KILL_ZONE": True,  # Emergency flag
+                "death_position": (self.current_pose[0], self.current_pose[1]),
+                "death_iteration": self.iteration
+            }
     
         # Get positions of currently grasped wounded
         grasped_positions = set(
@@ -1470,6 +1487,7 @@ class MyDronePrototype(DroneAbstract):
 
         dedup_radius = 50.0
         received_messages = self.communicator.received_messages
+        current_iteration = self.iteration
 
         # Pre-allocate collections
         all_wounded = []
@@ -1481,18 +1499,50 @@ class MyDronePrototype(DroneAbstract):
 
         # Single pass through messages
         for msg in received_messages:
-            other_message = msg[1] if isinstance(msg, tuple) else msg
+
+            other_message = msg[1]
             other_id = other_message.get("drone_id")
             
             # Skip own messages
             if other_id == self.identifier:
                 continue
-            
+
+###################################################################
+            # Check for emergency kill zone warning
+            if other_message.get("IN_KILL_ZONE", False):
+                print(f"{self.identifier} found a dead")
+                death_pos = tuple(other_message.get("death_position", (0, 0)))
+                death_iter = other_message.get("death_iteration", current_iteration)
+                
+                # Immediately mark this as a known kill zone
+                is_new_kill_zone = True
+                for kz_pos in self.known_kill_zones:
+                    if math.hypot(death_pos[0] - kz_pos[0], death_pos[1] - kz_pos[1]) < 50.0:
+                        is_new_kill_zone = False
+                        break
+                
+                if is_new_kill_zone:
+                    print(f"💀 [{self.identifier}] RECEIVED DEATH WARNING! Drone {other_id} died at {death_pos} (iteration {death_iter})")
+                    self.known_kill_zones.append(death_pos)
+                    # Optionally mark on grid
+                    # self.mark_kill_zone_on_grid(death_pos, radius=self.KILL_ZONE_RADIUS)
+                
+                # Remove from tracking
+                self.drone_last_heard.pop(other_id, None)
+                continue  # Skip normal processing for dead drone
+    
+    ###################################################################       
+
             # Drone positions (always needed for collision avoidance)
             pos = other_message.get("drone_pose")
             if pos is not None:
                 # Store as tuple: (position_array, id)
                 other_drones_positions.append((np.array(pos), other_id))
+                # Update last heard status
+                self.drone_last_heard[other_id] = {
+                    "iteration": current_iteration,
+                    "position": (pos[0], pos[1])
+                }
             
             # Wounded list (only if present in message)
             if "wounded_list" in other_message:
@@ -1592,6 +1642,46 @@ class MyDronePrototype(DroneAbstract):
 
         self.wounded_to_rescue = merged_wounded
 
+
+        # --- DETECT DEATHS (Check for silent drones) ---
+
+        if not self.base.in_kill_zone:
+            for drone_id, info in list(self.drone_last_heard.items()):
+                silence_duration = current_iteration - info["iteration"]
+                
+                # If a drone has been silent for too long, assume death
+                if silence_duration > self.DEATH_TIMEOUT:
+                    death_pos = info["position"]
+
+                #  Don't mark kill zone if we're too far away to hear them anyway
+                    my_distance_to_death = math.hypot(
+                        self.current_pose[0] - death_pos[0],
+                        self.current_pose[1] - death_pos[1]
+                )
+                    
+                    # If they were far away, they might just be out of range
+                    MAX_COMM_RANGE = 250.0 
+                    if my_distance_to_death > MAX_COMM_RANGE:
+                        print(f"[{self.identifier}] Drone {drone_id} silent, but too far away ({my_distance_to_death:.0f}px) - assuming out of range")
+                        continue
+                    
+                    # Check if we already marked this area
+                    is_new_kill_zone = True
+                    for kz_pos in self.known_kill_zones:
+                        if math.hypot(death_pos[0] - kz_pos[0], death_pos[1] - kz_pos[1]) < 50.0:
+                            is_new_kill_zone = False
+                            break
+                    
+                    if is_new_kill_zone:
+                        print(f"[{self.identifier}] DETECTED KILL ZONE! Drone {drone_id} died at {death_pos}, at iteration {info["iteration"]}")
+                        self.known_kill_zones.append(death_pos)
+                        #self.mark_kill_zone_on_grid(death_pos, radius=self.KILL_ZONE_RADIUS)
+                    
+                        # Remove from tracking (they're confirmed dead)
+                        del self.drone_last_heard[drone_id]
+
+
+            
     def find_free_position_for_unstuck(self):
         """
         Find the first safe free position at a medium distance to escape when stuck.
@@ -1750,7 +1840,7 @@ class MyDronePrototype(DroneAbstract):
             # 2. If we are here, it is a completely NEW area.
             if len(self.rescue_zone_points) < MAX_RESCUE_POINTS:
                 self.rescue_zone_points.append((nx, ny))
-                print(f"[{self.identifier}] Secured new Rescue Point {len(self.rescue_zone_points)}/5 at ({nx:.0f}, {ny:.0f})")
+
 
 
     def drone_repulsion(self, command):
