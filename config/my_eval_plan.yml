@@ -7,4 +7,4 @@ evaluation_plan:
   - map_name: MapMedium03
     nb_rounds: 1
     config_weight: 1
-    zones_config: [KILL_ZONE]
+    zones_config: []
