@@ -4,7 +4,7 @@ from enum import Enum
 from scipy.ndimage import binary_dilation, generate_binary_structure
 from scipy import ndimage
 from swarm_rescue.simulation.drone.drone_abstract import DroneAbstract
-from swarm_rescue.simulation.utils.utils import normalize_angle, circular_mean
+from swarm_rescue.simulation.utils.utils import normalize_angle
 from swarm_rescue.simulation.drone.controller import CommandsDict
 import arcade
 import heapq
@@ -518,10 +518,11 @@ class MyDronePrototype(DroneAbstract):
             if self.path:
                 command = self.follow_path(lidar_data)
                 return command
-            
             else:
-                print(f"[{self.identifier}] No barycenters available - using simple reverse")
+                # Unstuck path failed, try simple reverse maneuver
+                print("lost lost lost wsh wsh wsh")
                 return {"forward": -0.5, "lateral": 0.3, "rotation": 0.4, "grasper": 1}
+            
                
 
         # STATE MACHINE LOGIC
@@ -1289,7 +1290,6 @@ class MyDronePrototype(DroneAbstract):
  
     def follow_path(self, lidar_data) -> CommandsDict:
         if not self.path:
-            print("No path to follow.")
             return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
 
         
@@ -1694,7 +1694,7 @@ class MyDronePrototype(DroneAbstract):
                             "first_timeout_iter": current_iteration,
                             "position": death_pos
                         }
-                        print(f"[{self.identifier}] SUSPECTED DEATH: Drone {drone_id} at {death_pos}")
+                        print(f"[{self.identifier}] ⚠️  SUSPECTED DEATH: Drone {drone_id} at {death_pos}")
                         print(f"    Waiting {self.CONFIRMATION_TIMEOUT} iterations for confirmation...")
                         continue  # Don't declare yet!
 

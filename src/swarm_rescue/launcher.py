@@ -1,4 +1,5 @@
 import argparse
+from copy import copy
 import gc
 import os
 import sys
@@ -27,8 +28,8 @@ from swarm_rescue.maps.map_final_2024_25_03 import MapFinal_2024_25_03
 from swarm_rescue.maps.map_medium_01 import MapMedium01
 from swarm_rescue.maps.map_medium_02 import MapMedium02
 from swarm_rescue.maps.map_test_special_zones import MapTestSpecialZones
-from swarm_rescue.maps.mymap import MyMap
-
+from swarm_rescue.maps.map_intermediate_01_copy  import MapMoving01
+from swarm_rescue.maps.map_medium_03 import MapMedium03
 from swarm_rescue.solutions.my_drone_eval import MyDroneEval
 
 
@@ -207,7 +208,7 @@ class Launcher:
             filename_video_capture = None
 
         my_gui = GuiSR(the_map=the_map,
-                       draw_interactive=False,
+                       enable_visu_noises=False,
                        filename_video_capture=filename_video_capture,
                        headless=headless)
 
