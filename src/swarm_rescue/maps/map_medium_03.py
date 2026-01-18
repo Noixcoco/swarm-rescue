@@ -41,8 +41,8 @@ class MapMedium03(MapAbstract):
         self._rescue_center = RescueCenter(size=(202, 101))
         self._rescue_center_pos = ((442, 306), 0)
 
-        self._no_com_zone = NoComZone(size=(414, 254))
-        self._no_com_zone_pos = ((-332, 95), 0)
+        self._no_com_zone = NoComZone(size=(150, 130))
+        self._no_com_zone_pos = ((60, 140), 0)
 
         self._no_gps_zone = NoGpsZone(size=(240, 339))
         self._no_gps_zone_pos = ((-420, -56), 0)
