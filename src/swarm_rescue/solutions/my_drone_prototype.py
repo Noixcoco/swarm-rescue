@@ -113,11 +113,6 @@ class MyDronePrototype(DroneAbstract):
         self.path_cache_max_age = 50
         self.path_cache_max_size = 15
 
-    # --- HANSEL & GRETEL pour retourner a la rescue zone si find explored path fail ---
-        self.breadcrumbs = [] # Stores (x, y) tuples
-        self.last_breadcrumb_pos = None
-        self.breadcrumb_spacing = 100.0 # Distance between crumbs (pixels)
-
         # --- KILL ZONE DETECTION ---
         self.drone_last_heard = {}  # {drone_id: {"iteration": int, "position": (x,y)}}
         self.known_kill_zones = []  # List of (x, y) tuples marking death locations
@@ -479,9 +474,6 @@ class MyDronePrototype(DroneAbstract):
         # --- 1. PERCEPTION ---
         self.update_pose()
 
-        # --- RECORD HISTORY ---
-        self.update_breadcrumbs()
-
          # ---Check if lidar is available before updating grid, if drone killed  ---
         lidar_data = self.lidar_values()
         if lidar_data is None:
@@ -617,20 +609,9 @@ class MyDronePrototype(DroneAbstract):
 
             # Replan every 30 iterations to adapt to updated wounded position
             if self.current_target_wounded is not None and self.iteration % 30 == 0:
-                # Check if target position has moved significantly
-                if not self.path or len(self.path) == 0:
-                    # No path exists - create one
-                    self.path = self.creer_chemin(self.current_pose[:2], self.current_target_wounded)
-                    self.last_replan_iteration = self.iteration
-                else:
-                    # Check if wounded moved significantly from path end
-                    path_end = self.path[-1]
-                    distance_moved = np.linalg.norm(np.array(self.current_target_wounded) - path_end)
-                    
-                    if distance_moved > 50.0:  # Wounded moved more than 50 pixels
-                        print(f"[{self.identifier}] Wounded moved {distance_moved:.1f}px - Replanning!")
-                        self.path = self.creer_chemin(self.current_pose[:2], self.current_target_wounded)
-                        self.last_replan_iteration = self.iteration
+                # RECALCULATE PATH REGULARLY
+                self.path = self.creer_chemin(self.current_pose[:2], self.current_target_wounded)
+                self.last_replan_iteration = self.iteration
 
                     
 
@@ -784,9 +765,6 @@ class MyDronePrototype(DroneAbstract):
                
                 self.state = self.Activity.EXPLORING
                 self.current_target_wounded = None
-                # Reset Hansel & Gretel for the next run
-                self.breadcrumbs = []
-                self.last_breadcrumb_pos = None
                 self.path = []
                 
                 
@@ -796,7 +774,12 @@ class MyDronePrototype(DroneAbstract):
                    
                     # Replan with explored_only=True for safe return
                     should_replan = False
-                    if not self.path or len(self.path) == 0:
+                    
+                    # RECALCULATE PATH REGULARLY (every 30 iterations)
+                    if self.iteration % 30 == 0:
+                        should_replan = True
+                    # Also retry if no path exists (and we haven't tried just recently)
+                    elif (not self.path or len(self.path) == 0):
                         iterations_since_replan = self.iteration - self.last_replan_iteration
                         if iterations_since_replan >= 30 or self.last_replan_iteration == 0:
                             should_replan = True
@@ -810,24 +793,6 @@ class MyDronePrototype(DroneAbstract):
                         )
                         self.last_replan_iteration = self.iteration
                         
-                        # If no safe path found through explored areas, try without restriction
-                        if not self.path:
-                            print(f"[{self.identifier}] No safe explored path to rescue center, using breadcrumbs!")
-                            if len(self.breadcrumbs) > 2:
-                                # Reverse the recorded history
-                                return_path = self.breadcrumbs[::-1]
-                                
-                                # Convert to numpy and set as path
-                                self.path = [np.array([x, y]) for x, y in return_path]
-                                
-                                # Append the actual rescue center at the end to be sure
-                                self.path.append(np.array(self.rescue_zone_points[0]))
-                                
-                                print(f"[{self.identifier}] Success: Using Breadcrumbs (Length: {len(self.path)})")
-                            else:
-                                print(f"[{self.identifier}] No breadcrumbs available.")
-
-
         # --- 2. STRATÉGIE ---
         # Replanification for exploration (only when in EXPLORING state)
         if self.state == self.Activity.EXPLORING:
@@ -1940,31 +1905,6 @@ class MyDronePrototype(DroneAbstract):
                 
             return command
     
-
-    def update_breadcrumbs(self):
-
-    # Don't record if we are already going home!
-        if self.state == self.Activity.GOING_TO_RESCUE_CENTER:
-            return
-
-        current_pos_tuple = (self.current_pose[0], self.current_pose[1])
-
-        # Initialize if empty
-        if self.last_breadcrumb_pos is None:
-            self.breadcrumbs.append(current_pos_tuple)
-            self.last_breadcrumb_pos = current_pos_tuple
-            return
-
-        # Calculate distance from last crumb
-        dist = math.hypot(current_pos_tuple[0] - self.last_breadcrumb_pos[0], 
-                        current_pos_tuple[1] - self.last_breadcrumb_pos[1])
-
-        # Only drop a crumb if we moved enough (prevents clumps when stuck)
-        if dist >= self.breadcrumb_spacing:
-            self.breadcrumbs.append(current_pos_tuple)
-            self.last_breadcrumb_pos = current_pos_tuple
-    
-
 
     def mark_kill_zone_on_grid(self, death_pos, drone_id):  # ✅ ADD drone_id parameter
         """
