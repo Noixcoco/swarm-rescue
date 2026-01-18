@@ -4,7 +4,7 @@ from enum import Enum
 from scipy.ndimage import binary_dilation, generate_binary_structure
 from scipy import ndimage
 from swarm_rescue.simulation.drone.drone_abstract import DroneAbstract
-from swarm_rescue.simulation.utils.utils import normalize_angle, circular_mean
+from swarm_rescue.simulation.utils.utils import normalize_angle
 from swarm_rescue.simulation.drone.controller import CommandsDict
 import arcade
 import heapq
@@ -169,6 +169,9 @@ class MyDronePrototype(DroneAbstract):
     
         # Masque des murs (high positive values)
         is_wall = (grid >= SEUIL_MUR)
+        
+        if self.kill_zone_grid is not None:
+            is_wall = is_wall | (self.kill_zone_grid == 1.0)
         
         # CORRECT: Only cells with NEGATIVE values are explored free space
         is_explored_free = (grid < SEUIL_FREE)
@@ -1289,7 +1292,6 @@ class MyDronePrototype(DroneAbstract):
  
     def follow_path(self, lidar_data) -> CommandsDict:
         if not self.path:
-            print("No path to follow.")
             return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
 
         
@@ -1711,7 +1713,7 @@ class MyDronePrototype(DroneAbstract):
                                 break
 
                         if is_new_kill_zone:
-                            print(f"[{self.identifier}] DETECTED KILL ZONE! Drone {drone_id} died at {death_pos}, at iteration {info["iteration"]}")
+                            print(f"[{self.identifier}] DETECTED KILL ZONE! Drone {drone_id} died at {death_pos}, at iteration {info['iteration']}")
                             self.known_kill_zones.append(death_pos)
                             self.mark_kill_zone_on_grid(death_pos,drone_id)
                             self.declared_dead_drones.add(drone_id)
@@ -1992,7 +1994,7 @@ class MyDronePrototype(DroneAbstract):
             
             # MARK ON BOTH GRIDS SIMULTANEOUSLY
             self.kill_zone_grid[y0:y1, x0:x1] = 1.0      # Permanent record
-            self.grid.grid[y0:y1, x0:x1] = 100.0         # Active pathfinding obstacle
+            # self.grid.grid[y0:y1, x0:x1] = 100.0         # Active pathfinding obstacle
             
             print(f"[{self.identifier}] Marked kill zone at {death_pos}")
             print(f"    Size: {square_size:.0f}x{square_size:.0f}px")
@@ -2013,7 +2015,7 @@ class MyDronePrototype(DroneAbstract):
             return  # No kill zones marked yet
     
         # Where kill_zone_grid == 1.0, set grid.grid to 100.0
-        self.grid.grid[self.kill_zone_grid == 1.0] = 100.0
+        # self.grid.grid[self.kill_zone_grid == 1.0] = 100.0
 
 
 
@@ -2122,7 +2124,7 @@ class MyDronePrototype(DroneAbstract):
             
             # CLEAR from both grids
             self.kill_zone_grid[y0:y1, x0:x1] = 0.0      # Remove permanent record
-            self.grid.grid[y0:y1, x0:x1] = 0.0
+            # self.grid.grid[y0:y1, x0:x1] = 0.0
             # Don't reset grid.grid values - let lidar naturally re-explore
             # This is safer than guessing what the values should be
             
