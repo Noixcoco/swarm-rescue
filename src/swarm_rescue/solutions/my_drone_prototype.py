@@ -230,12 +230,26 @@ class MyDronePrototype(DroneAbstract):
         
         # --- 1. PERCEPTION ---
         self.update_pose()
-        
+
+        # # Mise à jour de la grille probabiliste self.grid.grid (utilisée pour l'exploration)
+        # self.estimated_pose = Pose(np.asarray(self.measured_gps_position()),
+        #                            self.measured_compass_angle())
+        # self.grid.update_grid(pose=self.estimated_pose) # Mise à jour de la carte utilisée!
+        # #print("grid :", self.grid.grid > 0.0)
+
+
+
+        # On regroupe x et y dans un tableau numpy : [x, y]
+        position_vector = np.array([self.current_pose[0], self.current_pose[1]])
+
+        # On crée l'objet Pose avec ce vecteur et l'angle
+        self.estimated_pose = Pose(position_vector, self.current_pose[2])
+
         # Mise à jour de la grille probabiliste self.grid.grid (utilisée pour l'exploration)
-        self.estimated_pose = Pose(np.asarray(self.measured_gps_position()),
-                                   self.measured_compass_angle())
+        # self.estimated_pose = Pose(np.asarray(self.measured_gps_position()),
+        #                            self.measured_compass_angle())
         self.grid.update_grid(pose=self.estimated_pose) # Mise à jour de la carte utilisée!
-        #print("grid :", self.grid.grid > 0.0)
+
 
         lidar_data = self.lidar_values()
         if lidar_data is None:
@@ -799,7 +813,17 @@ class MyDronePrototype(DroneAbstract):
         target_speed = max(0.0, min(max_speed, x_err * 0.15 + 0.3))
 
         measured_vel = self.measured_velocity()
-        measured_speed = math.sqrt(measured_vel[0] ** 2 + measured_vel[1] ** 2)
+
+        # measured_speed = math.sqrt(measured_vel[0] ** 2 + measured_vel[1] ** 2)
+
+        if measured_vel is not None:
+            measured_speed = math.sqrt(measured_vel[0] ** 2 + measured_vel[1] ** 2)
+        elif self.kf_initialized:
+            # Utilise la vitesse estimée par Kalman (vx=state[2], vy=state[3])
+            measured_speed = math.sqrt(self.kf_state[2] ** 2 + self.kf_state[3] ** 2)
+        else:
+            measured_speed = 0.0
+
         speed_error = target_speed - measured_speed
         deriv_speed = speed_error - self.prev_speed_error
         Kp_f = self.Kp_pos
@@ -983,98 +1007,215 @@ class MyDronePrototype(DroneAbstract):
     # FONCTIONS PRINCIPALES (Localisation, Cartographie Binaire)
     # --------------------------------------------------------------------------
 
+    # def update_pose(self):
+    #     gps_pos = self.measured_gps_position()
+    #     compass_angle = self.measured_compass_angle()
+
+    #     # Calculate dt for Kalman filter
+    #     current_time = self.iteration * 0.1  # Assuming 10 Hz
+    #     if self.kf_last_time > 0:
+    #         self.kf_dt = current_time - self.kf_last_time
+    #     self.kf_last_time = current_time
+        
+    #     if not np.isnan(gps_pos[0]):
+    #         # GPS available - use Kalman filter
+            
+    #         # Initialize filter on first GPS measurement
+    #         if not self.kf_initialized:
+    #             self.kf_state[0] = gps_pos[0]
+    #             self.kf_state[1] = gps_pos[1]
+    #             self.kf_state[2] = 0.0  # Initial velocity
+    #             self.kf_state[3] = 0.0
+    #             self.kf_initialized = True
+            
+    #         # Kalman Filter Prediction Step
+    #         # State transition matrix F (constant velocity model)
+    #         F = np.array([
+    #             [1, 0, self.kf_dt, 0],
+    #             [0, 1, 0, self.kf_dt],
+    #             [0, 0, 1, 0],
+    #             [0, 0, 0, 1]
+    #         ])
+            
+    #         # Predict state
+    #         self.kf_state = F @ self.kf_state
+            
+    #         # Predict covariance
+    #         self.kf_P = F @ self.kf_P @ F.T + self.kf_Q
+            
+    #         # Kalman Filter Update Step
+    #         # Measurement matrix H (we only measure position, not velocity)
+    #         H = np.array([
+    #             [1, 0, 0, 0],
+    #             [0, 1, 0, 0]
+    #         ])
+            
+    #         # Measurement residual
+    #         z = np.array([gps_pos[0], gps_pos[1]])
+    #         y = z - H @ self.kf_state
+            
+    #         # Residual covariance
+    #         S = H @ self.kf_P @ H.T + self.kf_R
+            
+    #         # Kalman gain
+    #         K = self.kf_P @ H.T @ np.linalg.inv(S)
+            
+    #         # Update state
+    #         self.kf_state = self.kf_state + K @ y
+            
+    #         # Update covariance
+    #         I = np.eye(4)
+    #         self.kf_P = (I - K @ H) @ self.kf_P
+            
+    #         # Use filtered position
+    #         self.current_pose[0] = self.kf_state[0]
+    #         self.current_pose[1] = self.kf_state[1]
+    #         self.current_pose[2] = compass_angle
+    #     else:
+    #         # GPS unavailable - use odometry with Kalman prediction
+    #         odom_data = self.odometer_values() 
+    #         if odom_data is None: return
+    #         dist_traveled = odom_data[0]
+    #         rotation_change = odom_data[2]
+            
+    #         self.current_pose[2] += rotation_change
+    #         self.current_pose[2] = normalize_angle(self.current_pose[2])
+            
+    #         if self.kf_initialized:
+    #             # Use Kalman predicted position when GPS unavailable
+    #             F = np.array([
+    #                 [1, 0, self.kf_dt, 0],
+    #                 [0, 1, 0, self.kf_dt],
+    #                 [0, 0, 1, 0],
+    #                 [0, 0, 0, 1]
+    #             ])
+    #             self.kf_state = F @ self.kf_state
+    #             self.kf_P = F @ self.kf_P @ F.T + self.kf_Q
+                
+    #             self.current_pose[0] = self.kf_state[0]
+    #             self.current_pose[1] = self.kf_state[1]
+    #         else:
+    #             # Fallback to odometry if Kalman not yet initialized
+    #             dx = dist_traveled * math.cos(self.current_pose[2])
+    #             dy = dist_traveled * math.sin(self.current_pose[2])
+    #             self.current_pose[0] += dx
+    #             self.current_pose[1] += dy
+
     def update_pose(self):
+        # 1. ACQUISITION DES DONNÉES
         gps_pos = self.measured_gps_position()
         compass_angle = self.measured_compass_angle()
+        odom_data = self.odometer_values() 
 
-        # Calculate dt for Kalman filter
-        current_time = self.iteration * 0.1  # Assuming 10 Hz
+        # Gestion du temps (dt)
+        current_time = self.iteration * 0.1
         if self.kf_last_time > 0:
             self.kf_dt = current_time - self.kf_last_time
+        else:
+            self.kf_dt = 0.1 # Valeur par défaut pour le 1er tour
         self.kf_last_time = current_time
+
+        # Initialisation si premier GPS reçu
+        if not self.kf_initialized and gps_pos is not None and not np.isnan(gps_pos[0]):
+            self.kf_state = np.zeros(4)
+            self.kf_state[0] = gps_pos[0] # x
+            self.kf_state[1] = gps_pos[1] # y
+            self.kf_state[2] = 0.0        # vx
+            self.kf_state[3] = 0.0        # vy
+            self.kf_initialized = True
+            
+            # Init orientation
+            if compass_angle is not None:
+                self.current_pose[2] = compass_angle
+            elif self.current_pose[2] is None:
+                self.current_pose[2] = 0.0
+            return # On attend le prochain tour pour prédire
+
+        if not self.kf_initialized:
+            return # On ne peut rien faire tant qu'on a pas eu au moins un point GPS
+
+        # ---------------------------------------------------------
+        # ÉTAPE 1 : GESTION DE L'ORIENTATION (THETA)
+        # On utilise toujours l'odométrie pour la fluidité, 
+        # et on recale avec le compas si dispo.
+        # ---------------------------------------------------------
         
-        if not np.isnan(gps_pos[0]):
-            # GPS available - use Kalman filter
-            
-            # Initialize filter on first GPS measurement
-            if not self.kf_initialized:
-                self.kf_state[0] = gps_pos[0]
-                self.kf_state[1] = gps_pos[1]
-                self.kf_state[2] = 0.0  # Initial velocity
-                self.kf_state[3] = 0.0
-                self.kf_initialized = True
-            
-            # Kalman Filter Prediction Step
-            # State transition matrix F (constant velocity model)
-            F = np.array([
-                [1, 0, self.kf_dt, 0],
-                [0, 1, 0, self.kf_dt],
-                [0, 0, 1, 0],
-                [0, 0, 0, 1]
-            ])
-            
-            # Predict state
-            self.kf_state = F @ self.kf_state
-            
-            # Predict covariance
-            self.kf_P = F @ self.kf_P @ F.T + self.kf_Q
-            
-            # Kalman Filter Update Step
-            # Measurement matrix H (we only measure position, not velocity)
+        # Mise à jour par odométrie (d_theta)
+        d_theta = 0.0
+        if odom_data is not None:
+            d_theta = odom_data[2]
+            # Si on n'a pas d'angle initial, on met 0
+            if self.current_pose[2] is None: self.current_pose[2] = 0.0
+            self.current_pose[2] += d_theta
+        
+        # Correction absolue par le compas (si dispo)
+        if compass_angle is not None:
+            # On pourrait faire une moyenne pondérée ici, mais le remplacement direct est plus simple
+            self.current_pose[2] = compass_angle
+
+        self.current_pose[2] = normalize_angle(self.current_pose[2])
+
+        # ---------------------------------------------------------
+        # ÉTAPE 2 : PRÉDICTION KALMAN (TOUJOURS)
+        # C'est ici que l'odométrie aide le filtre : 
+        # Si le drone tourne, on doit tourner son vecteur vitesse (vx, vy)
+        # ---------------------------------------------------------
+        
+        # Rotation du vecteur vitesse dans l'état Kalman si le drone a tourné
+        # Si on ne fait pas ça, le drone tourne mais le filtre pense qu'il continue tout droit !
+        if d_theta != 0:
+            c, s = math.cos(d_theta), math.sin(d_theta)
+            # Rotation de vx, vy (indices 2 et 3)
+            vx_old, vy_old = self.kf_state[2], self.kf_state[3]
+            self.kf_state[2] = vx_old * c - vy_old * s
+            self.kf_state[3] = vx_old * s + vy_old * c
+
+        # Matrice de transition F (Modèle vitesse constante)
+        F = np.array([
+            [1, 0, self.kf_dt, 0],
+            [0, 1, 0, self.kf_dt],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ])
+        
+        # Prédiction de l'état (A priori)
+        self.kf_state = F @ self.kf_state
+        # Prédiction de la covariance (L'incertitude grandit)
+        self.kf_P = F @ self.kf_P @ F.T + self.kf_Q
+
+        # ---------------------------------------------------------
+        # ÉTAPE 3 : CORRECTION KALMAN (SI GPS DISPO)
+        # Le GPS vient "tirer" la prédiction vers la réalité
+        # ---------------------------------------------------------
+        if gps_pos is not None and not np.isnan(gps_pos[0]):
             H = np.array([
                 [1, 0, 0, 0],
                 [0, 1, 0, 0]
             ])
-            
-            # Measurement residual
             z = np.array([gps_pos[0], gps_pos[1]])
-            y = z - H @ self.kf_state
             
-            # Residual covariance
+            # Calcul du gain de Kalman
+            y = z - H @ self.kf_state        # Innovation (Erreur entre mesure et prédiction)
             S = H @ self.kf_P @ H.T + self.kf_R
-            
-            # Kalman gain
             K = self.kf_P @ H.T @ np.linalg.inv(S)
             
-            # Update state
+            # Mise à jour de l'état (A posteriori)
             self.kf_state = self.kf_state + K @ y
             
-            # Update covariance
+            # Mise à jour de la covariance (L'incertitude réduit grâce au GPS)
             I = np.eye(4)
             self.kf_P = (I - K @ H) @ self.kf_P
-            
-            # Use filtered position
-            self.current_pose[0] = self.kf_state[0]
-            self.current_pose[1] = self.kf_state[1]
-            self.current_pose[2] = compass_angle
-        else:
-            # GPS unavailable - use odometry with Kalman prediction
-            odom_data = self.odometer_values() 
-            if odom_data is None: return
-            dist_traveled = odom_data[0]
-            rotation_change = odom_data[2]
-            
-            self.current_pose[2] += rotation_change
-            self.current_pose[2] = normalize_angle(self.current_pose[2])
-            
-            if self.kf_initialized:
-                # Use Kalman predicted position when GPS unavailable
-                F = np.array([
-                    [1, 0, self.kf_dt, 0],
-                    [0, 1, 0, self.kf_dt],
-                    [0, 0, 1, 0],
-                    [0, 0, 0, 1]
-                ])
-                self.kf_state = F @ self.kf_state
-                self.kf_P = F @ self.kf_P @ F.T + self.kf_Q
-                
-                self.current_pose[0] = self.kf_state[0]
-                self.current_pose[1] = self.kf_state[1]
-            else:
-                # Fallback to odometry if Kalman not yet initialized
-                dx = dist_traveled * math.cos(self.current_pose[2])
-                dy = dist_traveled * math.sin(self.current_pose[2])
-                self.current_pose[0] += dx
-                self.current_pose[1] += dy
 
-    
+        # ---------------------------------------------------------
+        # ÉTAPE 4 : SAUVEGARDE ET TRANSFERT
+        # ---------------------------------------------------------
+        
+        # On met à jour current_pose avec le meilleur état connu (Prédiction ou Correction)
+        self.current_pose[0] = self.kf_state[0]
+        self.current_pose[1] = self.kf_state[1]
+        
+        # Création de l'objet Pose (avec le correctif du tableau numpy [x,y])
+        self.estimated_pose = Pose(
+            np.array([self.current_pose[0], self.current_pose[1]]), 
+            self.current_pose[2]
+        )
