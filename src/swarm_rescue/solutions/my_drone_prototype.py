@@ -9,6 +9,7 @@ from swarm_rescue.simulation.drone.controller import CommandsDict
 import arcade
 import sys
 from pathlib import Path
+from swarm_rescue.simulation.utils.constants import MAX_RANGE_LIDAR_SENSOR
 
 # Ensure examples can be imported when running from the repository root
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent.parent))
@@ -1008,120 +1009,219 @@ class MyDronePrototype(DroneAbstract):
     # --------------------------------------------------------------------------
 
     def update_pose(self):
-        # 1. ACQUISITION DES DONNÉES
+        # 1. ACQUISITION
         gps_pos = self.measured_gps_position()
         compass_angle = self.measured_compass_angle()
         odom_data = self.odometer_values() 
+        lidar_data = self.lidar_values() 
 
         # Gestion du temps (dt)
         current_time = self.iteration * 0.1
         if self.kf_last_time > 0:
             self.kf_dt = current_time - self.kf_last_time
         else:
-            self.kf_dt = 0.1 # Valeur par défaut pour le 1er tour
+            self.kf_dt = 0.1
         self.kf_last_time = current_time
 
-        # Initialisation si premier GPS reçu
-        if not self.kf_initialized and gps_pos is not None and not np.isnan(gps_pos[0]):
-            self.kf_state = np.zeros(4)
-            self.kf_state[0] = gps_pos[0] # x
-            self.kf_state[1] = gps_pos[1] # y
-            self.kf_state[2] = 0.0        # vx
-            self.kf_state[3] = 0.0        # vy
-            self.kf_initialized = True
-            
-            # Init orientation
-            if compass_angle is not None:
-                self.current_pose[2] = compass_angle
-            elif self.current_pose[2] is None:
-                self.current_pose[2] = 0.0
-            return # On attend le prochain tour pour prédire
-
+        # --- CORRECTION 1 : INITIALISATION SANS RETURN ---
         if not self.kf_initialized:
-            return # On ne peut rien faire tant qu'on a pas eu au moins un point GPS
+            if gps_pos is not None and not np.isnan(gps_pos[0]):
+                self.kf_state = np.zeros(4)
+                self.kf_state[0] = gps_pos[0]
+                self.kf_state[1] = gps_pos[1]
+                self.kf_state[2] = 0.0
+                self.kf_state[3] = 0.0
+                self.kf_initialized = True
+                
+                # Init orientation
+                if compass_angle is not None:
+                    self.current_pose[2] = compass_angle
+                elif self.current_pose[2] is None:
+                    self.current_pose[2] = 0.0
+                
+                # IMPORTANT : On synchronise tout de suite pour ne pas attendre un tour
+                self.current_pose[0] = gps_pos[0]
+                self.current_pose[1] = gps_pos[1]
+            
+            # On continue vers la fin de la fonction pour créer estimated_pose
+            # Pas de 'return' ici !
+
+        # Si toujours pas initialisé (pas de GPS au départ), on ne peut rien faire
+        if not self.kf_initialized:
+            return
 
         # ---------------------------------------------------------
-        # ÉTAPE 1 : GESTION DE L'ORIENTATION (THETA)
-        # On utilise toujours l'odométrie pour la fluidité, 
-        # et on recale avec le compas si dispo.
+        # ÉTAPE 1 : GESTION DE L'ORIENTATION
         # ---------------------------------------------------------
-        
-        # Mise à jour par odométrie (d_theta)
+        dist_traveled = 0.0
         d_theta = 0.0
         if odom_data is not None:
+            dist_traveled = odom_data[0]
             d_theta = odom_data[2]
-            # Si on n'a pas d'angle initial, on met 0
-            if self.current_pose[2] is None: self.current_pose[2] = 0.0
-            self.current_pose[2] += d_theta
-        
-        # Correction absolue par le compas (si dispo)
-        if compass_angle is not None:
-            # On pourrait faire une moyenne pondérée ici, mais le remplacement direct est plus simple
-            self.current_pose[2] = compass_angle
 
+        if self.current_pose[2] is None: self.current_pose[2] = 0.0
+        self.current_pose[2] += d_theta
+        
+        if compass_angle is not None:
+             self.current_pose[2] = compass_angle
+             
         self.current_pose[2] = normalize_angle(self.current_pose[2])
 
         # ---------------------------------------------------------
-        # ÉTAPE 2 : PRÉDICTION KALMAN (TOUJOURS)
-        # C'est ici que l'odométrie aide le filtre : 
-        # Si le drone tourne, on doit tourner son vecteur vitesse (vx, vy)
+        # ÉTAPE 2 : PRÉDICTION (ODOMÉTRIE / DEAD RECKONING)
         # ---------------------------------------------------------
-        
-        # Rotation du vecteur vitesse dans l'état Kalman si le drone a tourné
-        # Si on ne fait pas ça, le drone tourne mais le filtre pense qu'il continue tout droit !
-        if d_theta != 0:
-            c, s = math.cos(d_theta), math.sin(d_theta)
-            # Rotation de vx, vy (indices 2 et 3)
-            vx_old, vy_old = self.kf_state[2], self.kf_state[3]
-            self.kf_state[2] = vx_old * c - vy_old * s
-            self.kf_state[3] = vx_old * s + vy_old * c
+        dx_odom = dist_traveled * math.cos(self.current_pose[2])
+        dy_odom = dist_traveled * math.sin(self.current_pose[2])
 
-        # Matrice de transition F (Modèle vitesse constante)
-        F = np.array([
-            [1, 0, self.kf_dt, 0],
-            [0, 1, 0, self.kf_dt],
-            [0, 0, 1, 0],
-            [0, 0, 0, 1]
-        ])
+        self.kf_state[0] += dx_odom
+        self.kf_state[1] += dy_odom
         
-        # Prédiction de l'état (A priori)
-        self.kf_state = F @ self.kf_state
-        # Prédiction de la covariance (L'incertitude grandit)
+        if self.kf_dt > 0:
+            self.kf_state[2] = dx_odom / self.kf_dt
+            self.kf_state[3] = dy_odom / self.kf_dt
+            
+        F = np.eye(4) 
         self.kf_P = F @ self.kf_P @ F.T + self.kf_Q
 
         # ---------------------------------------------------------
-        # ÉTAPE 3 : CORRECTION KALMAN (SI GPS DISPO)
-        # Le GPS vient "tirer" la prédiction vers la réalité
+        # ÉTAPE 3 : CORRECTION KALMAN (GPS)
         # ---------------------------------------------------------
-        if gps_pos is not None and not np.isnan(gps_pos[0]):
-            H = np.array([
-                [1, 0, 0, 0],
-                [0, 1, 0, 0]
-            ])
+        gps_missing = (gps_pos is None or np.isnan(gps_pos[0]))
+
+        if not gps_missing:
+            H = np.array([[1, 0, 0, 0], [0, 1, 0, 0]])
             z = np.array([gps_pos[0], gps_pos[1]])
             
-            # Calcul du gain de Kalman
-            y = z - H @ self.kf_state        # Innovation (Erreur entre mesure et prédiction)
+            y = z - H @ self.kf_state
             S = H @ self.kf_P @ H.T + self.kf_R
             K = self.kf_P @ H.T @ np.linalg.inv(S)
             
-            # Mise à jour de l'état (A posteriori)
             self.kf_state = self.kf_state + K @ y
-            
-            # Mise à jour de la covariance (L'incertitude réduit grâce au GPS)
             I = np.eye(4)
             self.kf_P = (I - K @ H) @ self.kf_P
 
-        # ---------------------------------------------------------
-        # ÉTAPE 4 : SAUVEGARDE ET TRANSFERT
-        # ---------------------------------------------------------
-        
-        # On met à jour current_pose avec le meilleur état connu (Prédiction ou Correction)
+        # --- CORRECTION 2 : SYNCHRONISATION CRUCIALE ---
+        # C'est la ligne qui manquait ! 
+        # On transfère le calcul mathématique (kf_state) vers le robot (current_pose)
+        # On le fait AVANT le SLAM pour donner au SLAM une bonne base de départ.
         self.current_pose[0] = self.kf_state[0]
         self.current_pose[1] = self.kf_state[1]
+
+        # ---------------------------------------------------------
+        # ÉTAPE 4 : SLAM (SCAN MATCHING)
+        # ---------------------------------------------------------
+        has_lidar = (lidar_data is not None)
         
-        # Création de l'objet Pose (avec le correctif du tableau numpy [x,y])
+        # Condition : Pas de GPS, Lidar dispo, et on a une carte (itération > 50)
+        if gps_missing and has_lidar and self.iteration > 50:
+            
+            current_guess = np.array([self.current_pose[0], self.current_pose[1], self.current_pose[2]])
+            corrected_pose = self.run_scan_matching(current_guess, lidar_data)
+            
+            # Mise à jour position robot
+            self.current_pose[0] = corrected_pose[0]
+            self.current_pose[1] = corrected_pose[1]
+            self.current_pose[2] = corrected_pose[2]
+            
+            # Mise à jour inverse du filtre (Feedback)
+            self.kf_state[0] = corrected_pose[0]
+            self.kf_state[1] = corrected_pose[1]
+
+        # ---------------------------------------------------------
+        # ÉTAPE 5 : UPDATE FINAL
+        # ---------------------------------------------------------
         self.estimated_pose = Pose(
             np.array([self.current_pose[0], self.current_pose[1]]), 
             self.current_pose[2]
         )
+
+    def calculate_scan_score(self, candidate_pose, lidar_distances):
+        """
+        Calcule la cohérence entre les mesures lidar et la carte pour une pose donnée.
+        """
+        score = 0
+        
+        # 1. RECUPERATION DES DONNEES
+        # lidar_distances est le tableau numpy passé en argument
+        # Les angles sont fixes et stockés dans l'objet capteur du drone
+        lidar_angles = self.lidar().ray_angles
+        
+        # 2. DOWNSAMPLING (Optimisation : on ne prend qu'un point sur 5)
+        # On doit appliquer le même masque aux distances et aux angles
+        distances = lidar_distances[::5]
+        angles = lidar_angles[::5]
+        
+        # 3. CALCUL GEOMETRIQUE
+        x_r, y_r = candidate_pose[0], candidate_pose[1]
+        theta_r = candidate_pose[2]
+        
+        # Angle global de chaque rayon = angle du rayon + orientation du drone
+        global_angles = angles + theta_r
+        
+        # Coordonnées des points d'impact dans le repère global (Monde)
+        x_points = x_r + distances * np.cos(global_angles)
+        y_points = y_r + distances * np.sin(global_angles)
+        
+        # 4. VÉRIFICATION SUR LA GRILLE
+        max_range = MAX_RANGE_LIDAR_SENSOR # Utilisez la constante importée
+        
+        for i in range(len(x_points)):
+            dist = distances[i]
+            
+            # FILTRAGE :
+            # - Si la distance est NaN (pas d'écho), on ignore
+            # - Si la distance est trop grande (max range), on ignore
+            if np.isnan(dist) or dist >= max_range: 
+                continue 
+            
+            # Conversion Monde -> Grille
+            # (Adaptez _conv_world_to_grid selon votre implémentation exacte de grid)
+            grid_pos = self.grid._conv_world_to_grid(x_points[i], y_points[i])
+            gy, gx = int(grid_pos[0]), int(grid_pos[1])
+            
+            # Vérification des bornes du tableau numpy de la grille
+            if 0 <= gy < self.grid.grid.shape[0] and 0 <= gx < self.grid.grid.shape[1]:
+                # On lit la probabilité d'occupation (0.0 à 1.0)
+                val = self.grid.grid[gy, gx]
+                
+                # On ajoute au score. 
+                # Si val proche de 1 (mur), le score augmente beaucoup.
+                # Si val proche de 0 (libre), le score augmente peu.
+                score += val
+                
+        return score
+
+    def run_scan_matching(self, initial_pose, lidar_data):
+        """
+        Essaie d'améliorer la position en testant des petits décalages.
+        """
+        best_pose = np.copy(initial_pose)
+        best_score = self.calculate_scan_score(best_pose, lidar_data)
+        
+        # Paramètres de recherche
+        search_radius = 10.0   # On cherche à +/- 10 pixels/cm
+        step_size = 2.0        # Pas de 2 pixels
+        angle_search = 0.05    # On cherche à +/- 0.05 radians (~3 degrés)
+        angle_step = 0.025
+        
+        # On teste une grille locale de positions
+        for dx in np.arange(-search_radius, search_radius + 0.1, step_size):
+            for dy in np.arange(-search_radius, search_radius + 0.1, step_size):
+                for dtheta in np.arange(-angle_search, angle_search + 0.001, angle_step):
+                    
+                    # On ne teste pas la position (0,0,0) car c'est déjà fait
+                    if dx == 0 and dy == 0 and dtheta == 0: continue
+                    
+                    candidate = np.array([
+                        initial_pose[0] + dx,
+                        initial_pose[1] + dy,
+                        normalize_angle(initial_pose[2] + dtheta)
+                    ])
+                    
+                    score = self.calculate_scan_score(candidate, lidar_data)
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_pose = candidate
+                        
+        return best_pose
