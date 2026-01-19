@@ -25,28 +25,28 @@ evaluation_plan:
   - map_name: MapIntermediate01
     nb_rounds: 2
     config_weight: 1
-    zones_config: []
+    zones_config: [NO_GPS_ZONE]
 
-  # Scenario 2: Intermediate map with 1 round, no special zones
-  - map_name: MapIntermediate02
-    nb_rounds: 1
-    config_weight: 1
-    zones_config: []
+  # # Scenario 2: Intermediate map with 1 round, no special zones
+  # - map_name: MapIntermediate02
+  #   nb_rounds: 1
+  #   config_weight: 1
+  #   zones_config: []
 
-  # Scenario 3: Medium map with 1 round, no special zones
-  - map_name: MapMedium01
-    nb_rounds: 1
-    config_weight: 1
-    zones_config: []
+  # # Scenario 3: Medium map with 1 round, no special zones
+  # - map_name: MapMedium01
+  #   nb_rounds: 1
+  #   config_weight: 1
+  #   zones_config: []
 
-  # Scenario 4: Medium map with 1 round, all special zones enabled
-  - map_name: MapMedium01
-    nb_rounds: 1
-    config_weight: 1
-    zones_config: [NO_COM_ZONE, NO_GPS_ZONE, KILL_ZONE]
+  # # Scenario 4: Medium map with 1 round, all special zones enabled
+  # - map_name: MapMedium01
+  #   nb_rounds: 1
+  #   config_weight: 1
+  #   zones_config: [NO_COM_ZONE, NO_GPS_ZONE, KILL_ZONE]
 
-  # Scenario 5: Another medium map with 1 round, all special zones enabled
-  - map_name: MapMedium02
-    nb_rounds: 1
-    config_weight: 1
-    zones_config: [NO_COM_ZONE, NO_GPS_ZONE, KILL_ZONE]
+  # # Scenario 5: Another medium map with 1 round, all special zones enabled
+  # - map_name: MapMedium02
+  #   nb_rounds: 1
+  #   config_weight: 1
+  #   zones_config: [NO_COM_ZONE, NO_GPS_ZONE, KILL_ZONE]
