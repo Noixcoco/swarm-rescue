@@ -728,7 +728,13 @@ class Playground:
         if isinstance(entity, Agent):
             return
 
-        self._space.remove(*entity.pm_elements)
+        try:
+            self._space.remove(*entity.pm_elements)
+        except AssertionError:
+            # L'objet a déjà été supprimé par Pymunk suite à un crash, on ignore.
+            pass
+        except KeyError:
+            pass
 
     def _remove_from_mappings(self, entity):
         """
