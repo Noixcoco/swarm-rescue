@@ -1111,21 +1111,58 @@ class MyDronePrototype(DroneAbstract):
         # ÉTAPE 4 : SLAM (SCAN MATCHING)
         # ---------------------------------------------------------
         has_lidar = (lidar_data is not None)
-        
+        # On ne fait le SLAM que tous les 5 pas (ex: toutes les 0.5 secondes)
+        do_slam_now = (self.iteration % 5 == 0)
+
         # Condition : Pas de GPS, Lidar dispo, et on a une carte (itération > 50)
-        if gps_missing and has_lidar and self.iteration > 50:
+        # On définit une variable pour stocker la confiance du dernier scan
+        # (A ajouter dans __init__ : self.last_slam_score = 0)
+        if not hasattr(self, 'last_slam_score'): self.last_slam_score = 0
+        
+        if gps_missing and has_lidar and self.iteration > 50:# and do_slam_now:
+            
+            # --- OPTIMISATION 1 : TRACKING MODE ---
+            # Si le score précédent était bon (> 50 par exemple, dépend de la carte),
+            # on réduit la zone de recherche pour aller vite.
+            # Sinon, on cherche large pour se retrouver.
+            if self.last_slam_score > 100: # Seuil à ajuster selon la densité de vos murs
+                current_radius = 4.0  # Petit rayon (Rapide)
+            else:
+                current_radius = 10.0 # Grand rayon (Recalage)
+
+            # On ne fait le SLAM que si nécessaire ou périodiquement
+            # Ici on le fait à chaque fois mais avec un rayon adapté (c'est plus fluide)
             
             current_guess = np.array([self.current_pose[0], self.current_pose[1], self.current_pose[2]])
-            corrected_pose = self.run_scan_matching(current_guess, lidar_data)
             
-            # Mise à jour position robot
-            self.current_pose[0] = corrected_pose[0]
-            self.current_pose[1] = corrected_pose[1]
-            self.current_pose[2] = corrected_pose[2]
+            # Appel avec le rayon dynamique
+            corrected_pose = self.run_scan_matching(current_guess, lidar_data, search_radius=current_radius)
             
-            # Mise à jour inverse du filtre (Feedback)
-            self.kf_state[0] = corrected_pose[0]
-            self.kf_state[1] = corrected_pose[1]
+            # Calcul du nouveau score pour le prochain tour
+            self.last_slam_score = self.calculate_scan_score(corrected_pose, lidar_data)
+
+            # --- SECURITE 2 : GATING (ANTI-SAUT) ---
+            # On calcule la distance entre la prédiction (Odométrie) et la correction (SLAM)
+            dist_correction = math.sqrt((corrected_pose[0] - current_guess[0])**2 + 
+                                        (corrected_pose[1] - current_guess[1])**2)
+            
+            # SEUIL DE REJET : Si le SLAM veut bouger le drone de plus de 20cm d'un coup,
+            # c'est probablement une erreur (faux positif). On rejette.
+            MAX_JUMP = 10.0 
+            
+            if dist_correction < MAX_JUMP:
+                # La correction est crédible, on l'applique
+                self.current_pose[0] = corrected_pose[0]
+                self.current_pose[1] = corrected_pose[1]
+                self.current_pose[2] = corrected_pose[2]
+                
+                # Feedback vers Kalman
+                self.kf_state[0] = corrected_pose[0]
+                self.kf_state[1] = corrected_pose[1]
+            else:
+                # SLAM rejeté : on fait confiance à l'odométrie pour ce tour
+                # Optionnel : print("SLAM JUMP REJECTED")
+                pass
 
         # ---------------------------------------------------------
         # ÉTAPE 5 : UPDATE FINAL
@@ -1191,20 +1228,17 @@ class MyDronePrototype(DroneAbstract):
                 
         return score
 
-    def run_scan_matching(self, initial_pose, lidar_data):
-        """
-        Essaie d'améliorer la position en testant des petits décalages.
-        """
+    def run_scan_matching(self, initial_pose, lidar_data, search_radius=10.0):
+        
         best_pose = np.copy(initial_pose)
         best_score = self.calculate_scan_score(best_pose, lidar_data)
         
-        # Paramètres de recherche
-        search_radius = 10.0   # On cherche à +/- 10 pixels/cm
-        step_size = 2.0        # Pas de 2 pixels
-        angle_search = 0.05    # On cherche à +/- 0.05 radians (~3 degrés)
-        angle_step = 0.025
+        # On garde vos paramètres optimisés, mais on utilise le rayon variable
+        step_size = 3.0       
+        angle_search = 0.05    
+        angle_step = 0.05
         
-        # On teste une grille locale de positions
+        # Utilisation de search_radius passé en argument
         for dx in np.arange(-search_radius, search_radius + 0.1, step_size):
             for dy in np.arange(-search_radius, search_radius + 0.1, step_size):
                 for dtheta in np.arange(-angle_search, angle_search + 0.001, angle_step):
