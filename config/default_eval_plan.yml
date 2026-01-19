@@ -25,9 +25,9 @@ evaluation_plan:
   - map_name: MapIntermediate01
     nb_rounds: 2
     config_weight: 1
-    zones_config: [NO_GPS_ZONE]
+    zones_config: []
 
-  # # Scenario 2: Intermediate map with 1 round, no special zones
+  # Scenario 2: Intermediate map with 1 round, no special zones
   # - map_name: MapIntermediate02
   #   nb_rounds: 1
   #   config_weight: 1

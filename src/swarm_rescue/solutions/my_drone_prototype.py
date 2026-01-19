@@ -25,6 +25,7 @@ class MyDronePrototype(DroneAbstract):
         EXPLORING = 1
         GOING_TO_WOUNDED = 2
         GOING_TO_RESCUE_CENTER = 3
+        GOING_TO_RETURN_AREA = 4
 
     def creer_chemin(self, start_world, goal_world, explored_only=False):
         """
@@ -192,6 +193,7 @@ class MyDronePrototype(DroneAbstract):
         # `rescue_zone_points`: list of (x,y) tuples representing detected rescue area points
         self.wounded_to_rescue = []
         self.rescue_zone_points = []
+        self.return_area_points = []
 
         # internal metadata to remember when a detection was last seen
         # keys are rounded tuples (x,y) -> last seen iteration
@@ -250,6 +252,16 @@ class MyDronePrototype(DroneAbstract):
         # self.estimated_pose = Pose(np.asarray(self.measured_gps_position()),
         #                            self.measured_compass_angle())
         self.grid.update_grid(pose=self.estimated_pose) # Mise à jour de la carte utilisée!
+
+        # Update return area knowledge
+        if getattr(self, 'is_inside_return_area', False):
+            self.return_area_points.append(self.current_pose[:2])
+            # Keep only the barycenter to have a single target point
+            xs = [p[0] for p in self.return_area_points]
+            ys = [p[1] for p in self.return_area_points]
+            bx = float(sum(xs) / len(xs))
+            by = float(sum(ys) / len(ys))
+            self.return_area_points = [(bx, by)]
 
 
         lidar_data = self.lidar_values()
@@ -339,6 +351,14 @@ class MyDronePrototype(DroneAbstract):
                     target_point = self.frontiers_world[closest_index]
                     self.target_point = target_point
                     self.path = self.creer_chemin(self.current_pose[:2], target_point)
+                else:
+                    # No frontiers found, exploration finished.
+                    # If no wounded to rescue, go to return area.
+                    if self.iteration > 100 and not self.wounded_to_rescue and not self.grasper.grasped_wounded_persons:
+                        self.state = self.Activity.GOING_TO_RETURN_AREA
+                        if self.return_area_points:
+                            self.path = self.creer_chemin(self.current_pose[:2], self.return_area_points[0], explored_only=True)
+                            self.last_replan_iteration = self.iteration
         
         # --- 3. ACTION (Le "Pilote") ---
         # Execute commands based on state
@@ -384,6 +404,25 @@ class MyDronePrototype(DroneAbstract):
                 
                 if should_replan:
                     self.path = self.creer_chemin(self.current_pose[:2], self.rescue_zone_points[0], explored_only=True)
+                    self.last_replan_iteration = self.iteration
+                
+                if self.path:
+                    command = self.go_to_point(lidar_data)
+                else:
+                    command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
+
+        elif self.state == self.Activity.GOING_TO_RETURN_AREA:
+            if getattr(self, 'is_inside_return_area', False):
+                command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
+            elif self.return_area_points:
+                should_replan = False
+                if not self.path or len(self.path) == 0:
+                    should_replan = True
+                elif self.iteration % 10 == 0:
+                    should_replan = True
+                
+                if should_replan:
+                    self.path = self.creer_chemin(self.current_pose[:2], self.return_area_points[0], explored_only=True)
                     self.last_replan_iteration = self.iteration
                 
                 if self.path:
@@ -709,6 +748,16 @@ class MyDronePrototype(DroneAbstract):
                     pt = np.array([xr, yr]) + self._half_size_array
                     arcade.draw_rectangle_outline(pt[0], pt[1], width=30, height=30, color=(0,160,0), border_width=2)
                     arcade.draw_text("RZ", pt[0] + 12, pt[1] + 12, (0,120,0), 10)
+        except Exception:
+            pass
+
+        # Draw return area points
+        try:
+            if hasattr(self, 'return_area_points') and self.return_area_points:
+                for (rx, ry) in self.return_area_points:
+                    pt = np.array([rx, ry]) + self._half_size_array
+                    arcade.draw_rectangle_outline(pt[0], pt[1], width=30, height=30, color=(0, 160, 255), border_width=2)
+                    arcade.draw_text("RA", pt[0] + 12, pt[1] + 12, (0, 120, 200), 10)
         except Exception:
             pass
 
