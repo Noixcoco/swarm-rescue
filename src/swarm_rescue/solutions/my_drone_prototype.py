@@ -1480,35 +1480,52 @@ class MyDronePrototype(DroneAbstract):
             return
 
         # ---------------------------------------------------------
-        # ÉTAPE 1 : GESTION DE L'ORIENTATION
+        # ÉTAPE 1 : GESTION DE L'ORIENTATION (THETA)
         # ---------------------------------------------------------
         dist_traveled = 0.0
-        d_theta = 0.0
-        if odom_data is not None:
-            dist_traveled = odom_data[0]
-            d_theta = odom_data[2]
-
-        if self.current_pose[2] is None: self.current_pose[2] = 0.0
-        self.current_pose[2] += d_theta
+        alpha = 0.0          # La direction du mouvement relative
+        rotation_change = 0.0 # La rotation du drone lui-même
         
+        if odom_data is not None:
+            dist_traveled = odom_data[0] 
+            alpha = odom_data[1]          # <-- NOUVEAU
+            rotation_change = odom_data[2]
+
+        # Sauvegarde de l'ancien angle pour le calcul du mouvement
+        # (Le mouvement se fait par rapport à l'orientation au début du pas de temps)
+        prev_orientation = self.current_pose[2]
+        if prev_orientation is None: prev_orientation = 0.0
+
+        # Mise à jour de l'orientation du drone (Son "Nez")
+        self.current_pose[2] = prev_orientation + rotation_change
+        
+        # Recalage absolu avec le compas si dispo
         if compass_angle is not None:
              self.current_pose[2] = compass_angle
              
         self.current_pose[2] = normalize_angle(self.current_pose[2])
 
         # ---------------------------------------------------------
-        # ÉTAPE 2 : PRÉDICTION (ODOMÉTRIE / DEAD RECKONING)
+        # ÉTAPE 2 : PRÉDICTION CORRIGÉE AVEC ALPHA
         # ---------------------------------------------------------
-        dx_odom = dist_traveled * math.cos(self.current_pose[2])
-        dy_odom = dist_traveled * math.sin(self.current_pose[2])
+        
+        # L'angle GLOBAL du mouvement est : Orientation du drone + Angle relatif du mouvement
+        movement_angle = prev_orientation + alpha
+        
+        # Calcul du déplacement physique (dx, dy)
+        dx_odom = dist_traveled * math.cos(movement_angle)
+        dy_odom = dist_traveled * math.sin(movement_angle)
 
+        # Mise à jour Kalman (Dead Reckoning)
         self.kf_state[0] += dx_odom
         self.kf_state[1] += dy_odom
         
+        # Mise à jour vitesses (pour info)
         if self.kf_dt > 0:
             self.kf_state[2] = dx_odom / self.kf_dt
             self.kf_state[3] = dy_odom / self.kf_dt
             
+        # Augmentation de l'incertitude
         F = np.eye(4) 
         self.kf_P = F @ self.kf_P @ F.T + self.kf_Q
 
