@@ -192,7 +192,7 @@ class MyDronePrototype(DroneAbstract):
         comfort_dist_cells = COMFORT_DISTANCE_WORLD / self.grid.resolution
         
         # Max penalty to apply if we are right next to the wall
-        MAX_PENALTY = 50.0
+        MAX_PENALTY = 100.0
 
         
         # --- MODIFIED DRONE AVOIDANCE ZONE - ONLY AVOID DRONES IN FRONT ---
@@ -240,7 +240,7 @@ class MyDronePrototype(DroneAbstract):
         # Si le start ou le goal sont dans la danger_zone (par ex. drone collé au mur),
         # on autorise une petite zone autour d'eux pour permettre à A* de s'extraire.
         try:
-            radius_clear = 1
+            radius_clear = 2  # Increased to 2 (from 1) to ensure connectivity if stuck
             sx, sy = start
             gx, gy = goal
             x0 = max(0, sx - radius_clear)
@@ -785,12 +785,27 @@ class MyDronePrototype(DroneAbstract):
                             should_replan = True
                     
                     if should_replan:
-                        # KEY CHANGE: Force explored_only=True when going to rescue center
-                        self.path = self.creer_chemin(
+                        # Consistent target selection
+                        target_index = int(self.identifier) % len(self.rescue_zone_points)
+                        target_zone = self.rescue_zone_points[target_index]
+
+                        # Try safe explored path first
+                        new_path = self.creer_chemin(
                             self.current_pose[:2], 
-                            self.rescue_zone_points[0], 
-                            explored_only=True  # Only use explored safe areas
+                            target_zone, 
+                            explored_only=True
                         )
+                        
+                        # Fallback: if no safe path found, try any path
+                        if not new_path:
+                            print(f"[{self.identifier}] No safe explored return path found, trying any path...")
+                            new_path = self.creer_chemin(
+                                self.current_pose[:2], 
+                                target_zone, 
+                                explored_only=False
+                            )
+                        
+                        self.path = new_path
                         self.last_replan_iteration = self.iteration
                         
         # --- 2. STRATÉGIE ---
@@ -1078,7 +1093,8 @@ class MyDronePrototype(DroneAbstract):
 
         # Safety margin around walls
         struct = np.ones((5, 5), dtype=bool)
-        danger_zone = binary_dilation(is_wall, structure=struct, iterations=2)
+        # Reduced safety margin to allow detecting frontiers in narrow corridors
+        danger_zone = binary_dilation(is_wall, structure=struct, iterations=1)
         frontier_mask = frontier_mask & (~danger_zone)
 
         # Clustering
