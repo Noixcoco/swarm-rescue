@@ -49,6 +49,10 @@ class MapIntermediate01(MapAbstract):
 
         self._wounded_persons_pos = [(-310, -180)]
         self._wounded_persons_path = [[(-260, -170), (-360, -190)], ]
+        
+        # self._wounded_persons_pos = [(-50, 0)]
+        # self._wounded_persons_path = [[(-100, 0), (0, 0)], ]
+
         self._number_wounded_persons = len(self._wounded_persons_pos)
         self._wounded_persons: List[WoundedPerson] = []
 
