@@ -44,8 +44,8 @@ class MapMedium03(MapAbstract):
         self._no_com_zone = NoComZone(size=(150, 130))
         self._no_com_zone_pos = ((60, 140), 0)
 
-        self._no_gps_zone = NoGpsZone(size=(240, 339))
-        self._no_gps_zone_pos = ((-420, -56), 0)
+        self._no_gps_zone = NoGpsZone(size=(540, 539))
+        self._no_gps_zone_pos = ((100, -56), 0)
 
         self._kill_zone = KillZone(size=(150, 130))
         self._kill_zone_pos = ((60, 140), 0)
