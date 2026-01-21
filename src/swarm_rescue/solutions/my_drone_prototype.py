@@ -198,37 +198,7 @@ class MyDronePrototype(DroneAbstract):
         # --- MODIFIED DRONE AVOIDANCE ZONE - ONLY AVOID DRONES IN FRONT ---
         # Cache drone danger zone for a few iterations if positions haven't changed
        
-        # --- NEW: ADD OTHER DRONES AS TEMPORARY OBSTACLES ---
-        # This treats other drones as "walls" for the pathfinder
-        if hasattr(self, 'other_drones_positions') and self.other_drones_positions:
-        
-            DRONE_OBSTACLE_RADIUS = 40.0 
-            radius_cells = int(DRONE_OBSTACLE_RADIUS / self.grid.resolution)
-            
-            for other_info in self.other_drones_positions:
-                other_pos = other_info[0]
-                
-                # Only consider drones that are somewhat close (optimization)
-                # e.g., within 200 pixels. Far away drones don't matter.
-                if math.hypot(other_pos[0] - start_world[0], other_pos[1] - start_world[1]) > 200.0:
-                    continue
-
-                try:
-                    # Convert drone world pos to grid
-                    p_grid = self.grid._conv_world_to_grid(other_pos[0], other_pos[1])
-                    py, px = int(p_grid[0]), int(p_grid[1])
-                    
-                    # Define a square around the drone
-                    y0 = max(0, py - radius_cells)
-                    y1 = min(grid.shape[0], py + radius_cells + 1)
-                    x0 = max(0, px - radius_cells)
-                    x1 = min(grid.shape[1], px + radius_cells + 1)
-                    
-                    # Mark this area as BLOCKED
-                    danger_zone[y0:y1, x0:x1] = True
-                    
-                except Exception:
-                    continue
+        # (Drone obstacle avoidance removed as per request)
 
     
 
@@ -836,65 +806,78 @@ class MyDronePrototype(DroneAbstract):
                             for drone_id_str, target in other_assignments.items():
                                 assigned_targets[int(drone_id_str)] = np.array(target)
     
-                    best_score = float('inf')
-                    best_target = None
+                    
+                    # Goal: Minimize Distance, Maximize Cluster Size, Minimize Conflicts.
                     
                     min_separation = 300.0  # Minimum distance between drone targets
+                    scored_targets = []
                     
                     for bc in barycenters:
-                      
                         distance = np.linalg.norm(bc - self.current_pose[:2])
-                        # 2. Conflict penalty (avoid targets near other drones' assignments)
+                        
+                        # Penalties (positive values to be subtracted from utility or added to cost)
                         conflict_penalty = 0.0
                         for other_target in assigned_targets.values():
-                            dist_to_assigned = np.linalg.norm(bc - other_target)
-                                
-                            if dist_to_assigned < min_separation:
-                                conflict_penalty += 10000.0  # Heavy penalty
+                            if np.linalg.norm(bc - other_target) < min_separation:
+                                conflict_penalty += 5000.0
 
-                        cluster_size = 10  # Default if size unknown
-                        for cluster in self.frontier_clusters:
-                            if np.linalg.norm(cluster["barycenter"] - bc) < 20:
-                                cluster_size = cluster["size"]
-                                break
-
-                        size_bonus = cluster_size * 50.0 
-
-                        # 3. Drone proximity penalty (avoid crowded areas)
                         drone_penalty = 0.0
                         if hasattr(self, 'other_drones_positions') and self.other_drones_positions:
                             for drone_pos in self.other_drones_positions:
-                                dist_drone_to_frontier = np.linalg.norm(bc - np.array(drone_pos[0][:2]))
-                                if dist_drone_to_frontier < 200.0:
-                                    drone_penalty += 300.0 / (dist_drone_to_frontier + 1.0)
-        
-                        # Combined score (lower is better)
-                        score = distance + size_bonus - conflict_penalty - drone_penalty+size_bonus
-            
-                        if score > best_score:
-                            best_score = score
-                            best_target = bc
-
-                    if best_target is not None:
-                        self.target_point = best_target
-                        self.path = self.creer_chemin(self.current_pose[:2], best_target)
-                    
+                                d = np.linalg.norm(bc - np.array(drone_pos[0][:2]))
+                                if d < 200.0:
+                                    drone_penalty += 300.0 / (d + 1.0)
                         
-                    else:
-                        # Fallback to first barycenter
-                        if barycenters:
-                            self.target_point = barycenters[0]
-                            self.path = self.creer_chemin(self.current_pose[:2], self.target_point)
+                        # Size bonus (negative cost)
+                        cluster_size = 10
+                        for cluster in self.frontier_clusters:
+                             if np.linalg.norm(cluster["barycenter"] - bc) < 20:
+                                cluster_size = cluster["size"]
+                                break
+                        
+                        # COST FUNCTION (Lower is better)
+                        # Cost = Distance + Penalties - Bonus
+                        cost = distance + conflict_penalty + drone_penalty - (cluster_size * 2.0)
+                        
+                        scored_targets.append((cost, bc))
+                    
+                    # Sort by cost (ascending), so best targets are first
+                    scored_targets.sort(key=lambda x: x[0])
+                    
+                    # Try to find a valid path to the best targets
+                    path_found = False
+                    for cost, target in scored_targets:
+                        path = self.creer_chemin(self.current_pose[:2], target)
+                        if path:
+                            self.target_point = target
+                            self.path = path
+                            path_found = True
+                            print(f"[{self.identifier}] Selected target with cost {cost:.1f}")
+                            break
+                    
+                    if not path_found:
+                         print(f"[{self.identifier}] No reachable target found in shared list")
+
+                    # Fallback handled by outer logic if path is still empty
                 
                 else:
                     # FALLBACK: Use local frontier detection
                     local_frontiers = self.find_safe_frontier_points() 
-                    if local_frontiers: 
-                        distances = [np.linalg.norm(f - self.current_pose[:2]) for f in local_frontiers]
-                        target_index = np.argmin(distances)
-                        target_point = local_frontiers[target_index]
-                        self.target_point = target_point
-                        self.path = self.creer_chemin(self.current_pose[:2], target_point)
+                    if local_frontiers:
+                        # Sort by distance
+                        local_frontiers.sort(key=lambda f: np.linalg.norm(f - self.current_pose[:2]))
+                        
+                        path_found = False
+                        for target_point in local_frontiers:
+                            path = self.creer_chemin(self.current_pose[:2], target_point)
+                            if path:
+                                self.target_point = target_point
+                                self.path = path
+                                path_found = True
+                                break
+                        
+                        if not path_found:
+                             print(f"[{self.identifier}] Local frontiers found but all unreachable")
                     else:
                         print(f"[{self.identifier}] MAP FULLY EXPLORED - No more frontiers to explore!")
 
@@ -902,9 +885,9 @@ class MyDronePrototype(DroneAbstract):
         if self.state == self.Activity.EXPLORING:
             if self.path:   
                 command = self.follow_path(lidar_data)
-
             else:
-                command = {"forward": 0.3, "lateral": 0.0, "rotation": 0.0}
+                # Rotate in place to find new frontiers/update map instead of drifting blind
+                command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.5}
 
         elif self.state == self.Activity.GOING_TO_WOUNDED:
 
