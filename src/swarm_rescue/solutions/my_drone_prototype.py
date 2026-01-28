@@ -1,4 +1,5 @@
 import math
+import random
 import numpy as np
 from enum import Enum
 from scipy.ndimage import binary_dilation, generate_binary_structure
@@ -130,6 +131,10 @@ class MyDronePrototype(DroneAbstract):
         #tracking grasped wounded angle for better approach
         self.grasped_wounded_angle = None 
 
+        self.wall_following_side = None
+        self.prev_wall_error = None
+        self.integral_wall_error = 0.0
+        self.last_slam_score = 0.0
 
 
 
@@ -432,6 +437,86 @@ class MyDronePrototype(DroneAbstract):
             }
     
         return message
+
+    def wall_follower_control(self, lidar_data) -> CommandsDict:
+        """
+        Suivre le mur de DROITE uniquement en l'absence de GPS.
+        """
+        # Force right side
+        self.wall_following_side = 'right'
+
+        command = {"forward": 0.3, "lateral": 0.0, "rotation": 0.0, "grasper": 0}
+        
+        angles = self.lidar().ray_angles
+        
+        # Define sectors
+        # Front: -30 to 30 degrees
+        front_indices = np.where(np.abs(angles) < math.radians(30))[0]
+        # Right: -110 to -70 degrees (Strict Side)
+        right_indices = np.where((angles > math.radians(-110)) & (angles < math.radians(-70)))[0]
+        # Front-Right: -60 to -20 (Corner anticipation)
+        front_right_indices = np.where((angles > math.radians(-60)) & (angles < math.radians(-20)))[0]
+        
+        front_dist = np.min(lidar_data[front_indices]) if len(front_indices) > 0 else 999.0
+        right_dist = np.min(lidar_data[right_indices]) if len(right_indices) > 0 else 999.0
+        front_right_dist = np.min(lidar_data[front_right_indices]) if len(front_right_indices) > 0 else 999.0
+        
+        TARGET_DIST = 45.0
+        
+        # 1. EMERGENCY: Too close to front -> Reverse
+        if front_dist < 30.0:
+            command["forward"] = -0.1
+            command["rotation"] = 0.5 # Turn left while reversing
+            return command
+
+        # 2. OBSTACLE AVOIDANCE: Front blocked -> Turn Left in place
+        if front_dist < 50.0:
+            command["forward"] = 0.0
+            command["rotation"] = 0.6 # Strong Left
+            return command
+            
+        # 3. CORNER AVOIDANCE: Front-Right blocked -> Turn Left while moving
+        if front_right_dist < 40.0:
+            command["forward"] = 0.2
+            command["rotation"] = 0.3 # Turn Left
+            return command
+
+        # 4. WALL FOLLOWING
+        if right_dist > 120.0:
+            # Lost wall -> Turn Right to find it
+            # But ensure we don't just spin if we are in open space.
+            # Move forward significantly.
+            command["forward"] = 0.3
+            command["rotation"] = -0.2 # Gentle Right
+            self.prev_wall_error = None # Reset derivative memory when wall is lost
+            self.integral_wall_error = 0.0 # Reset integral when wall is lost
+        else:
+            # Maintain distance
+            error = right_dist - TARGET_DIST
+            # error > 0 (too far) -> Turn Right (negative)
+            # error < 0 (too close) -> Turn Left (positive)
+
+            # Handle first iteration or re-acquisition to avoid derivative spike
+            if self.prev_wall_error is None:
+                self.prev_wall_error = error
+
+            # --- PID Controller ---
+            Kp = 0.01  # Proportional (Reduced)
+            Ki = 0.0   # Integral (Disabled for stability)
+            Kd = 0.1   # Derivative (Increased for damping)
+
+            self.integral_wall_error += error
+            self.integral_wall_error = np.clip(self.integral_wall_error, -100, 100) # Anti-windup
+            
+            deriv = error - self.prev_wall_error
+            self.prev_wall_error = error
+            
+            command["rotation"] = -(Kp * error + Ki * self.integral_wall_error + Kd * deriv)
+            # Clamp
+            command["rotation"] = max(-0.5, min(0.5, command["rotation"]))
+            command["forward"] = 0.3
+        
+        return command
 
     def control(self) -> CommandsDict:
         """
@@ -876,12 +961,19 @@ class MyDronePrototype(DroneAbstract):
                 else:
                     # FALLBACK: Use local frontier detection
                     local_frontiers = self.find_safe_frontier_points() 
-                    if local_frontiers:
+                    
+                    # Filter frontiers too close to the drone (likely the drone's current location)
+                    valid_frontiers = [
+                        f for f in local_frontiers 
+                        if np.linalg.norm(f - self.current_pose[:2]) > 40.0
+                    ]
+
+                    path_found = False
+                    if valid_frontiers:
                         # Sort by distance
-                        local_frontiers.sort(key=lambda f: np.linalg.norm(f - self.current_pose[:2]))
+                        valid_frontiers.sort(key=lambda f: np.linalg.norm(f - self.current_pose[:2]))
                         
-                        path_found = False
-                        for target_point in local_frontiers:
+                        for target_point in valid_frontiers:
                             path = self.creer_chemin(self.current_pose[:2], target_point)
                             if path:
                                 self.target_point = target_point
@@ -891,23 +983,41 @@ class MyDronePrototype(DroneAbstract):
                         
                         if not path_found:
                              print(f"[{self.identifier}] Local frontiers found but all unreachable")
-                    else:
+                    
+                    if not path_found:
                         # No frontiers found, exploration finished.
                         # If no wounded to rescue, go to return area.
                         if self.iteration > 100 and not self.wounded_to_rescue and not self.grasper.grasped_wounded_persons:
                             self.state = self.Activity.GOING_TO_RETURN_AREA
                             if self.return_area_points:
                                 self.path = self.creer_chemin(self.current_pose[:2], self.return_area_points[0], explored_only=True)
+                                # Fallback : si pas de chemin sûr, on tente le chemin direct
+                                if not self.path:
+                                    self.path = self.creer_chemin(self.current_pose[:2], self.return_area_points[0], explored_only=False)
                                 self.last_replan_iteration = self.iteration
                         print(f"[{self.identifier}] MAP FULLY EXPLORED - No more frontiers to explore!")
 
         # Generate movement commands based on current state
         if self.state == self.Activity.EXPLORING:
-            if self.path:   
-                command = self.follow_path(lidar_data)
+            # if self.path:   
+            #     command = self.follow_path(lidar_data)
+            gps_pos = self.measured_gps_position()
+            has_gps = gps_pos is not None and not np.isnan(gps_pos[0])
+            
+            if not has_gps:
+                command = self.wall_follower_control(lidar_data)
             else:
                 # Rotate in place to find new frontiers/update map instead of drifting blind
-                command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.5}
+                # command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.5}
+                if self.wall_following_side is not None:
+                    self.wall_following_side = None # Reset when GPS is back
+                    self.path = [] # Force replan to avoid jumps
+                    self.prev_wall_error = None
+
+                if self.path:   
+                    command = self.follow_path(lidar_data)
+                else:
+                    command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
 
         elif self.state == self.Activity.GOING_TO_WOUNDED:
 
@@ -943,6 +1053,9 @@ class MyDronePrototype(DroneAbstract):
                 
                 if should_replan:
                     self.path = self.creer_chemin(self.current_pose[:2], self.return_area_points[0], explored_only=True)
+                    # Fallback : si pas de chemin sûr, on tente le chemin direct
+                    if not self.path:
+                        self.path = self.creer_chemin(self.current_pose[:2], self.return_area_points[0], explored_only=False)
                     self.last_replan_iteration = self.iteration
                 
                 if self.path:
@@ -1438,6 +1551,7 @@ class MyDronePrototype(DroneAbstract):
     def update_pose(self):
         gps_pos = self.measured_gps_position()
         compass_angle = self.measured_compass_angle()
+        lidar_data = self.lidar_values()
         
         # Calculate dt for Kalman filter
         current_time = self.iteration * 0.1  # Assuming 10 Hz
@@ -1569,6 +1683,104 @@ class MyDronePrototype(DroneAbstract):
                 if self.iteration % 10 == 0:  # Print every 10 iterations to reduce spam
                     print(f"[{self.identifier}] Dead reckoning: dist={dist_travel:.1f}, alpha={math.degrees(alpha):.1f}°, "
                         f"theta={math.degrees(theta):.1f}°, heading={math.degrees(heading):.1f}°")
+
+        # ---------------------------------------------------------
+        # ÉTAPE 4 : SLAM (SCAN MATCHING)
+        # ---------------------------------------------------------
+        gps_missing = (gps_pos is None or np.isnan(gps_pos[0]))
+        has_lidar = (lidar_data is not None)
+        # On ne fait le SLAM que tous les 5 pas (ex: toutes les 0.5 secondes)
+        do_slam_now = (self.iteration % 15 == 0)
+
+        # Condition : Pas de GPS, Lidar dispo, on a une carte (itération > 50) et c'est le moment
+        if gps_missing and has_lidar and self.iteration > 50 and do_slam_now:
+            
+            # --- OPTIMISATION 1 : TRACKING MODE ---
+            # Si le score précédent était bon (> 300 par exemple, dépend de la carte),
+            # on réduit la zone de recherche pour aller vite.
+            # Sinon, on cherche large pour se retrouver.
+            if self.last_slam_score > 300: 
+                current_radius = 20.0  # Tracking (2 pixels)
+                angle_limit = 0.1      # ~6 deg
+            else:
+                current_radius = 40.0 # Recalage (4 pixels)
+                angle_limit = 0.2     # ~12 deg
+
+            current_guess = np.array([self.current_pose[0], self.current_pose[1], self.current_pose[2]])
+            
+            # Appel avec le rayon dynamique
+            corrected_pose = self.run_scan_matching(current_guess, lidar_data, 
+                                                  search_radius=current_radius, 
+                                                  angle_search=angle_limit)
+            
+            # Calcul du nouveau score pour le prochain tour
+            self.last_slam_score = self.calculate_scan_score(corrected_pose, lidar_data)
+
+            # --- SECURITE 2 : GATING (ANTI-SAUT) ---
+            # On calcule la distance entre la prédiction (Odométrie) et la correction (SLAM)
+            dist_correction = math.sqrt((corrected_pose[0] - current_guess[0])**2 + 
+                                        (corrected_pose[1] - current_guess[1])**2)
+            
+            # SEUIL DE REJET : Si le SLAM veut bouger le drone de plus de 20cm d'un coup,
+            # c'est probablement une erreur (faux positif). On rejette.
+            MAX_JUMP = 25.0 
+            
+            if dist_correction < MAX_JUMP:
+                # La correction est crédible, on l'applique
+                self.current_pose[0] = corrected_pose[0]
+                self.current_pose[1] = corrected_pose[1]
+                self.current_pose[2] = corrected_pose[2]
+                
+                # Feedback vers Kalman
+                self.kf_state[0] = corrected_pose[0]
+                self.kf_state[1] = corrected_pose[1]
+
+    def calculate_scan_score(self, candidate_pose, lidar_distances):
+        """
+        Calcule la cohérence entre les mesures lidar et la carte pour une pose donnée.
+        """
+        score = 0
+        lidar_angles = self.lidar().ray_angles
+        distances = lidar_distances[::5]
+        angles = lidar_angles[::5]
+        
+        x_r, y_r = candidate_pose[0], candidate_pose[1]
+        theta_r = candidate_pose[2]
+        
+        global_angles = angles + theta_r
+        x_points = x_r + distances * np.cos(global_angles)
+        y_points = y_r + distances * np.sin(global_angles)
+        
+        max_range = MAX_RANGE_LIDAR_SENSOR
+        
+        for i in range(len(x_points)):
+            dist = distances[i]
+            if np.isnan(dist) or dist >= max_range: 
+                continue 
+            
+            grid_pos = self.grid._conv_world_to_grid(x_points[i], y_points[i])
+            gy, gx = int(grid_pos[0]), int(grid_pos[1])
+            
+            if 0 <= gy < self.grid.grid.shape[0] and 0 <= gx < self.grid.grid.shape[1]:
+                score += self.grid.grid[gy, gx]
+                
+        return score
+
+    def run_scan_matching(self, initial_pose, lidar_data, search_radius=10.0, angle_search=0.05):
+        best_pose = np.copy(initial_pose)
+        best_score = self.calculate_scan_score(best_pose, lidar_data)
+        step_size = 5.0       # 0.5 pixel
+        angle_step = 0.02     # ~1 deg
+        for dx in np.arange(-search_radius, search_radius + 0.1, step_size):
+            for dy in np.arange(-search_radius, search_radius + 0.1, step_size):
+                for dtheta in np.arange(-angle_search, angle_search + 0.001, angle_step):
+                    if dx == 0 and dy == 0 and dtheta == 0: continue
+                    candidate = np.array([initial_pose[0] + dx, initial_pose[1] + dy, normalize_angle(initial_pose[2] + dtheta)])
+                    score = self.calculate_scan_score(candidate, lidar_data)
+                    if score > best_score:
+                        best_score = score
+                        best_pose = candidate
+        return best_pose
 
 
     def process_communication_sensor(self):
