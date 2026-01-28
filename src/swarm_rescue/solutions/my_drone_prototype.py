@@ -125,12 +125,14 @@ class MyDronePrototype(DroneAbstract):
         # --- KILL ZONE DETECTION ---
         self.drone_last_heard = {}  # {drone_id: {"iteration": int, "position": (x,y)}}
         self.known_kill_zones = []  # List of (x, y) tuples marking death locations
-        self.DEATH_TIMEOUT = 20 # 100 iterations = ~10 seconds of silence
+        self.DEATH_TIMEOUT = 8 # 100 iterations = ~10 seconds of silence
         self.kill_zone_grid = None
         self.declared_dead_drones = set() 
+        self.drone_position_history = {}    #to estimate kill zone position
         # Two-step verification before declaring death
         self.suspected_dead_drones = {}  # {drone_id: {"first_timeout_iter": int, "position": (x,y)}}
-        self.CONFIRMATION_TIMEOUT = 20 # Additional iterations to confirm death
+        self.CONFIRMATION_TIMEOUT = 5 # Additional iterations to confirm death
+
 
 
         #tracking grasped wounded angle for better approach
@@ -211,7 +213,7 @@ class MyDronePrototype(DroneAbstract):
         # This treats other drones as "walls" for the pathfinder
         if hasattr(self, 'other_drones_positions') and self.other_drones_positions:
         
-            DRONE_OBSTACLE_RADIUS = 40.0 
+            DRONE_OBSTACLE_RADIUS = 85.0 
             radius_cells = int(DRONE_OBSTACLE_RADIUS / self.grid.resolution)
             
             for other_info in self.other_drones_positions:
@@ -463,7 +465,7 @@ class MyDronePrototype(DroneAbstract):
         # Assigned barycenters: only when exploring and target exists
         if self.state == self.Activity.EXPLORING and hasattr(self, "target_point"):
             message["assigned_barycenters"] = {
-                str(self.identifier): self.target_point.tolist()
+                str(self.identifier): np.array(self.target_point).tolist()
             }
     
         return message
@@ -556,6 +558,7 @@ class MyDronePrototype(DroneAbstract):
             ]
             
             if available_wounded and (self.iteration % 50 == 0):
+                print(f"[{self.identifier}] [DEBUG] Available wounded: {available_wounded}")
                 # Choose closest available wounded
                 distances = [np.linalg.norm(np.array(w) - self.current_pose[:2]) for w in available_wounded]
                 closest_idx = int(np.argmin(distances))
@@ -665,8 +668,6 @@ class MyDronePrototype(DroneAbstract):
                                     w[1] - self.current_target_wounded[1]) > 50.0
                     ]
 
-            
-                    print(f"[{self.identifier}] STEP 2: Removed wounded at {self.current_target_wounded}")
                     
 
 
@@ -806,6 +807,7 @@ class MyDronePrototype(DroneAbstract):
                         if not self.path:
                             print(f"[{self.identifier}] No safe explored path to rescue center, using breadcrumbs!")
                             if len(self.breadcrumbs) > 4:
+                                print("enter the loop")
                                 # Reverse the recorded history
                                 current_pos = self.current_pose[:2]
                                 breadcrumbs_np = np.array(self.breadcrumbs)
@@ -857,18 +859,15 @@ class MyDronePrototype(DroneAbstract):
                                 assigned_targets[int(drone_id_str)] = np.array(target)
     
                     best_score = float('inf')
-                    best_target = None
+                    best_target = barycenters[0]
                     
                     min_separation = 300.0  # Minimum distance between drone targets
                     
                     for bc in barycenters:
-                      
                         distance = np.linalg.norm(bc - self.current_pose[:2])
-                        # 2. Conflict penalty (avoid targets near other drones' assignments)
                         conflict_penalty = 0.0
                         for other_target in assigned_targets.values():
                             dist_to_assigned = np.linalg.norm(bc - other_target)
-                                
                             if dist_to_assigned < min_separation:
                                 conflict_penalty += 10000.0  # Heavy penalty
 
@@ -878,45 +877,58 @@ class MyDronePrototype(DroneAbstract):
                                 cluster_size = cluster["size"]
                                 break
 
-                        size_bonus = cluster_size * 50.0 
+                        # Reward large clusters (subtract bonus)
+                        size_bonus = -cluster_size * 50.0
 
-                        # 3. Drone proximity penalty (avoid crowded areas)
                         drone_penalty = 0.0
                         if hasattr(self, 'other_drones_positions') and self.other_drones_positions:
                             for drone_pos in self.other_drones_positions:
                                 dist_drone_to_frontier = np.linalg.norm(bc - np.array(drone_pos[0][:2]))
                                 if dist_drone_to_frontier < 200.0:
-                                    drone_penalty += 300.0 / (dist_drone_to_frontier + 1.0)
-        
-                        # Combined score (lower is better)
-                        score = distance + size_bonus - conflict_penalty - drone_penalty+size_bonus
-            
-                        if score > best_score:
+                                    drone_penalty += 800.0 / (dist_drone_to_frontier + 1.0)
+
+                        # Cost: lower is better
+                        score = distance + conflict_penalty + drone_penalty + size_bonus
+
+                        if score < best_score:
                             best_score = score
                             best_target = bc
 
-                    if best_target is not None:
-                        self.target_point = best_target
-                        self.path = self.creer_chemin(self.current_pose[:2], best_target)
+        
+                    self.target_point = best_target
+                    self.path = self.creer_chemin(self.current_pose[:2], best_target)
                     
-                        
-                    else:
-                        # Fallback to first barycenter
-                        if barycenters:
-                            self.target_point = barycenters[0]
-                            self.path = self.creer_chemin(self.current_pose[:2], self.target_point)
                 
                 else:
                     # FALLBACK: Use local frontier detection
+                    print(f"[{self.identifier}] [DEBUG] No shared clusters, using local frontiers.")
                     local_frontiers = self.find_safe_frontier_points() 
-                    if local_frontiers: 
+                    if local_frontiers:
+                        print(f"[{self.identifier}] [DEBUG] Local frontiers found: {local_frontiers}")
+                        found_path = False
+                        # Try each frontier in order of proximity
                         distances = [np.linalg.norm(f - self.current_pose[:2]) for f in local_frontiers]
-                        target_index = np.argmin(distances)
-                        target_point = local_frontiers[target_index]
-                        self.target_point = target_point
-                        self.path = self.creer_chemin(self.current_pose[:2], target_point)
+                        for idx in np.argsort(distances):
+                            target_point = local_frontiers[idx]
+                            path = self.creer_chemin(self.current_pose[:2], target_point)
+                            if path:
+                                self.target_point = target_point
+                                self.path = path
+                                found_path = True
+                                break
+                        if not found_path:
+                            print(f"[{self.identifier}] No reachable frontiers - Going to return area!")
+                            if self.return_area_points:
+                                target_index = int(self.identifier) % len(self.return_area_points)
+                                target_zone = self.return_area_points[target_index]
+                                self.target_point = target_zone
+                                self.path = self.creer_chemin(self.current_pose[:2], target_zone, explored_only=True)
+                                self.state = self.Activity.GOING_TO_RETURN_AREA
+                            else:
+                                print(f"[{self.identifier}] No return area points available!")
                     else:
-                        print(f"[{self.identifier}] MAP FULLY EXPLORED - No more frontiers to explore!")
+                        print(f"[{self.identifier}] MAP FULLY EXPLORED - Going to return area!")
+
 
         # Generate movement commands based on current state
         if self.state == self.Activity.EXPLORING:
@@ -924,6 +936,7 @@ class MyDronePrototype(DroneAbstract):
                 command = self.follow_path(lidar_data)
 
             else:
+                print("bug here")
                 command = {"forward": 0.3, "lateral": 0.0, "rotation": 0.0}
 
         elif self.state == self.Activity.GOING_TO_WOUNDED:
@@ -1099,6 +1112,9 @@ class MyDronePrototype(DroneAbstract):
         self.frontier_clusters = []
         min_cluster_size = 3
 
+        min_distance = float('inf')
+        closest_cluster = None
+
         for label_idx in range(1, num_features + 1):
             ys, xs = np.where(labeled == label_idx)
             size = ys.size
@@ -1131,12 +1147,17 @@ class MyDronePrototype(DroneAbstract):
             if heavily_explored_nearby > 0.7 * neighborhood.size:
                 continue
             
+            distance = np.linalg.norm(barycenter - self.current_pose[:2])
             self.frontier_clusters.append({
                 "barycenter": barycenter,
-                "size": int(size)
+                "size": int(size),
+                "distance": distance
             })
 
-        self.frontier_clusters.sort(key=lambda c: c["size"], reverse=True)
+            if distance < min_distance:
+                min_distance = distance
+                closest_cluster = barycenter
+
         frontiers = [c["barycenter"] for c in self.frontier_clusters]
 
         return frontiers
@@ -1474,8 +1495,6 @@ class MyDronePrototype(DroneAbstract):
         else:
             odom_data = self.odometer_values()
             if odom_data is None:
-                # No odometry available - cannot update position
-                print(f"[{self.identifier}] WARNING: No odometry data available!")
                 return
             
             dist_travel = odom_data[0]  # Distance traveled
@@ -1601,6 +1620,13 @@ class MyDronePrototype(DroneAbstract):
                     "iteration": current_iteration,
                     "position": (pos[0], pos[1])
                 }
+
+                if other_id not in self.drone_position_history:
+                    self.drone_position_history[other_id] = []
+                self.drone_position_history[other_id].append((current_iteration, (pos[0], pos[1])))
+                # Keep only the last 5 positions
+                if len(self.drone_position_history[other_id]) > 3:
+                    self.drone_position_history[other_id] = self.drone_position_history[other_id][-5:]
 
 
             
@@ -1888,8 +1914,8 @@ class MyDronePrototype(DroneAbstract):
                 return command
 
             # SETTINGS
-            SAFE_DIST = 80.0  # Start pushing away at 70 pixels (approx 0.7 meter)
-            GAIN = 2.0         # Strong push (Stronger than walls to prevent tangling)
+            SAFE_DIST = 120.0  # Start pushing away at 70 pixels (approx 0.7 meter)
+            GAIN = 3.5      # Strong push (Stronger than walls to prevent tangling)
 
             repulsion_forward = 0.0
             repulsion_lateral = 0.0
@@ -1956,44 +1982,47 @@ class MyDronePrototype(DroneAbstract):
             self.last_breadcrumb_pos = current_pos_tuple
     
 
-    def mark_kill_zone_on_grid(self, death_pos, drone_id):  # ✅ ADD drone_id parameter
-        """
-        Mark a SQUARE area as a permanent kill zone on BOTH grids.
-        Size is estimated from the drone's last heard (safe) position to death position.
-        """
+    def mark_kill_zone_on_grid(self, death_pos, drone_id):
         try:
-            # Initialize kill zone grid if needed
             if self.kill_zone_grid is None:
                 self.kill_zone_grid = np.zeros_like(self.grid.grid)
 
-           
-            square_size = self.detect_kill_zone_size(death_pos, drone_id)
-            
-            # Convert world position to grid coordinates
-            grid_pos = self.grid._conv_world_to_grid(death_pos[0], death_pos[1])
+            # Use last two positions for direction and speed
+            history = self.drone_position_history.get(drone_id, [])
+            if len(history) >= 2:
+                (iter1, pos1), (iter2, pos2) = history[-2], history[-1]
+                dt = max(1, iter2 - iter1)
+                dx = pos2[0] - pos1[0]
+                dy = pos2[1] - pos1[1]
+                speed = math.hypot(dx, dy) / dt  # px per iteration
+                # Estimate how far it could have gone since last heard
+                silence = self.DEATH_TIMEOUT
+                max_travel = speed * silence
+                # Center kill zone a bit ahead in the direction of movement
+                direction = np.array([dx, dy])
+                if np.linalg.norm(direction) > 0:
+                    direction = direction / np.linalg.norm(direction)
+                center = np.array(pos2) + direction * (max_travel / 2)
+                square_size = max(130, min(150.0, max_travel * 5))
+            else:
+                center = np.array(death_pos)
+                square_size = 150.0  # fallback
+
+            # Convert to grid and mark
+            grid_pos = self.grid._conv_world_to_grid(center[0], center[1])
             center_y, center_x = int(grid_pos[0]), int(grid_pos[1])
-            
-            # Calculate SQUARE bounds (in GRID CELLS)
             size_cells = int(square_size / self.grid.resolution)
             half_size = size_cells // 2
-            
             y0 = max(0, center_y - half_size)
             y1 = min(self.grid.grid.shape[0], center_y + half_size)
             x0 = max(0, center_x - half_size)
             x1 = min(self.grid.grid.shape[1], center_x + half_size)
-            
-            # MARK ON BOTH GRIDS SIMULTANEOUSLY
-            self.kill_zone_grid[y0:y1, x0:x1] = 1.0      # Permanent record
-            # self.grid.grid[y0:y1, x0:x1] = 100.0         # Active pathfinding obstacle
-            
-            print(f"[{self.identifier}] Marked kill zone at {death_pos}")
-            print(f"    Size: {square_size:.0f}x{square_size:.0f}px")
-            print(f"    Grid bounds: y[{y0}:{y1}], x[{x0}:{x1}]")
-            
+            self.kill_zone_grid[y0:y1, x0:x1] = 1.0
+
+            print(f"[{self.identifier}] Marked improved kill zone for {drone_id} at {center} (size {square_size:.1f})")
         except Exception as e:
             print(f"[{self.identifier}] Error marking kill zone: {e}")
-            import traceback
-            traceback.print_exc()
+
 
 
     def apply_kill_zones_to_grid(self):
@@ -2005,8 +2034,7 @@ class MyDronePrototype(DroneAbstract):
             return  # No kill zones marked yet
     
         # Where kill_zone_grid == 1.0, set grid.grid to 100.0
-        # self.grid.grid[self.kill_zone_grid == 1.0] = 100.0
-
+        self.grid.grid[self.kill_zone_grid == 1.0] = 100.0
 
 
     def detect_kill_zone_size(self, death_pos, drone_id):
@@ -2023,7 +2051,7 @@ class MyDronePrototype(DroneAbstract):
             # Max speed ≈ 100 px/s → 200px in 2 seconds
             
             SAFETY_MARGIN = 1.5  # 50% larger for safety
-            ASSUMED_TRAVEL_DISTANCE = 150.0  # Conservative estimate
+            ASSUMED_TRAVEL_DISTANCE = 125.0  # Conservative estimate
             
             square_size = ASSUMED_TRAVEL_DISTANCE * SAFETY_MARGIN
             
@@ -2163,27 +2191,11 @@ class MyDronePrototype(DroneAbstract):
         
 
         # Stay near the rescue center (within 5-10px), only rotate
-        if dist_to_rescue > 10.0:
+        if dist_to_rescue > 80.0:
             # Approach until close enough
             return self.follow_path(lidar_data)
-        
-        
-        # Rotate in place until wounded is aligned with rescue center
-        to_rescue = np.array(rescue_center_pos) - self.current_pose[:2]
-        angle_to_rescue = math.atan2(to_rescue[1], to_rescue[0])
-        
-        if self.grasped_wounded_angle is not None:
-            desired_heading = normalize_angle(angle_to_rescue - self.grasped_wounded_angle)
-        else:
-            desired_heading = angle_to_rescue
-        
-        heading = self.current_pose[2]
-        angle_error = normalize_angle(desired_heading - heading)
-        rotation_speed = self.Kp * angle_error
-        rotation_speed = float(np.clip(rotation_speed, -1.0, 1.0))
-        
-        # Always rotate, never move forward
-        return {"forward": 0, "lateral": 0, "rotation": rotation_speed}
+
+        return {"forward": 0.4, "lateral": 0, "rotation": 0.4}
     
 
     def add_return_area_point(self, new_point):
@@ -2201,3 +2213,26 @@ class MyDronePrototype(DroneAbstract):
         self.return_area_points.append((nx, ny))
 
 
+    def local_exploration_fallback(self):
+        """
+        Fallback: Move towards the nearest unexplored cell, or random walk if none found.
+        """
+        grid_map = self.grid.grid
+        SEUIL_UNEXPLORED_MIN = -4.99
+        SEUIL_UNEXPLORED_MAX = 4.0
+        is_unexplored = (grid_map >= SEUIL_UNEXPLORED_MIN) & (grid_map <= SEUIL_UNEXPLORED_MAX)
+        is_wall = (grid_map >= 4.01)
+        unexplored_mask = is_unexplored & (~is_wall)
+        if np.any(unexplored_mask):
+            current_grid = self.grid._conv_world_to_grid(self.current_pose[0], self.current_pose[1])
+            unexplored_indices = np.argwhere(unexplored_mask)
+            distances = np.linalg.norm(unexplored_indices - current_grid, axis=1)
+            nearest_idx = np.argmin(distances)
+            nearest_unexplored = unexplored_indices[nearest_idx]
+            target_world = self.grid._conv_grid_to_world(nearest_unexplored[0], nearest_unexplored[1])
+            path = self.creer_chemin(self.current_pose[:2], target_world)
+            if path:
+                self.path = path
+                self.target_point = np.array(target_world)
+                print(f"[{self.identifier}] [FALLBACK] Moving to nearest unexplored cell at {target_world}")
+                return
