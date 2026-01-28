@@ -8,4 +8,4 @@ evaluation_plan:
 
     nb_rounds: 1
     config_weight: 1
-    zones_config: []
+    zones_config: [NO_GPS_ZONE]

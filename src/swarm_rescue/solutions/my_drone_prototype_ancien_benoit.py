@@ -201,7 +201,37 @@ class MyDronePrototype(DroneAbstract):
         # --- MODIFIED DRONE AVOIDANCE ZONE - ONLY AVOID DRONES IN FRONT ---
         # Cache drone danger zone for a few iterations if positions haven't changed
        
-        # (Drone obstacle avoidance removed as per request)
+        # --- NEW: ADD OTHER DRONES AS TEMPORARY OBSTACLES ---
+        # This treats other drones as "walls" for the pathfinder
+        if hasattr(self, 'other_drones_positions') and self.other_drones_positions:
+        
+            DRONE_OBSTACLE_RADIUS = 40.0 
+            radius_cells = int(DRONE_OBSTACLE_RADIUS / self.grid.resolution)
+            
+            for other_info in self.other_drones_positions:
+                other_pos = other_info[0]
+                
+                # Only consider drones that are somewhat close (optimization)
+                # e.g., within 200 pixels. Far away drones don't matter.
+                if math.hypot(other_pos[0] - start_world[0], other_pos[1] - start_world[1]) > 200.0:
+                    continue
+
+                try:
+                    # Convert drone world pos to grid
+                    p_grid = self.grid._conv_world_to_grid(other_pos[0], other_pos[1])
+                    py, px = int(p_grid[0]), int(p_grid[1])
+                    
+                    # Define a square around the drone
+                    y0 = max(0, py - radius_cells)
+                    y1 = min(grid.shape[0], py + radius_cells + 1)
+                    x0 = max(0, px - radius_cells)
+                    x1 = min(grid.shape[1], px + radius_cells + 1)
+                    
+                    # Mark this area as BLOCKED
+                    danger_zone[y0:y1, x0:x1] = True
+                    
+                except Exception:
+                    continue
 
     
 
@@ -292,9 +322,11 @@ class MyDronePrototype(DroneAbstract):
             close_set.add(current)
             for dx, dy in neighbors:
                 neighbor = (current[0] + dx, current[1] + dy)
+                # bounds check
                 if not (0 <= neighbor[0] < grid.shape[0] and 0 <= neighbor[1] < grid.shape[1]):
                     continue
 
+                # don't enter danger zone
                 if danger_zone[neighbor]:
                     continue
 
@@ -320,7 +352,7 @@ class MyDronePrototype(DroneAbstract):
 
                 if neighbor in close_set and tentative_g_score >= gscore.get(neighbor, float('inf')):
                     continue
-                            
+                
                 if tentative_g_score < gscore.get(neighbor, float('inf')):
                     came_from[neighbor] = current
                     gscore[neighbor] = tentative_g_score
@@ -768,27 +800,12 @@ class MyDronePrototype(DroneAbstract):
                             should_replan = True
                     
                     if should_replan:
-                        # Consistent target selection
-                        target_index = int(self.identifier) % len(self.rescue_zone_points)
-                        target_zone = self.rescue_zone_points[target_index]
-
-                        # Try safe explored path first
-                        new_path = self.creer_chemin(
+                        # KEY CHANGE: Force explored_only=True when going to rescue center
+                        self.path = self.creer_chemin(
                             self.current_pose[:2], 
-                            target_zone, 
-                            explored_only=True
+                            self.rescue_zone_points[0], 
+                            explored_only=True  # Only use explored safe areas
                         )
-                        
-                        # Fallback: if no safe path found, try any path
-                        if not new_path:
-                            print(f"[{self.identifier}] No safe explored return path found, trying any path...")
-                            new_path = self.creer_chemin(
-                                self.current_pose[:2], 
-                                target_zone, 
-                                explored_only=False
-                            )
-                        
-                        self.path = new_path
                         self.last_replan_iteration = self.iteration
                         
         # --- 2. STRATÉGIE ---
@@ -819,78 +836,65 @@ class MyDronePrototype(DroneAbstract):
                             for drone_id_str, target in other_assignments.items():
                                 assigned_targets[int(drone_id_str)] = np.array(target)
     
-                    
-                    # Goal: Minimize Distance, Maximize Cluster Size, Minimize Conflicts.
+                    best_score = float('inf')
+                    best_target = None
                     
                     min_separation = 300.0  # Minimum distance between drone targets
-                    scored_targets = []
                     
                     for bc in barycenters:
+                      
                         distance = np.linalg.norm(bc - self.current_pose[:2])
-                        
-                        # Penalties (positive values to be subtracted from utility or added to cost)
+                        # 2. Conflict penalty (avoid targets near other drones' assignments)
                         conflict_penalty = 0.0
                         for other_target in assigned_targets.values():
-                            if np.linalg.norm(bc - other_target) < min_separation:
-                                conflict_penalty += 5000.0
+                            dist_to_assigned = np.linalg.norm(bc - other_target)
+                                
+                            if dist_to_assigned < min_separation:
+                                conflict_penalty += 10000.0  # Heavy penalty
 
+                        cluster_size = 10  # Default if size unknown
+                        for cluster in self.frontier_clusters:
+                            if np.linalg.norm(cluster["barycenter"] - bc) < 20:
+                                cluster_size = cluster["size"]
+                                break
+
+                        size_bonus = cluster_size * 50.0 
+
+                        # 3. Drone proximity penalty (avoid crowded areas)
                         drone_penalty = 0.0
                         if hasattr(self, 'other_drones_positions') and self.other_drones_positions:
                             for drone_pos in self.other_drones_positions:
-                                d = np.linalg.norm(bc - np.array(drone_pos[0][:2]))
-                                if d < 200.0:
-                                    drone_penalty += 300.0 / (d + 1.0)
-                        
-                        # Size bonus (negative cost)
-                        cluster_size = 10
-                        for cluster in self.frontier_clusters:
-                             if np.linalg.norm(cluster["barycenter"] - bc) < 20:
-                                cluster_size = cluster["size"]
-                                break
-                        
-                        # COST FUNCTION (Lower is better)
-                        # Cost = Distance + Penalties - Bonus
-                        cost = distance + conflict_penalty + drone_penalty - (cluster_size * 2.0)
-                        
-                        scored_targets.append((cost, bc))
-                    
-                    # Sort by cost (ascending), so best targets are first
-                    scored_targets.sort(key=lambda x: x[0])
-                    
-                    # Try to find a valid path to the best targets
-                    path_found = False
-                    for cost, target in scored_targets:
-                        path = self.creer_chemin(self.current_pose[:2], target)
-                        if path:
-                            self.target_point = target
-                            self.path = path
-                            path_found = True
-                            print(f"[{self.identifier}] Selected target with cost {cost:.1f}")
-                            break
-                    
-                    if not path_found:
-                         print(f"[{self.identifier}] No reachable target found in shared list")
+                                dist_drone_to_frontier = np.linalg.norm(bc - np.array(drone_pos[0][:2]))
+                                if dist_drone_to_frontier < 200.0:
+                                    drone_penalty += 300.0 / (dist_drone_to_frontier + 1.0)
+        
+                        # Combined score (lower is better)
+                        score = distance + size_bonus - conflict_penalty - drone_penalty+size_bonus
+            
+                        if score > best_score:
+                            best_score = score
+                            best_target = bc
 
-                    # Fallback handled by outer logic if path is still empty
+                    if best_target is not None:
+                        self.target_point = best_target
+                        self.path = self.creer_chemin(self.current_pose[:2], best_target)
+                    
+                        
+                    else:
+                        # Fallback to first barycenter
+                        if barycenters:
+                            self.target_point = barycenters[0]
+                            self.path = self.creer_chemin(self.current_pose[:2], self.target_point)
                 
                 else:
                     # FALLBACK: Use local frontier detection
                     local_frontiers = self.find_safe_frontier_points() 
-                    if local_frontiers:
-                        # Sort by distance
-                        local_frontiers.sort(key=lambda f: np.linalg.norm(f - self.current_pose[:2]))
-                        
-                        path_found = False
-                        for target_point in local_frontiers:
-                            path = self.creer_chemin(self.current_pose[:2], target_point)
-                            if path:
-                                self.target_point = target_point
-                                self.path = path
-                                path_found = True
-                                break
-                        
-                        if not path_found:
-                             print(f"[{self.identifier}] Local frontiers found but all unreachable")
+                    if local_frontiers: 
+                        distances = [np.linalg.norm(f - self.current_pose[:2]) for f in local_frontiers]
+                        target_index = np.argmin(distances)
+                        target_point = local_frontiers[target_index]
+                        self.target_point = target_point
+                        self.path = self.creer_chemin(self.current_pose[:2], target_point)
                     else:
                         # No frontiers found, exploration finished.
                         # If no wounded to rescue, go to return area.
@@ -906,8 +910,7 @@ class MyDronePrototype(DroneAbstract):
             if self.path:   
                 command = self.follow_path(lidar_data)
             else:
-                # Rotate in place to find new frontiers/update map instead of drifting blind
-                command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.5}
+                command = {"forward": 0.3, "lateral": 0.0, "rotation": 0.0}
 
         elif self.state == self.Activity.GOING_TO_WOUNDED:
 
@@ -1124,8 +1127,7 @@ class MyDronePrototype(DroneAbstract):
 
         # Safety margin around walls
         struct = np.ones((5, 5), dtype=bool)
-        # Reduced safety margin to allow detecting frontiers in narrow corridors
-        danger_zone = binary_dilation(is_wall, structure=struct, iterations=1)
+        danger_zone = binary_dilation(is_wall, structure=struct, iterations=2)
         frontier_mask = frontier_mask & (~danger_zone)
 
         # Clustering
@@ -1293,14 +1295,6 @@ class MyDronePrototype(DroneAbstract):
 
     
         
-
-            # --- DRAW THIS DRONE'S POSITION (for reference) ---
-        my_screen_pos = self.current_pose[:2] + self._half_size_array
-        arcade.draw_circle_filled(my_screen_pos[0], my_screen_pos[1], 
-                                radius=18, color=detection_color)
-        
-    
-
         try:
             current_pose_screen = self.current_pose[:2] + self._half_size_array
             # Get state name
@@ -1393,12 +1387,17 @@ class MyDronePrototype(DroneAbstract):
         target_speed = max(0.0, min(max_speed, x_err * 0.15 + 0.3))
 
         measured_vel = self.measured_velocity()
-        if measured_vel is None:
-            # No velocity data available (no GPS zone) - use target speed directly
-            measured_speed = 0.0
-        else:
+
+        # measured_speed = math.sqrt(measured_vel[0] ** 2 + measured_vel[1] ** 2)
+
+        if measured_vel is not None:
             measured_speed = math.sqrt(measured_vel[0] ** 2 + measured_vel[1] ** 2)
-        
+        elif self.kf_initialized:
+            # Utilise la vitesse estimée par Kalman (vx=state[2], vy=state[3])
+            measured_speed = math.sqrt(self.kf_state[2] ** 2 + self.kf_state[3] ** 2)
+        else:
+            measured_speed = 0.0
+
         speed_error = target_speed - measured_speed
         deriv_speed = speed_error - self.prev_speed_error
         
@@ -1435,141 +1434,281 @@ class MyDronePrototype(DroneAbstract):
     # --------------------------------------------------------------------------
     # FONCTIONS PRINCIPALES (Localisation, Cartographie Binaire)
     # --------------------------------------------------------------------------
+
     def update_pose(self):
+        # 1. ACQUISITION
         gps_pos = self.measured_gps_position()
         compass_angle = self.measured_compass_angle()
-        
-        # Calculate dt for Kalman filter
-        current_time = self.iteration * 0.1  # Assuming 10 Hz
+        odom_data = self.odometer_values() 
+        lidar_data = self.lidar_values() 
+
+        # Gestion du temps (dt)
+        current_time = self.iteration * 0.1
         if self.kf_last_time > 0:
             self.kf_dt = current_time - self.kf_last_time
         else:
-            self.kf_dt = 0.1  # Default for first iteration
+            self.kf_dt = 0.1
         self.kf_last_time = current_time
 
-        # --- UPDATE HEADING (always available unless in kill zone) ---
-        if compass_angle is not None:
-            self.current_pose[2] = compass_angle
-        
-        # --- GPS AVAILABLE: Use Kalman filter ---
-        if gps_pos is not None and not np.isnan(gps_pos[0]):
-            # Initialize filter on first GPS measurement
-            if not self.kf_initialized:
+        # --- CORRECTION 1 : INITIALISATION SANS RETURN ---
+        if not self.kf_initialized:
+            if gps_pos is not None and not np.isnan(gps_pos[0]):
+                self.kf_state = np.zeros(4)
                 self.kf_state[0] = gps_pos[0]
                 self.kf_state[1] = gps_pos[1]
-                self.kf_state[2] = 0.0  # Initial velocity
+                self.kf_state[2] = 0.0
                 self.kf_state[3] = 0.0
                 self.kf_initialized = True
+                
+                # Init orientation
+                if compass_angle is not None:
+                    self.current_pose[2] = compass_angle
+                elif self.current_pose[2] is None:
+                    self.current_pose[2] = 0.0
+                
+                # IMPORTANT : On synchronise tout de suite pour ne pas attendre un tour
+                self.current_pose[0] = gps_pos[0]
+                self.current_pose[1] = gps_pos[1]
             
-            # Kalman Filter Prediction Step
-            F = np.array([
-                [1, 0, self.kf_dt, 0],
-                [0, 1, 0, self.kf_dt],
-                [0, 0, 1, 0],
-                [0, 0, 0, 1]
-            ])
+            # On continue vers la fin de la fonction pour créer estimated_pose
+            # Pas de 'return' ici !
+
+        # Si toujours pas initialisé (pas de GPS au départ), on ne peut rien faire
+        if not self.kf_initialized:
+            return
+
+        # ---------------------------------------------------------
+        # ÉTAPE 1 : GESTION DE L'ORIENTATION (THETA)
+        # ---------------------------------------------------------
+        dist_traveled = 0.0
+        alpha = 0.0          # La direction du mouvement relative
+        rotation_change = 0.0 # La rotation du drone lui-même
+        
+        if odom_data is not None:
+            dist_traveled = odom_data[0] 
+            alpha = odom_data[1]          # <-- NOUVEAU
+            rotation_change = odom_data[2]
+
+        # Sauvegarde de l'ancien angle pour le calcul du mouvement
+        # (Le mouvement se fait par rapport à l'orientation au début du pas de temps)
+        prev_orientation = self.current_pose[2]
+        if prev_orientation is None: prev_orientation = 0.0
+
+        # Mise à jour de l'orientation du drone (Son "Nez")
+        self.current_pose[2] = prev_orientation + rotation_change
+        
+        # Recalage absolu avec le compas si dispo
+        if compass_angle is not None:
+             self.current_pose[2] = compass_angle
+             
+        self.current_pose[2] = normalize_angle(self.current_pose[2])
+
+        # ---------------------------------------------------------
+        # ÉTAPE 2 : PRÉDICTION CORRIGÉE AVEC ALPHA
+        # ---------------------------------------------------------
+        
+        # L'angle GLOBAL du mouvement est : Orientation du drone + Angle relatif du mouvement
+        movement_angle = prev_orientation + alpha
+        
+        # Calcul du déplacement physique (dx, dy)
+        dx_odom = dist_traveled * math.cos(movement_angle)
+        dy_odom = dist_traveled * math.sin(movement_angle)
+
+        # Mise à jour Kalman (Dead Reckoning)
+        self.kf_state[0] += dx_odom
+        self.kf_state[1] += dy_odom
+        
+        # Mise à jour vitesses (pour info)
+        if self.kf_dt > 0:
+            self.kf_state[2] = dx_odom / self.kf_dt
+            self.kf_state[3] = dy_odom / self.kf_dt
             
-            # Predict state
-            self.kf_state = F @ self.kf_state
-            
-            # Predict covariance
-            self.kf_P = F @ self.kf_P @ F.T + self.kf_Q
-            
-            # Kalman Filter Update Step
-            H = np.array([
-                [1, 0, 0, 0],
-                [0, 1, 0, 0]
-            ])
-            
-            # Measurement residual
+        # Augmentation de l'incertitude
+        F = np.eye(4) 
+        self.kf_P = F @ self.kf_P @ F.T + self.kf_Q
+
+        # ---------------------------------------------------------
+        # ÉTAPE 3 : CORRECTION KALMAN (GPS)
+        # ---------------------------------------------------------
+        gps_missing = (gps_pos is None or np.isnan(gps_pos[0]))
+
+        if not gps_missing:
+            H = np.array([[1, 0, 0, 0], [0, 1, 0, 0]])
             z = np.array([gps_pos[0], gps_pos[1]])
+            
             y = z - H @ self.kf_state
             
             # Residual covariance
             S = H @ self.kf_P @ H.T + self.kf_R
-            
+
             # Kalman gain
             K = self.kf_P @ H.T @ np.linalg.inv(S)
             
             # Update state
             self.kf_state = self.kf_state + K @ y
-            
+
             # Update covariance
             I = np.eye(4)
             self.kf_P = (I - K @ H) @ self.kf_P
             
             # Use filtered position
-            self.current_pose[0] = self.kf_state[0]
-            self.current_pose[1] = self.kf_state[1]
+        # On transfère le calcul mathématique (kf_state) vers le robot (current_pose)
+        # On le fait AVANT le SLAM pour donner au SLAM une bonne base de départ.
+        self.current_pose[0] = self.kf_state[0]
+        self.current_pose[1] = self.kf_state[1]
 
-        # --- NO GPS ZONE: Use odometry for dead reckoning ---
-        else:
-            odom_data = self.odometer_values()
-            if odom_data is None:
-                # No odometry available - cannot update position
-                print(f"[{self.identifier}] WARNING: No odometry data available!")
-                return
+        # ---------------------------------------------------------
+        # ÉTAPE 4 : SLAM (SCAN MATCHING)
+        # ---------------------------------------------------------
+        has_lidar = (lidar_data is not None)
+        # On ne fait le SLAM que tous les 5 pas (ex: toutes les 0.5 secondes)
+        do_slam_now = (self.iteration % 5 == 0)
+
+        # Condition : Pas de GPS, Lidar dispo, et on a une carte (itération > 50)
+        # On définit une variable pour stocker la confiance du dernier scan
+        # (A ajouter dans __init__ : self.last_slam_score = 0)
+        if not hasattr(self, 'last_slam_score'): self.last_slam_score = 0
+        
+        if gps_missing and has_lidar and self.iteration > 50:# and do_slam_now:
             
-            # According to documentation:
-            # odom_data[0] = dist_travel: distance traveled during the last timestep
-            # odom_data[1] = alpha: relative angle of current position from previous frame
-            # odom_data[2] = theta: variation of orientation during last timestep
-            
-            dist_travel = odom_data[0]  # Distance traveled
-            alpha = odom_data[1]        # Relative angle of travel direction
-            theta = odom_data[2]        # Change in orientation
-            
-            # Update heading first (using odometry rotation if compass unavailable)
-            if compass_angle is None:
-                self.current_pose[2] += theta
-                self.current_pose[2] = normalize_angle(self.current_pose[2])
-            
-            # Get current heading (either from compass or updated odometry)
-            heading = self.current_pose[2]
-            
-            # Calculate displacement in WORLD frame
-            # The drone traveled 'dist_travel' distance at angle (heading + alpha)
-            # alpha is the direction of travel relative to drone's orientation
-            travel_direction = heading + alpha
-            
-            dx_world = dist_travel * math.cos(travel_direction)
-            dy_world = dist_travel * math.sin(travel_direction)
-            
-            # Update position using odometry integration
-            if self.kf_initialized:
-                # Use Kalman prediction with odometry-based velocity estimate
-                if self.kf_dt > 0:
-                    vx_odom = dx_world / self.kf_dt
-                    vy_odom = dy_world / self.kf_dt
-                    
-                    # Update velocity estimate (trust odometry heavily in no-GPS zones)
-                    self.kf_state[2] = 0.8 * vx_odom + 0.2 * self.kf_state[2]
-                    self.kf_state[3] = 0.8 * vy_odom + 0.2 * self.kf_state[3]
-                
-                # Predict position using velocity
-                F = np.array([
-                    [1, 0, self.kf_dt, 0],
-                    [0, 1, 0, self.kf_dt],
-                    [0, 0, 1, 0],
-                    [0, 0, 0, 1]
-                ])
-                self.kf_state = F @ self.kf_state
-                
-                # Increase uncertainty significantly in no-GPS zones
-                self.kf_P = F @ self.kf_P @ F.T + self.kf_Q * 3.0
-                
-                # Update pose
-                self.current_pose[0] = self.kf_state[0]
-                self.current_pose[1] = self.kf_state[1]
+            # --- OPTIMISATION 1 : TRACKING MODE ---
+            # Si le score précédent était bon (> 50 par exemple, dépend de la carte),
+            # on réduit la zone de recherche pour aller vite.
+            # Sinon, on cherche large pour se retrouver.
+            if self.last_slam_score > 100: # Seuil à ajuster selon la densité de vos murs
+                current_radius = 4.0  # Petit rayon (Rapide)
             else:
-                # Kalman not initialized - pure odometry dead reckoning
-                self.current_pose[0] += dx_world
-                self.current_pose[1] += dy_world
-                
-                if self.iteration % 10 == 0:  # Print every 10 iterations to reduce spam
-                    print(f"[{self.identifier}] Dead reckoning: dist={dist_travel:.1f}, alpha={math.degrees(alpha):.1f}°, "
-                        f"theta={math.degrees(theta):.1f}°, heading={math.degrees(heading):.1f}°")
+                current_radius = 10.0 # Grand rayon (Recalage)
 
+            # On ne fait le SLAM que si nécessaire ou périodiquement
+            # Ici on le fait à chaque fois mais avec un rayon adapté (c'est plus fluide)
+            
+            current_guess = np.array([self.current_pose[0], self.current_pose[1], self.current_pose[2]])
+            
+            # Appel avec le rayon dynamique
+            corrected_pose = self.run_scan_matching(current_guess, lidar_data, search_radius=current_radius)
+            
+            # Calcul du nouveau score pour le prochain tour
+            self.last_slam_score = self.calculate_scan_score(corrected_pose, lidar_data)
+
+            # --- SECURITE 2 : GATING (ANTI-SAUT) ---
+            # On calcule la distance entre la prédiction (Odométrie) et la correction (SLAM)
+            dist_correction = math.sqrt((corrected_pose[0] - current_guess[0])**2 + 
+                                        (corrected_pose[1] - current_guess[1])**2)
+            
+            # SEUIL DE REJET : Si le SLAM veut bouger le drone de plus de 20cm d'un coup,
+            # c'est probablement une erreur (faux positif). On rejette.
+            MAX_JUMP = 10.0 
+            
+            if dist_correction < MAX_JUMP:
+                # La correction est crédible, on l'applique
+                self.current_pose[0] = corrected_pose[0]
+                self.current_pose[1] = corrected_pose[1]
+                self.current_pose[2] = corrected_pose[2]
+                
+                # Feedback vers Kalman
+                self.kf_state[0] = corrected_pose[0]
+                self.kf_state[1] = corrected_pose[1]
+            else:
+                # SLAM rejeté : on fait confiance à l'odométrie pour ce tour
+                # Optionnel : print("SLAM JUMP REJECTED")
+                pass
+
+        # ---------------------------------------------------------
+        # ÉTAPE 5 : UPDATE FINAL
+        # ---------------------------------------------------------
+        self.estimated_pose = Pose(
+            np.array([self.current_pose[0], self.current_pose[1]]), 
+            self.current_pose[2]
+        )
+
+    def calculate_scan_score(self, candidate_pose, lidar_distances):
+        """
+        Calcule la cohérence entre les mesures lidar et la carte pour une pose donnée.
+        """
+        score = 0
+        
+        # 1. RECUPERATION DES DONNEES
+        # lidar_distances est le tableau numpy passé en argument
+        # Les angles sont fixes et stockés dans l'objet capteur du drone
+        lidar_angles = self.lidar().ray_angles
+        
+        # 2. DOWNSAMPLING (Optimisation : on ne prend qu'un point sur 5)
+        # On doit appliquer le même masque aux distances et aux angles
+        distances = lidar_distances[::5]
+        angles = lidar_angles[::5]
+        
+        # 3. CALCUL GEOMETRIQUE
+        x_r, y_r = candidate_pose[0], candidate_pose[1]
+        theta_r = candidate_pose[2]
+        
+        # Angle global de chaque rayon = angle du rayon + orientation du drone
+        global_angles = angles + theta_r
+        
+        # Coordonnées des points d'impact dans le repère global (Monde)
+        x_points = x_r + distances * np.cos(global_angles)
+        y_points = y_r + distances * np.sin(global_angles)
+        
+        # 4. VÉRIFICATION SUR LA GRILLE
+        max_range = MAX_RANGE_LIDAR_SENSOR # Utilisez la constante importée
+        
+        for i in range(len(x_points)):
+            dist = distances[i]
+            
+            # FILTRAGE :
+            # - Si la distance est NaN (pas d'écho), on ignore
+            # - Si la distance est trop grande (max range), on ignore
+            if np.isnan(dist) or dist >= max_range: 
+                continue 
+            
+            # Conversion Monde -> Grille
+            # (Adaptez _conv_world_to_grid selon votre implémentation exacte de grid)
+            grid_pos = self.grid._conv_world_to_grid(x_points[i], y_points[i])
+            gy, gx = int(grid_pos[0]), int(grid_pos[1])
+            
+            # Vérification des bornes du tableau numpy de la grille
+            if 0 <= gy < self.grid.grid.shape[0] and 0 <= gx < self.grid.grid.shape[1]:
+                # On lit la probabilité d'occupation (0.0 à 1.0)
+                val = self.grid.grid[gy, gx]
+                
+                # On ajoute au score. 
+                # Si val proche de 1 (mur), le score augmente beaucoup.
+                # Si val proche de 0 (libre), le score augmente peu.
+                score += val
+                
+        return score
+
+    def run_scan_matching(self, initial_pose, lidar_data, search_radius=10.0):
+        
+        best_pose = np.copy(initial_pose)
+        best_score = self.calculate_scan_score(best_pose, lidar_data)
+        
+        # On garde vos paramètres optimisés, mais on utilise le rayon variable
+        step_size = 3.0       
+        angle_search = 0.05    
+        angle_step = 0.05
+        
+        # Utilisation de search_radius passé en argument
+        for dx in np.arange(-search_radius, search_radius + 0.1, step_size):
+            for dy in np.arange(-search_radius, search_radius + 0.1, step_size):
+                for dtheta in np.arange(-angle_search, angle_search + 0.001, angle_step):
+                    
+                    # On ne teste pas la position (0,0,0) car c'est déjà fait
+                    if dx == 0 and dy == 0 and dtheta == 0: continue
+                    
+                    candidate = np.array([
+                        initial_pose[0] + dx,
+                        initial_pose[1] + dy,
+                        normalize_angle(initial_pose[2] + dtheta)
+                    ])
+                    
+                    score = self.calculate_scan_score(candidate, lidar_data)
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_pose = candidate
+                        
+        return best_pose
 
     def process_communication_sensor(self):
         """
