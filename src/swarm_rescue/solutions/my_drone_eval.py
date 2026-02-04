@@ -1,3 +1,4 @@
+from swarm_rescue.solutions.my_drone_lidar_communication import MyDroneLidarCommunication
 from swarm_rescue.solutions.my_drone_prototype import MyDronePrototype
 
 

@@ -27,8 +27,8 @@ class MapIntermediate02(MapAbstract):
 
     def __init__(self, drone_type: Type[DroneAbstract], zones_config: ZonesConfig = ()):
         super().__init__(drone_type, zones_config)
-        self._max_timestep_limit = 2700
-        self._max_walltime_limit = 270  # In seconds
+        self._max_timestep_limit = 5000
+        self._max_walltime_limit = 500  # In seconds
 
         # PARAMETERS MAP
         self._size_area = (1200, 500)

@@ -125,6 +125,12 @@ class MyDronePrototype(DroneAbstract):
         #tracking grasped wounded angle for better approach
         self.grasped_wounded_angle = None 
 
+        # --- Dead Drones / Kill Zones Detection ---
+        self.dead_drones = []  # Confirmed dead drones (x, y)
+        self.suspected_dead_drones = [] # Candidates: {'pos': (x,y), 'first_seen_iter': int, 'last_seen_iter': int}
+        self.dead_drone_radius = 60.0 # Radius to match a drone
+        self.dead_confirm_iterations = 5 # How many iterations of immobility to confirm death
+
 
 
 
@@ -382,7 +388,8 @@ class MyDronePrototype(DroneAbstract):
     
         # Base message (sent every iteration)
         message = {
-            "drone_id": self.identifier,  
+            "drone_id": self.identifier,
+            "status": "alive",
             "drone_pose": self.current_pose.tolist(),
             "wounded_assignments": self.wounded_assignments,
             "grasped_wounded": list(grasped_positions),
@@ -565,7 +572,7 @@ class MyDronePrototype(DroneAbstract):
                     self.path = []
 
             # Replan every 30 iterations to adapt to updated wounded position
-            if self.current_target_wounded is not None and self.iteration % 30 == 0:
+            if self.current_target_wounded is not None and (self.iteration % 30 == 0 or not self.path):
                 # RECALCULATE PATH REGULARLY
                 self.path = self.creer_chemin(self.current_pose[:2], self.current_target_wounded)
                 self.last_replan_iteration = self.iteration
@@ -1002,6 +1009,166 @@ class MyDronePrototype(DroneAbstract):
         # Merge newly seen rescue centers
         for nx, ny in newly_seen_rescue:
             self._add_or_merge_rescue_point((nx, ny))
+            
+        # --- DETECT DEAD DRONES ---
+        self.detect_dead_drones(detections, px, py, ptheta)
+
+    def detect_dead_drones(self, detections, px, py, ptheta):
+        """
+        Identify drones that are visible but not communicating and not moving.
+        """
+        # 1. Collect positions of communicating "alive" drones
+        alive_drones_positions = []
+        for msg in getattr(self.communicator, "received_messages", []):
+            if isinstance(msg, dict):
+                 data = msg
+            elif isinstance(msg, tuple):
+                 data = msg[1]
+            else:
+                 continue
+            
+            p = data.get("drone_pose")
+            if p is not None:
+                alive_drones_positions.append(np.array(p[:2]))
+
+        # 2. Process Semantic Detections for Drones
+        visible_drones = []
+        for data in detections:
+             if data.entity_type == DroneSemanticSensor.TypeEntity.DRONE:
+                global_angle = normalize_angle(ptheta + data.angle)
+                xd = px + data.distance * math.cos(global_angle)
+                yd = py + data.distance * math.sin(global_angle)
+                visible_drones.append(np.array([xd, yd]))
+        
+        # 3. Filter visible drones
+        for v_drone_pos in visible_drones:
+            # A. Check if it corresponds to a communicating drone
+            min_dist_alive = float('inf')
+            if alive_drones_positions:
+                dists = [np.linalg.norm(v_drone_pos - ap) for ap in alive_drones_positions]
+                min_dist_alive = min(dists)
+
+            if min_dist_alive < self.dead_drone_radius:
+                continue
+
+            # B. Check if it corresponds to an already known DEAD drone
+            is_known_dead = False
+            for dead_pos in self.dead_drones:
+                if np.linalg.norm(v_drone_pos - np.array(dead_pos)) < self.dead_drone_radius:
+                    is_known_dead = True
+                    break
+            
+            if is_known_dead:
+                continue
+            
+            # C. It is silent and unknown. Check suspects.
+            matched_suspect = None
+            for suspect in self.suspected_dead_drones:
+                if np.linalg.norm(v_drone_pos - np.array(suspect['pos'])) < self.dead_drone_radius:
+                    matched_suspect = suspect
+                    break
+            
+            if matched_suspect:
+                # Update suspect
+                # Check for movement (if it moved too much from start, reset/remove)
+                # But here we just update 'last_seen_pos' effectively by confirming it is still there.
+                # Actually, we should check if the NEW position is close to the START position of the suspect.
+                # If it drifted significantly, maybe it's moving slowly?
+                # For now, we update last_seen_iter.
+                
+                dist_from_start = np.linalg.norm(v_drone_pos - np.array(matched_suspect['start_pos']))
+                if dist_from_start > 30.0: # It moved > 30px since first seen
+                    # It is moving, so not dead in the "static" sense. Remove from suspects.
+                    print(f"[{self.identifier}] Suspect moved {dist_from_start:.1f}px - REMOVING")
+                    self.suspected_dead_drones.remove(matched_suspect)
+                else:
+                    matched_suspect['last_seen_iter'] = self.iteration
+                    matched_suspect['pos'] = (v_drone_pos[0], v_drone_pos[1]) # Update current pos estimate
+                    
+                    # Check confirmation condition
+                    if (self.iteration - matched_suspect['first_seen_iter']) > self.dead_confirm_iterations:
+                        # CONFIRMED DEAD
+                        print(f"[{self.identifier}] *** CONFIRMED DEAD DRONE at ({matched_suspect['pos'][0]:.1f}, {matched_suspect['pos'][1]:.1f}) ***")
+                        self.dead_drones.append(matched_suspect['pos'])
+                        self.suspected_dead_drones.remove(matched_suspect)
+
+                        # FORCE REPLANNING to avoid the newly discovered kill zone
+                        print(f"[{self.identifier}] -> Clearing path to force replanning around kill zone.")
+                        self.path = []
+            
+            else:
+                # Create new suspect
+                print(f"[{self.identifier}] VISIBLE DRONE WITHOUT RADIO SIGNAL at ({v_drone_pos[0]:.1f}, {v_drone_pos[1]:.1f})")
+                print(f"[{self.identifier}] (Nearest radio signal: {min_dist_alive:.1f})")
+                print(f"[{self.identifier}] ??? SUSPECTED DEAD DRONE initialized ???")
+                self.suspected_dead_drones.append({
+                    'pos': (v_drone_pos[0], v_drone_pos[1]),
+                    'start_pos': (v_drone_pos[0], v_drone_pos[1]),
+                    'first_seen_iter': self.iteration,
+                    'last_seen_iter': self.iteration
+                })
+        
+        # Cleanup suspects not seen for a while (e.g. they moved out of view)
+        # We can keep them or drop them. If we lost visual, we can't confirm they are dead static.
+        self.suspected_dead_drones = [
+            s for s in self.suspected_dead_drones 
+            if (self.iteration - s['last_seen_iter']) < 10
+        ]
+
+        # 5. Cleanup Dead Drones that disappeared (False Positives correction)
+        drones_to_remove = []
+        for dead_pos in self.dead_drones:
+            # Check if we are close enough to theoretically see it (approx range check)
+            if np.linalg.norm(np.array(dead_pos) - np.array([px, py])) < 150.0:
+                # Check if we actually see a drone at that position
+                is_still_there = False
+                for v_pos in visible_drones:
+                    if np.linalg.norm(v_pos - np.array(dead_pos)) < self.dead_drone_radius:
+                        is_still_there = True
+                        break
+                
+                if not is_still_there:
+                    print(f"[{self.identifier}] Dead drone at ({dead_pos[0]:.1f}, {dead_pos[1]:.1f}) disappeared - REMOVING KILL ZONE")
+                    drones_to_remove.append(dead_pos)
+        
+        for d in drones_to_remove:
+            self.dead_drones.remove(d)
+
+        # 4. Apply Virtual Walls for Confirmed Dead Drones (The Bubble)
+        if self.dead_drones:
+            grid_h, grid_w = self.grid.grid.shape
+            radius_cells = int(50.0 / self.grid.resolution)
+            val_wall = 100.0 # Very high value for virtual wall
+
+            y, x = np.ogrid[-radius_cells:radius_cells+1, -radius_cells:radius_cells+1]
+            mask = x**2 + y**2 <= radius_cells**2
+
+            for dx_world, dy_world in self.dead_drones:
+                # Get grid indices
+                res = self.grid._conv_world_to_grid(dx_world, dy_world)
+                
+                # Handling return type (can be float array or tuple)
+                r_idx = int(res[0])
+                c_idx = int(res[1])
+
+                # Calculate bounds
+                r_min = max(0, r_idx - radius_cells)
+                r_max = min(grid_h, r_idx + radius_cells + 1)
+                c_min = max(0, c_idx - radius_cells)
+                c_max = min(grid_w, c_idx + radius_cells + 1)
+
+                # Adjust mask for boundary clipping
+                mask_r_min = r_min - (r_idx - radius_cells)
+                mask_r_max = mask_r_min + (r_max - r_min)
+                mask_c_min = c_min - (c_idx - radius_cells)
+                mask_c_max = mask_c_min + (c_max - c_min)
+
+                if r_max > r_min and c_max > c_min:
+                    # Apply wall to grid
+                    region = self.grid.grid[r_min:r_max, c_min:c_max]
+                    region_mask = mask[mask_r_min:mask_r_max, mask_c_min:mask_c_max]
+                    region[region_mask] = val_wall
+
 
 
     # --------------------------------------------------------------------------
