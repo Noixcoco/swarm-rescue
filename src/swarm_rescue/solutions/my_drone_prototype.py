@@ -125,7 +125,7 @@ class MyDronePrototype(DroneAbstract):
         # --- KILL ZONE DETECTION ---
         self.drone_last_heard = {}  # {drone_id: {"iteration": int, "position": (x,y)}}
         self.known_kill_zones = []  # List of (x, y) tuples marking death locations
-        self.DEATH_TIMEOUT = 8 # 100 iterations = ~10 seconds of silence
+        self.DEATH_TIMEOUT = 50 # 100 iterations = ~10 seconds of silence
         self.kill_zone_grid = None
         self.declared_dead_drones = set() 
         self.drone_position_history = {}    #to estimate kill zone position
@@ -213,7 +213,7 @@ class MyDronePrototype(DroneAbstract):
         # This treats other drones as "walls" for the pathfinder
         if hasattr(self, 'other_drones_positions') and self.other_drones_positions:
         
-            DRONE_OBSTACLE_RADIUS = 85.0 
+            DRONE_OBSTACLE_RADIUS = 40.0 
             radius_cells = int(DRONE_OBSTACLE_RADIUS / self.grid.resolution)
             
             for other_info in self.other_drones_positions:
@@ -917,18 +917,11 @@ class MyDronePrototype(DroneAbstract):
                                 found_path = True
                                 break
                         if not found_path:
-                            print(f"[{self.identifier}] No reachable frontiers - Going to return area!")
-                            if self.return_area_points:
-                                target_index = int(self.identifier) % len(self.return_area_points)
-                                target_zone = self.return_area_points[target_index]
-                                self.target_point = target_zone
-                                self.path = self.creer_chemin(self.current_pose[:2], target_zone, explored_only=True)
-                                self.state = self.Activity.GOING_TO_RETURN_AREA
-                            else:
-                                print(f"[{self.identifier}] No return area points available!")
+                            self.go_to_return_area(lidar_data)
                     else:
-                        print(f"[{self.identifier}] MAP FULLY EXPLORED - Going to return area!")
+                        self.go_to_return_area(lidar_data)
 
+        command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0} 
 
         # Generate movement commands based on current state
         if self.state == self.Activity.EXPLORING:
@@ -936,8 +929,8 @@ class MyDronePrototype(DroneAbstract):
                 command = self.follow_path(lidar_data)
 
             else:
-                print("bug here")
-                command = {"forward": 0.3, "lateral": 0.0, "rotation": 0.0}
+                self.go_to_return_area(lidar_data)
+                
 
         elif self.state == self.Activity.GOING_TO_WOUNDED:
 
@@ -961,6 +954,13 @@ class MyDronePrototype(DroneAbstract):
             else:
                 command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
 
+        elif self.state == self.Activity.GOING_TO_RETURN_AREA:
+            if self.path:
+                command = self.follow_path(lidar_data)
+            else:
+                # Si le chemin est fini ou invalide, on retente de cibler la zone
+                self.go_to_return_area(lidar_data)
+
 
 
 ########## GRASPER LOGIC ############
@@ -968,7 +968,7 @@ class MyDronePrototype(DroneAbstract):
         if self.state == self.Activity.GOING_TO_WOUNDED or self.state == self.Activity.GOING_TO_RESCUE_CENTER:
             command["grasper"] = 1
         else:
-            command["grasper"] = 0
+            self.grasper._release_grasping()
 
 
         # Dynamic replanning if other drones are too close to current path
@@ -1599,20 +1599,15 @@ class MyDronePrototype(DroneAbstract):
                     # We need to find the kill zone closest to where we last heard from them
                     if other_id in self.drone_last_heard:
                         false_death_pos = self.drone_last_heard[other_id]["position"]
-                        
-                        # Remove from known_kill_zones list
-                        kill_zones_to_remove = []
-                        for kz_pos in self.known_kill_zones:
-                            if math.hypot(false_death_pos[0] - kz_pos[0], 
-                                        false_death_pos[1] - kz_pos[1]) < 100.0:
-                                kill_zones_to_remove.append(kz_pos)
-                        
-                        for kz in kill_zones_to_remove:
-                            self.known_kill_zones.remove(kz)
-                            print(f"[{self.identifier}] Removed kill zone at {kz}")
-                        
-                        # Clear the kill zone from the grid
                         self.clear_kill_zone_from_grid(false_death_pos)
+
+                        
+                    self.known_kill_zones = [
+                                kz for kz in self.known_kill_zones 
+                                if math.hypot(false_death_pos[0] - kz[0], false_death_pos[1] - kz[1]) > 150.0
+        ]
+                        
+
 
 
                 # Update last heard status
@@ -2119,44 +2114,45 @@ class MyDronePrototype(DroneAbstract):
 
 
     def clear_kill_zone_from_grid(self, false_death_pos):
-        """
-        Remove a kill zone from both grids when a false positive is detected.
-        """
-        try:
-            if self.kill_zone_grid is None:
-                return
-            
-            # Use same size calculation as marking
-            SAFETY_MARGIN = 1.5
-            ASSUMED_TRAVEL_DISTANCE = 150.0
-            square_size = ASSUMED_TRAVEL_DISTANCE * SAFETY_MARGIN
-            
-            # Convert world position to grid coordinates
-            grid_pos = self.grid._conv_world_to_grid(false_death_pos[0], false_death_pos[1])
-            center_y, center_x = int(grid_pos[0]), int(grid_pos[1])
-            
-            # Calculate SQUARE bounds (in GRID CELLS)
-            size_cells = int(square_size / self.grid.resolution)
-            half_size = size_cells // 2
-            
-            y0 = max(0, center_y - half_size)
-            y1 = min(self.grid.grid.shape[0], center_y + half_size)
-            x0 = max(0, center_x - half_size)
-            x1 = min(self.grid.grid.shape[1], center_x + half_size)
-            
-            # CLEAR from both grids
-            self.kill_zone_grid[y0:y1, x0:x1] = 0.0      # Remove permanent record
-            # self.grid.grid[y0:y1, x0:x1] = 0.0
-            # Don't reset grid.grid values - let lidar naturally re-explore
-            # This is safer than guessing what the values should be
-            
-            print(f"[{self.identifier}] Cleared kill zone area at {false_death_pos}")
-            print(f"    Grid bounds cleared: y[{y0}:{y1}], x[{x0}:{x1}]")
-            
-        except Exception as e:
-            print(f"[{self.identifier}] Error clearing kill zone: {e}")
-            import traceback
-            traceback.print_exc()
+            try:
+                if self.kill_zone_grid is None:
+                    return
+                
+                # Utiliser la même taille que lors du marquage (150px par défaut dans votre code)
+                ASSUMED_TRAVEL_DISTANCE = 150.0
+                SAFETY_MARGIN = 1.5
+                square_size = ASSUMED_TRAVEL_DISTANCE * SAFETY_MARGIN
+                
+                grid_pos = self.grid._conv_world_to_grid(false_death_pos[0], false_death_pos[1])
+                center_y, center_x = int(grid_pos[0]), int(grid_pos[1])
+                
+                size_cells = int(square_size / self.grid.resolution)
+                half_size = size_cells // 2
+                
+                y0 = max(0, center_y - half_size)
+                y1 = min(self.grid.grid.shape[0], center_y + half_size)
+                x0 = max(0, center_x - half_size)
+                x1 = min(self.grid.grid.shape[1], center_x + half_size)
+                
+                # --- CORRECTION : Remplacer par une valeur "Explored Free" ---
+                # Dans votre code, SEUIL_FREE est à -5.0. On met -10.0 pour être sûr.
+                VALEUR_EXPLORED_FREE = -10.0
+                
+                # 1. On efface le masque de la kill zone
+                self.kill_zone_grid[y0:y1, x0:x1] = 0.0
+                
+                # 2. On remplace les murs artificiels par du vide exploré dans la grille de navigation
+                # On ne le fait que là où il y avait un mur de Kill Zone (valeur 100.0)
+                # pour ne pas effacer les vrais murs physiques aux alentours.
+                mask_to_clear = (self.grid.grid[y0:y1, x0:x1] >= 100.0)
+                self.grid.grid[y0:y1, x0:x1][mask_to_clear] = VALEUR_EXPLORED_FREE
+                
+                print(f"[{self.identifier}] Kill zone cleared and grid restored to free space at {false_death_pos}")
+                
+            except Exception as e:
+                print(f"[{self.identifier}] Error clearing kill zone: {e}")
+
+
 
     def get_wounded_orientation(self):
         try:
@@ -2202,12 +2198,23 @@ class MyDronePrototype(DroneAbstract):
         nx, ny = new_point
         # Radius to consider a point "already known"
         DEDUP_RADIUS = 50.0 
+        #make distance from rescue center to avoid traffic jam near rescue center
+        MIN_DIST_FROM_RESCUE = 170.0
 
+
+        if hasattr(self, 'rescue_zone_points') and self.rescue_zone_points:
+                    for (xr, yr) in self.rescue_zone_points:
+                        dist_to_rescue = math.hypot(nx - xr, ny - yr)
+                        # Si le point est trop proche d'un centre de secours, on l'ignore
+                        if dist_to_rescue < MIN_DIST_FROM_RESCUE:
+                            return
+                        
         # 1. Check against ALL existing points
         for (rx, ry) in self.return_area_points:
             dist = math.hypot(rx - nx, ry - ny)
             if dist < DEDUP_RADIUS:
                 return
+            
 
         # 2. If we are here, it is a completely NEW area.
         self.return_area_points.append((nx, ny))
@@ -2236,3 +2243,20 @@ class MyDronePrototype(DroneAbstract):
                 self.target_point = np.array(target_world)
                 print(f"[{self.identifier}] [FALLBACK] Moving to nearest unexplored cell at {target_world}")
                 return
+            
+
+    def go_to_return_area(self, lidar_data) -> CommandsDict:
+        """
+        Helper: Set target and path to go to the return area.
+        """
+        if self.return_area_points:
+            target_index = int(self.identifier) % len(self.return_area_points)
+            target_zone = self.return_area_points[target_index]
+            self.target_point = target_zone
+            self.path = self.creer_chemin(self.current_pose[:2], target_zone, explored_only=True)
+            self.state = self.Activity.GOING_TO_RETURN_AREA
+
+            return self.follow_path(lidar_data) if lidar_data is not None else {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
+        else:
+            print(f"[{self.identifier}] No return area points available!")
+            
