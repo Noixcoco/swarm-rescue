@@ -48,11 +48,11 @@ class MyDronePrototype(DroneAbstract):
         
         # parametre PID rotation
         self.prev_angle_error = 0.0
-        self.Kp = 5.0
-        self.Kd = 3.0
+        self.Kp = 5
+        self.Kd = 3
 
         # PID translation
-        self.Kp_pos = 6.0
+        self.Kp_pos = 7.0
         self.Kd_pos = 11.0
         self.prev_speed_error = 0.0
         self.prev_lat_error = 0.0
@@ -125,7 +125,7 @@ class MyDronePrototype(DroneAbstract):
         # --- KILL ZONE DETECTION ---
         self.drone_last_heard = {}  # {drone_id: {"iteration": int, "position": (x,y)}}
         self.known_kill_zones = []  # List of (x, y) tuples marking death locations
-        self.DEATH_TIMEOUT = 100 # 100 iterations = ~10 seconds of silence
+        self.DEATH_TIMEOUT = 50 # 100 iterations = ~10 seconds of silence
         self.kill_zone_grid = None
         self.declared_dead_drones = set() 
         self.drone_position_history = {}    #to estimate kill zone position
@@ -168,9 +168,9 @@ class MyDronePrototype(DroneAbstract):
         goal = tuple(map(int, goal))
 
         # --- FIXED THRESHOLDS ---
-        SEUIL_MUR = 3.0
+        SEUIL_MUR = 4.01
         SEUIL_FREE = -5.0  # Free cells are BELOW this threshold
-        SEUIL_UNEXPLORED_MAX = 2.99  # Unexplored cells are near 0 (between -4 and +4)
+        SEUIL_UNEXPLORED_MAX = 4.0  # Unexplored cells are near 0 (between -4 and +4)
         SEUIL_UNEXPLORED_MIN = -4.99
     
         # Masque des murs (high positive values)
@@ -186,7 +186,7 @@ class MyDronePrototype(DroneAbstract):
         is_unexplored = (grid >= SEUIL_UNEXPLORED_MIN) & (grid <= SEUIL_UNEXPLORED_MAX)
         
         # Dilate les murs pour éviter les zones proches
-        struct = np.ones((6, 6), dtype=bool)
+        struct = np.ones((5, 5), dtype=bool)
         danger_zone = binary_dilation(is_wall, structure=struct, iterations=1)
 
 
@@ -203,13 +203,43 @@ class MyDronePrototype(DroneAbstract):
         comfort_dist_cells = COMFORT_DISTANCE_WORLD / self.grid.resolution
         
         # Max penalty to apply if we are right next to the wall
-        MAX_PENALTY = 100.0
+        MAX_PENALTY = 50.0
 
         
         # --- MODIFIED DRONE AVOIDANCE ZONE - ONLY AVOID DRONES IN FRONT ---
         # Cache drone danger zone for a few iterations if positions haven't changed
        
-        # (Drone obstacle avoidance removed as per request)
+        # --- NEW: ADD OTHER DRONES AS TEMPORARY OBSTACLES ---
+        # This treats other drones as "walls" for the pathfinder
+        if hasattr(self, 'other_drones_positions') and self.other_drones_positions:
+        
+            DRONE_OBSTACLE_RADIUS = 40.0 
+            radius_cells = int(DRONE_OBSTACLE_RADIUS / self.grid.resolution)
+            
+            for other_info in self.other_drones_positions:
+                other_pos = other_info[0]
+                
+                # Only consider drones that are somewhat close (optimization)
+                # e.g., within 200 pixels. Far away drones don't matter.
+                if math.hypot(other_pos[0] - start_world[0], other_pos[1] - start_world[1]) > 200.0:
+                    continue
+
+                try:
+                    # Convert drone world pos to grid
+                    p_grid = self.grid._conv_world_to_grid(other_pos[0], other_pos[1])
+                    py, px = int(p_grid[0]), int(p_grid[1])
+                    
+                    # Define a square around the drone
+                    y0 = max(0, py - radius_cells)
+                    y1 = min(grid.shape[0], py + radius_cells + 1)
+                    x0 = max(0, px - radius_cells)
+                    x1 = min(grid.shape[1], px + radius_cells + 1)
+                    
+                    # Mark this area as BLOCKED
+                    danger_zone[y0:y1, x0:x1] = True
+                    
+                except Exception:
+                    continue
 
     
 
@@ -220,7 +250,7 @@ class MyDronePrototype(DroneAbstract):
         # Si le start ou le goal sont dans la danger_zone (par ex. drone collé au mur),
         # on autorise une petite zone autour d'eux pour permettre à A* de s'extraire.
         try:
-            radius_clear = 2  # Increased to 2 (from 1) to ensure connectivity if stuck
+            radius_clear = 1
             sx, sy = start
             gx, gy = goal
             x0 = max(0, sx - radius_clear)
@@ -315,8 +345,10 @@ class MyDronePrototype(DroneAbstract):
 
                 # Apply penalty if closer than comfort distance
                 if dist_to_wall_cells < comfort_dist_cells:
-                    proximity = 1.0 - (dist_to_wall_cells / comfort_dist_cells)
-                    penalty = MAX_PENALTY * (proximity ** 2)
+                    # Linear gradient: closer to wall = higher cost
+                    # 0 penalty at comfort distance, MAX_PENALTY at wall
+                    factor = 1.0 - (dist_to_wall_cells / comfort_dist_cells)
+                    penalty = MAX_PENALTY * factor
                 
                 move_cost = base_cost + penalty
                 # -----------------------------------------------
@@ -415,7 +447,7 @@ class MyDronePrototype(DroneAbstract):
             self._last_rescue_list = self.rescue_zone_points
     
         # Grid data: only every 20 iterations (was 10)
-        if self.iteration % 5 == 0:
+        if self.iteration % 20 == 0:
             message["grid_data"] = self.grid.grid.copy()
     
         # Removed wounded: only when non-empty
@@ -445,9 +477,6 @@ class MyDronePrototype(DroneAbstract):
 
         # increment the iteration counter
         self.iteration += 1
-
-        # INITIALIZE COMMAND HERE TO AVOID UNBOUNDLOCALERROR
-        command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0, "grasper": 0}
 
         # Process received messages from other drones
         self.process_communication_sensor()
@@ -555,7 +584,7 @@ class MyDronePrototype(DroneAbstract):
                             other_dist = np.linalg.norm(np.array(closest_wounded) - other_pose[:2])
                             
                             # If other drone is significantly closer (with margin), don't assign
-                            if other_dist < my_distance - 10.0:
+                            if other_dist < my_distance - 30.0:
                                 should_assign = False
                                 break
                             
@@ -611,7 +640,7 @@ class MyDronePrototype(DroneAbstract):
                             other_dist = np.linalg.norm(np.array(self.current_target_wounded) - other_pose[:2])
                             
                             # If another drone is now significantly closer, abandon
-                            if other_dist < my_dist - 10.0:  # Larger margin during approach
+                            if other_dist < my_dist - 50.0:  # Larger margin during approach
                                 should_abandon = True
                                 winner_id = other_id
                                 break
@@ -805,90 +834,110 @@ class MyDronePrototype(DroneAbstract):
         # Replanification for exploration (only when in EXPLORING state)
         if self.state == self.Activity.EXPLORING:
             need_replan = False
-            
             if not self.path or len(self.path) < 1:
                 need_replan = True
+
+        #no too much replanning if already have a target
             elif hasattr(self, 'target_point') and self.target_point is not None:
                 dist_to_target = np.linalg.norm(self.target_point - self.current_pose[:2])
+                
+                # Si on est encore loin de la cible (> 150px), on n'autorise la 
+                # replanification que toutes les 100 itérations (au lieu de 30)
                 if dist_to_target > 200.0:
                     if self.iteration % 100 == 0:
                         need_replan = True
+                # Si on est proche, on finit le travail sans changer d'avis !
                 else:
                     need_replan = False
 
             if need_replan:
-                # --- FUSION DES CIBLES (Locales + Partagées) ---
-                local_frontiers = self.find_safe_frontier_points()
+                # Use shared frontier clusters from communication
                 shared_clusters = getattr(self, "shared_frontier_barycenters", [])
                 
-                # On crée une liste globale de candidats
-                all_candidates = []
-                
-                # Ajout des partagés
-                for bc in shared_clusters:
-                    all_candidates.append({"point": np.array(bc), "source": "shared"})
-                
-                # Ajout des locaux s'ils ne font pas doublon (rayon 40px)
-                for lf in local_frontiers:
-                    if not any(np.linalg.norm(lf - c["point"]) < 40.0 for c in all_candidates):
-                        all_candidates.append({"point": lf, "source": "local"})
-
-                if all_candidates:
-                    # --- CALCUL DU MEILLEUR SCORE ---
-                    scored_targets = []
+                if shared_clusters:
+                    barycenters = [np.array(bc) for bc in shared_clusters]
                     
-                    # Récupération des positions des autres pour les pénalités
+                    # Get assignments from other drones
                     assigned_targets = {}
                     for msg in getattr(self.communicator, "received_messages", []):
                         other = msg[1] if isinstance(msg, tuple) else msg
+                        other_id = other.get("drone_id")
                         other_assignments = other.get("assigned_barycenters", {})
-                        for drone_id_str, target in other_assignments.items():
-                            if int(drone_id_str) != self.identifier:
-                                assigned_targets[int(drone_id_str)] = np.array(target)
-
-                    for cand in all_candidates:
-                        p = cand["point"]
-                        distance = np.linalg.norm(p - self.current_pose[:2])
                         
-                        # Ton calcul de pénalité de conflit
+                        if other_id != self.identifier:
+                            for drone_id_str, target in other_assignments.items():
+                                assigned_targets[int(drone_id_str)] = np.array(target)
+    
+                    best_score = float('inf')
+                    best_target = barycenters[0]
+                    
+                    min_separation = 300.0  # Minimum distance between drone targets
+                    
+                    for bc in barycenters:
+                        distance = np.linalg.norm(bc - self.current_pose[:2])
                         conflict_penalty = 0.0
                         for other_target in assigned_targets.values():
-                            if np.linalg.norm(p - other_target) < 300.0:
-                                conflict_penalty += 10000.0
+                            dist_to_assigned = np.linalg.norm(bc - other_target)
+                            if dist_to_assigned < min_separation:
+                                conflict_penalty += 10000.0  # Heavy penalty
 
-                        # Bonus de taille (uniquement si on a l'info en local)
-                        size_bonus = 0.0
+                        cluster_size = 10  # Default if size unknown
                         for cluster in self.frontier_clusters:
-                            if np.linalg.norm(cluster["barycenter"] - p) < 20:
-                                size_bonus = -cluster["size"] * 50.0
+                            if np.linalg.norm(cluster["barycenter"] - bc) < 20:
+                                cluster_size = cluster["size"]
                                 break
-                        
-                        score = distance + conflict_penalty + size_bonus
-                        scored_targets.append({"point": p, "score": score})
 
-                    # Tri par score (le plus petit est le meilleur)
-                    scored_targets.sort(key=lambda x: x["score"])
+                        # Reward large clusters (subtract bonus)
+                        size_bonus = -cluster_size * 50.0
 
-                    # --- BOUCLE DE TENTATIVE (REPLI) ---
-                    found_path = False
-                    for target_info in scored_targets:
-                        path = self.creer_chemin(self.current_pose[:2], target_info["point"])
-                        if path:
-                            self.target_point = target_info["point"]
-                            self.path = path
-                            found_path = True
-                            break # Cible trouvée, on sort de la boucle !
+                        drone_penalty = 0.0
+                        if hasattr(self, 'other_drones_positions') and self.other_drones_positions:
+                            for drone_pos in self.other_drones_positions:
+                                dist_drone_to_frontier = np.linalg.norm(bc - np.array(drone_pos[0][:2]))
+                                if dist_drone_to_frontier < 200.0:
+                                    drone_penalty += 800.0 / (dist_drone_to_frontier + 1.0)
+
+                        # Cost: lower is better
+                        score = distance + conflict_penalty + drone_penalty + size_bonus
+
+                        if score < best_score:
+                            best_score = score
+                            best_target = bc
+
+        
+                    self.target_point = best_target
+                    self.path = self.creer_chemin(self.current_pose[:2], best_target)
                     
-                    if not found_path:
-                        self.go_to_return_area(lidar_data)
+                
                 else:
-                    self.go_to_return_area(lidar_data)
+                    # FALLBACK: Use local frontier detection
+                    print(f"[{self.identifier}] [DEBUG] No shared clusters, using local frontiers.")
+                    local_frontiers = self.find_safe_frontier_points() 
+                    if local_frontiers:
+                        print(f"[{self.identifier}] [DEBUG] Local frontiers found: {local_frontiers}")
+                        found_path = False
+                        # Try each frontier in order of proximity
+                        distances = [np.linalg.norm(f - self.current_pose[:2]) for f in local_frontiers]
+                        for idx in np.argsort(distances):
+                            target_point = local_frontiers[idx]
+                            path = self.creer_chemin(self.current_pose[:2], target_point)
+                            if path:
+                                self.target_point = target_point
+                                self.path = path
+                                found_path = True
+                                break
+                        if not found_path:
+                            self.go_to_return_area(lidar_data)
+                    else:
+                        self.go_to_return_area(lidar_data)
 
+        command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0} 
 
         # Generate movement commands based on current state
         if self.state == self.Activity.EXPLORING:
             if self.path:   
                 command = self.follow_path(lidar_data)
+
             else:
                 self.go_to_return_area(lidar_data)
                 
@@ -959,7 +1008,7 @@ class MyDronePrototype(DroneAbstract):
         # This will override/modify the command to push us away from collisions
         command = self.drone_repulsion(command)
 
-        if self.iteration % 5 == 0:
+        if self.iteration % 50 == 0:
             self.grid.display(self.grid.zoomed_grid,
                               self.estimated_pose,
                               title="zoomed occupancy grid")
@@ -1030,66 +1079,98 @@ class MyDronePrototype(DroneAbstract):
     # --------------------------------------------------------------------------
     # FONCTION DE DÉTECTION DES FRONTIÈRES SÛRES 
     # --------------------------------------------------------------------------
+
     def find_safe_frontier_points(self) -> list:
+        
+        grid_map = self.grid.grid 
+        
+        # RELAXED THRESHOLDS - Encourage exploring unexplored areas
+        SEUIL_FREE = -3.0        # Lightly explored (was -7.0)
+        SEUIL_MUR = 6.0         
+        SEUIL_UNEXPLORED_MIN = -2.99  # Wider unexplored range
+        SEUIL_UNEXPLORED_MAX = 5.99
+    
+        frontiers = []
 
-            grid_map = self.grid.grid 
+        # Masks
+        is_unknown = (grid_map >= SEUIL_UNEXPLORED_MIN) & (grid_map <= SEUIL_UNEXPLORED_MAX)
+        is_wall = (grid_map >= SEUIL_MUR)  
+        is_free = (grid_map < SEUIL_FREE) # Lightly explored areas
+        
+        # KEY: Exclude heavily explored dark blue corridor
+        is_heavily_explored = (grid_map < -40.0)
+
+        # Frontier detection
+        structure = np.array([[0,1,0],
+                          [1,1,1],
+                          [0,1,0]], dtype=bool)
+
+        unknown_neighbors = binary_dilation(is_unknown, structure=structure)
+        
+        # FIXED: Find free cells near unexplored, but NOT in heavily explored corridor
+        frontier_mask = is_free & (~is_heavily_explored) & unknown_neighbors
+
+        # Safety margin around walls
+        struct = np.ones((5, 5), dtype=bool)
+        danger_zone = binary_dilation(is_wall, structure=struct, iterations=2)
+        frontier_mask = frontier_mask & (~danger_zone)
+
+        # Clustering
+        structure = generate_binary_structure(2, 2)
+        labeled, num_features = ndimage.label(frontier_mask, structure=structure)
+
+        self.frontier_clusters = []
+        min_cluster_size = 3
+
+        min_distance = float('inf')
+        closest_cluster = None
+
+        for label_idx in range(1, num_features + 1):
+            ys, xs = np.where(labeled == label_idx)
+            size = ys.size
+            if size < min_cluster_size:
+                continue
+
+            mean_x = float(np.mean(ys))
+            mean_y = float(np.mean(xs))
+            x_world, y_world = self.grid._conv_grid_to_world(mean_x, mean_y)
+            barycenter = np.array([x_world, y_world])
             
-            # --- 1. CALCUL DU GRADIENT OPTIMISÉ ---
-            dx = ndimage.sobel(grid_map, axis=1)
-            dy = ndimage.sobel(grid_map, axis=0)
-
-            mag_sq = dx**2 + dy**2
-            frontier_mask = (mag_sq > 25.0)
-
-            # --- 2. FILTRAGE VECTORISÉ (PAS DE BOUCLE) ---
- 
-            is_wall = (grid_map >= 4.0) 
-            danger_zone = binary_dilation(is_wall, iterations=2) # 2 itérations = ~20px
+            # VALIDATION: Ensure nearby unexplored cells exist
+            bc_grid = self.grid._conv_world_to_grid(x_world, y_world)
+            bc_y, bc_x = int(bc_grid[0]), int(bc_grid[1])
             
-            is_unknown = (grid_map >= -2.0) & (grid_map <= 2.0)
+            window = 15
+            y0, y1 = max(0, bc_y - window), min(grid_map.shape[0], bc_y + window)
+            x0, x1 = max(0, bc_x - window), min(grid_map.shape[1], bc_x + window)
+            neighborhood = grid_map[y0:y1, x0:x1]
             
-            # Intersection : Gradient fort et zone sécurisée et proche de l'inconnu
-
-            near_unknown = binary_dilation(is_unknown, iterations=1)
-            frontier_mask &= (~danger_zone) & near_unknown
-
-            # --- 3. CLUSTERING EFFICACE ---
-
-            labeled, num_features = ndimage.label(frontier_mask)
+            # Count unexplored cells nearby
+            unexplored_nearby = np.sum((neighborhood >= SEUIL_UNEXPLORED_MIN) & 
+                                       (neighborhood <= SEUIL_UNEXPLORED_MAX))
             
-            if num_features == 0:
-                return []
-
-            # Utilisation de find_objects pour extraire les clusters sans itérer sur toute la grille
-            slices = ndimage.find_objects(labeled)
+            if unexplored_nearby < 10:  # Require some unexplored cells
+                continue
             
-            self.frontier_clusters = []
-            min_cluster_size = 5
+            # REJECT dark blue corridor: if 70%+ heavily explored, skip
+            heavily_explored_nearby = np.sum(neighborhood < -15.0)
+            if heavily_explored_nearby > 0.7 * neighborhood.size:
+                continue
             
-            # On itère seulement sur les bounding boxes des clusters trouvés
-            for i, sl in enumerate(slices):
-                if sl is None: continue
-                
-                # Extraction rapide du cluster
-                cluster_mask = (labeled[sl] == (i + 1))
-                size = np.sum(cluster_mask)
-                
-                if size >= min_cluster_size:
-                    # Calcul direct des coordonnées moyennes dans la slice
-                    coords = np.argwhere(cluster_mask)
-                    mean_y = coords[:, 0].mean() + sl[0].start
-                    mean_x = coords[:, 1].mean() + sl[1].start
-                    
-                    # Conversion monde
-                    x_world, y_world = self.grid._conv_grid_to_world(mean_y, mean_x)
-                    
-                    self.frontier_clusters.append({
-                        "barycenter": np.array([x_world, y_world]),
-                        "size": int(size)
-                    })
+            distance = np.linalg.norm(barycenter - self.current_pose[:2])
+            self.frontier_clusters.append({
+                "barycenter": barycenter,
+                "size": int(size),
+                "distance": distance
+            })
 
-            # Retourne les barycentres pour la stratégie d'exploration
-            return [c["barycenter"] for c in self.frontier_clusters]
+            if distance < min_distance:
+                min_distance = distance
+                closest_cluster = barycenter
+
+        frontiers = [c["barycenter"] for c in self.frontier_clusters]
+
+        return frontiers
 
     # FONCTION DE DESSIN
     # --------------------------------------------------------------------------
@@ -1297,11 +1378,11 @@ class MyDronePrototype(DroneAbstract):
             
         lateral_cmd = float(np.clip(lateral_cmd, -1.0, 1.0))
         self.prev_lat_error = y_err
-        # 1. Calcul de la vitesse cible agressive
-        max_speed = 22.0 
-        # On utilise une accélération plus forte (0.25 au lieu de 0.15)
-        target_speed = max(0.0, min(max_speed, x_err * 0.25 + 0.5))
 
+        # 6. FORWARD SPEED PROFILE
+        max_speed = 100.0 
+        # Use x_err (longitudinal distance) to scale speed
+        target_speed = max(0.0, min(max_speed, x_err * 0.15 + 0.3))
 
         measured_vel = self.measured_velocity()
         if measured_vel is None:
@@ -1477,6 +1558,9 @@ class MyDronePrototype(DroneAbstract):
                 self.current_pose[0] += dx_world
                 self.current_pose[1] += dy_world
                 
+                if self.iteration % 10 == 0:  # Print every 10 iterations to reduce spam
+                    print(f"[{self.identifier}] Dead reckoning: dist={dist_travel:.1f}, alpha={math.degrees(alpha):.1f}°, "
+                        f"theta={math.degrees(theta):.1f}°, heading={math.degrees(heading):.1f}°")
 
 
     def process_communication_sensor(self):
@@ -1584,30 +1668,12 @@ class MyDronePrototype(DroneAbstract):
             if "frontier_clusters" in other_message:
                 all_frontier_clusters.extend(other_message["frontier_clusters"])
         
-            # --- Grid fusion (inside process_communication_sensor) ---
-            if "grid_data" in other_message:
-                # other_grid is the incoming data, self.grid.grid is our current data
+            # Grid fusion (only if present and not too often)
+            if self.iteration % 20 == 0 and "grid_data" in other_message and other_message["grid_data"] is not None:
                 other_grid = np.array(other_message["grid_data"])
-                
-                # Define thresholds for 'certainty'
-                # In your code: Walls >= 4.0, Free Space <= -5.0, Unexplored ≈ 0
-                
-                # Mask 1: Other drone has found a wall where we have unknown or free space
-                other_found_wall = (other_grid >= 4.0)
-                
-                # Mask 2: Other drone has found free space where we only have unknown
-                # We don't overwrite our own walls with their free space to be safe (avoid clipping)
-                other_found_free = (other_grid <= -5.0) & (self.grid.grid < 4.0)
-                
-                # Apply updates
-                self.grid.grid[other_found_wall] = other_grid[other_found_wall]
-                self.grid.grid[other_found_free] = other_grid[other_found_free]
-                
-                # Re-apply Kill Zones so they aren't 'cleaned' by other drones' free space info
-                if self.kill_zone_grid is not None:
-                    self.apply_kill_zones_to_grid()
-
-
+                # Simple weighted average (favor own observations)
+                self.grid.grid = 0.7 * self.grid.grid + 0.3 * other_grid
+    
         # Store drone positions immediately (needed for avoidance)
         self.other_drones_positions = other_drones_positions
     
@@ -1658,7 +1724,7 @@ class MyDronePrototype(DroneAbstract):
         # --- FRONTIER DEDUPLICATION (ALL clusters, no limiting) ---
         if all_frontier_clusters:
             deduped_barycenters = []
-            dedup_radius_frontier = 60.0
+            dedup_radius_frontier = 100.0
             for cl in all_frontier_clusters:
                 bc = np.array(cl["barycenter"])
                 if all(np.linalg.norm(bc - np.array(b)) > dedup_radius_frontier for b in deduped_barycenters):
@@ -1736,7 +1802,7 @@ class MyDronePrototype(DroneAbstract):
 
         is_free = (grid_map < SEUIL_FREE)
         is_wall = (grid_map >= SEUIL_MUR)
-        struct = np.ones((6, 6), dtype=bool)
+        struct = np.ones((5, 5), dtype=bool)
         danger_zone = binary_dilation(is_wall, structure=struct, iterations=1)
         safe_free = is_free & (~danger_zone)
 
@@ -2114,55 +2180,28 @@ class MyDronePrototype(DroneAbstract):
         return None
         
 
-
-
     def go_to_rescue_center_oriented(self, lidar_data) -> CommandsDict:
-        command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
-
-        if not self.rescue_zone_points:
-            return command
-
-        # 1. Vecteur vers le centre de secours
-        target_point = np.array(self.rescue_zone_points[0])
-        target_vector = target_point - self.current_pose[:2]
-        dist_to_center = np.linalg.norm(target_vector)
+        """
+        Stay close to rescue center and rotate until wounded is perfectly aligned.
+        The drone will not move forward, only rotate in place for precise presentation.
+        """
+        if not self.path:
+            return {"forward": 0, "lateral": 0, "rotation": 0}
         
-        # 2. ANGLE DE PRÉCISION
-        # Angle global vers le centre
-        angle_to_center = math.atan2(target_vector[1], target_vector[0])
         
-        # On récupère l'angle stocké. S'il est None (cas d'erreur), on assume l'arrière (pi)
-        grasp_angle = getattr(self, "grasped_wounded_angle", None)
-        if grasp_angle is None:
-            grasp_angle = math.pi
-            
-        # target_orientation est l'angle du drone tel que : 
-        # drone_orientation + grasp_angle = angle_to_center
-        target_orientation = normalize_angle(angle_to_center - grasp_angle)
+        rescue_center_pos = self.rescue_zone_points[0] if self.rescue_zone_points else None
+        if rescue_center_pos is None:
+            return self.follow_path(lidar_data)
         
-        # 3. Calcul de l'erreur d'angle
-        angle_error = normalize_angle(target_orientation - self.current_pose[2])
+        dist_to_rescue = np.linalg.norm(np.array(rescue_center_pos) - self.current_pose[:2])
+        
 
-        # --- LOGIQUE DE COMMANDE ---
-        
-        # A. Rotation : S'aligner sur l'axe du blessé
-        if abs(angle_error) > 0.03:  # Plus de précision (2 degrés)
-            command["rotation"] = np.clip(self.Kp * angle_error, -0.6, 0.6)
-            command["forward"] = 1.0
-        else:
-            command["rotation"] = 0.0
-            
-            # B. Translation : Pousser le blessé vers le centre
-            # On n'avance/recule que si l'alignement est quasi parfait
-            if dist_to_center > 12.0:  # Distance d'arrêt ajustée
-                # Si le blessé est plutôt devant (grasp_angle ~ 0), forward positif
-                # Si le blessé est plutôt derrière (grasp_angle ~ pi), forward négatif
-                direction = 1.0 if abs(grasp_angle) < math.pi/2 else -0.3
-                command["forward"] = direction
-            else:
-                command["forward"] = 1.0
+        # Stay near the rescue center (within 5-10px), only rotate
+        if dist_to_rescue > 80.0:
+            # Approach until close enough
+            return self.follow_path(lidar_data)
 
-        return command
+        return {"forward": 0.4, "lateral": 0, "rotation": 0.4}
     
 
     def add_return_area_point(self, new_point):

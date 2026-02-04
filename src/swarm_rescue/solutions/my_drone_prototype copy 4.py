@@ -203,13 +203,43 @@ class MyDronePrototype(DroneAbstract):
         comfort_dist_cells = COMFORT_DISTANCE_WORLD / self.grid.resolution
         
         # Max penalty to apply if we are right next to the wall
-        MAX_PENALTY = 100.0
+        MAX_PENALTY = 50.0
 
         
         # --- MODIFIED DRONE AVOIDANCE ZONE - ONLY AVOID DRONES IN FRONT ---
         # Cache drone danger zone for a few iterations if positions haven't changed
        
-        # (Drone obstacle avoidance removed as per request)
+        # --- NEW: ADD OTHER DRONES AS TEMPORARY OBSTACLES ---
+        # This treats other drones as "walls" for the pathfinder
+        if hasattr(self, 'other_drones_positions') and self.other_drones_positions:
+        
+            DRONE_OBSTACLE_RADIUS = 40.0 
+            radius_cells = int(DRONE_OBSTACLE_RADIUS / self.grid.resolution)
+            
+            for other_info in self.other_drones_positions:
+                other_pos = other_info[0]
+                
+                # Only consider drones that are somewhat close (optimization)
+                # e.g., within 200 pixels. Far away drones don't matter.
+                if math.hypot(other_pos[0] - start_world[0], other_pos[1] - start_world[1]) > 200.0:
+                    continue
+
+                try:
+                    # Convert drone world pos to grid
+                    p_grid = self.grid._conv_world_to_grid(other_pos[0], other_pos[1])
+                    py, px = int(p_grid[0]), int(p_grid[1])
+                    
+                    # Define a square around the drone
+                    y0 = max(0, py - radius_cells)
+                    y1 = min(grid.shape[0], py + radius_cells + 1)
+                    x0 = max(0, px - radius_cells)
+                    x1 = min(grid.shape[1], px + radius_cells + 1)
+                    
+                    # Mark this area as BLOCKED
+                    danger_zone[y0:y1, x0:x1] = True
+                    
+                except Exception:
+                    continue
 
     
 
@@ -220,7 +250,7 @@ class MyDronePrototype(DroneAbstract):
         # Si le start ou le goal sont dans la danger_zone (par ex. drone collé au mur),
         # on autorise une petite zone autour d'eux pour permettre à A* de s'extraire.
         try:
-            radius_clear = 2  # Increased to 2 (from 1) to ensure connectivity if stuck
+            radius_clear = 1
             sx, sy = start
             gx, gy = goal
             x0 = max(0, sx - radius_clear)
@@ -415,7 +445,7 @@ class MyDronePrototype(DroneAbstract):
             self._last_rescue_list = self.rescue_zone_points
     
         # Grid data: only every 20 iterations (was 10)
-        if self.iteration % 5 == 0:
+        if self.iteration % 20 == 0:
             message["grid_data"] = self.grid.grid.copy()
     
         # Removed wounded: only when non-empty
@@ -889,6 +919,7 @@ class MyDronePrototype(DroneAbstract):
         if self.state == self.Activity.EXPLORING:
             if self.path:   
                 command = self.follow_path(lidar_data)
+
             else:
                 self.go_to_return_area(lidar_data)
                 
@@ -959,7 +990,7 @@ class MyDronePrototype(DroneAbstract):
         # This will override/modify the command to push us away from collisions
         command = self.drone_repulsion(command)
 
-        if self.iteration % 5 == 0:
+        if self.iteration % 50 == 0:
             self.grid.display(self.grid.zoomed_grid,
                               self.estimated_pose,
                               title="zoomed occupancy grid")
@@ -1477,6 +1508,9 @@ class MyDronePrototype(DroneAbstract):
                 self.current_pose[0] += dx_world
                 self.current_pose[1] += dy_world
                 
+                if self.iteration % 10 == 0:  # Print every 10 iterations to reduce spam
+                    print(f"[{self.identifier}] Dead reckoning: dist={dist_travel:.1f}, alpha={math.degrees(alpha):.1f}°, "
+                        f"theta={math.degrees(theta):.1f}°, heading={math.degrees(heading):.1f}°")
 
 
     def process_communication_sensor(self):
@@ -1584,26 +1618,26 @@ class MyDronePrototype(DroneAbstract):
             if "frontier_clusters" in other_message:
                 all_frontier_clusters.extend(other_message["frontier_clusters"])
         
-            # --- Grid fusion (inside process_communication_sensor) ---
-            if "grid_data" in other_message:
-                # other_grid is the incoming data, self.grid.grid is our current data
+            # Grid fusion (only if present and not too often)
+            if self.iteration % 5 == 0 and "grid_data" in other_message:
                 other_grid = np.array(other_message["grid_data"])
                 
-                # Define thresholds for 'certainty'
-                # In your code: Walls >= 4.0, Free Space <= -5.0, Unexplored ≈ 0
+                # 1. On crée un masque pour identifier où l'autre drone a une info "plus forte"
+                # Un obstacle (valeur haute) est toujours prioritaire sur le vide
+                # Le vide (valeur très négative) est prioritaire sur l'inconnu (proche de 0)
                 
-                # Mask 1: Other drone has found a wall where we have unknown or free space
-                other_found_wall = (other_grid >= 4.0)
+                # Condition : garder la valeur la plus éloignée de zéro (la plus certaine)
+                # Si l'autre a une certitude absolue (obstacle ou vide franc), on prend.
+                mask_other_is_better = np.abs(other_grid) > np.abs(self.grid.grid)
                 
-                # Mask 2: Other drone has found free space where we only have unknown
-                # We don't overwrite our own walls with their free space to be safe (avoid clipping)
-                other_found_free = (other_grid <= -5.0) & (self.grid.grid < 4.0)
+                self.grid.grid[mask_other_is_better] = other_grid[mask_other_is_better]
                 
-                # Apply updates
-                self.grid.grid[other_found_wall] = other_grid[other_found_wall]
-                self.grid.grid[other_found_free] = other_grid[other_found_free]
-                
-                # Re-apply Kill Zones so they aren't 'cleaned' by other drones' free space info
+                # 2. Sécurité spécifique pour les murs (valeur > 4)
+                # Si l'autre drone détecte un mur là où on pensait que c'était vide, on met le mur
+                mask_new_wall = (other_grid >= 4.0) & (self.grid.grid < 4.0)
+                self.grid.grid[mask_new_wall] = other_grid[mask_new_wall]
+
+                # 3. Ré-application des Kill Zones locales
                 if self.kill_zone_grid is not None:
                     self.apply_kill_zones_to_grid()
 
