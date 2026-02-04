@@ -168,9 +168,9 @@ class MyDronePrototype(DroneAbstract):
         goal = tuple(map(int, goal))
 
         # --- FIXED THRESHOLDS ---
-        SEUIL_MUR = 3.0
+        SEUIL_MUR = 4.0
         SEUIL_FREE = -5.0  # Free cells are BELOW this threshold
-        SEUIL_UNEXPLORED_MAX = 2.99  # Unexplored cells are near 0 (between -4 and +4)
+        SEUIL_UNEXPLORED_MAX = 3.99  # Unexplored cells are near 0 (between -4 and +4)
         SEUIL_UNEXPLORED_MIN = -4.99
     
         # Masque des murs (high positive values)
@@ -186,7 +186,7 @@ class MyDronePrototype(DroneAbstract):
         is_unexplored = (grid >= SEUIL_UNEXPLORED_MIN) & (grid <= SEUIL_UNEXPLORED_MAX)
         
         # Dilate les murs pour éviter les zones proches
-        struct = np.ones((6, 6), dtype=bool)
+        struct = np.ones((5, 5), dtype=bool)
         danger_zone = binary_dilation(is_wall, structure=struct, iterations=1)
 
 
@@ -197,13 +197,13 @@ class MyDronePrototype(DroneAbstract):
         dist_map = ndimage.distance_transform_edt(~is_wall)
 
         # DEFINITION: How far (in world units) do we want to be?
-        COMFORT_DISTANCE_WORLD = 200.0  # e.g., 60cm or 60px
+        COMFORT_DISTANCE_WORLD = 250.0  # e.g., 60cm or 60px
         
         # CONVERSION: Convert that to grid cells so we can compare with dist_map
         comfort_dist_cells = COMFORT_DISTANCE_WORLD / self.grid.resolution
         
         # Max penalty to apply if we are right next to the wall
-        MAX_PENALTY = 50.0
+        MAX_PENALTY = 150.0
 
         
         # --- MODIFIED DRONE AVOIDANCE ZONE - ONLY AVOID DRONES IN FRONT ---
@@ -444,9 +444,8 @@ class MyDronePrototype(DroneAbstract):
             message["rescue_list"] = self.rescue_zone_points
             self._last_rescue_list = self.rescue_zone_points
     
-        # Grid data: only every 20 iterations (was 10)
-        if self.iteration % 5 == 0:
-            message["grid_data"] = self.grid.grid.copy()
+        # Grid data
+        message["grid_data"] = self.grid.grid.copy()
     
         # Removed wounded: only when non-empty
         if self.removed_wounded:
@@ -478,6 +477,7 @@ class MyDronePrototype(DroneAbstract):
 
         # INITIALIZE COMMAND HERE TO AVOID UNBOUNDLOCALERROR
         command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0, "grasper": 0}
+        need_replan = False 
 
         # Process received messages from other drones
         self.process_communication_sensor()
@@ -559,7 +559,6 @@ class MyDronePrototype(DroneAbstract):
             ]
             
             if available_wounded and (self.iteration % 50 == 0):
-                print(f"[{self.identifier}] [DEBUG] Available wounded: {available_wounded}")
                 # Choose closest available wounded
                 distances = [np.linalg.norm(np.array(w) - self.current_pose[:2]) for w in available_wounded]
                 closest_idx = int(np.argmin(distances))
@@ -605,7 +604,7 @@ class MyDronePrototype(DroneAbstract):
 
         elif self.state == self.Activity.GOING_TO_WOUNDED:
             grasped = getattr(self, "other_grasped_wounded", set())
-            exclusion_radius = 20.0
+            exclusion_radius = 40.0
 
             def is_near_grasped(w):
                 return any(math.hypot(w[0] - gx, w[1] - gy) < exclusion_radius for (gx, gy) in grasped)
@@ -947,6 +946,33 @@ class MyDronePrototype(DroneAbstract):
                 command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
 
         elif self.state == self.Activity.GOING_TO_RETURN_AREA:
+
+        # --- Check for available wounded during return ---
+            grasped = getattr(self, "other_grasped_wounded", set()) #
+            
+            # Filter: Not assigned, and not too close to someone else's grasp
+            available_wounded = [
+                w for w in self.wounded_to_rescue
+                if w not in self.wounded_assignments and 
+                not any(math.hypot(w[0] - gx, w[1] - gy) < 40.0 for (gx, gy) in grasped)
+            ] #
+
+            if available_wounded:
+                # Pick the closest one to current location
+                distances = [np.linalg.norm(np.array(w) - self.current_pose[:2]) for w in available_wounded]
+                closest_idx = int(np.argmin(distances))
+                
+                # Switch state back to re-trigger the GOING_TO_WOUNDED logic
+                self.current_target_wounded = available_wounded[closest_idx]
+                self.wounded_assignments[self.current_target_wounded] = self.identifier
+                self.state = self.Activity.GOING_TO_WOUNDED
+                self.path = self.creer_chemin(self.current_pose[:2], self.current_target_wounded)
+                self.last_replan_iteration = self.iteration
+                print(f"[{self.identifier}] Return interrupted! Rescuing wounded at {self.current_target_wounded}")
+                
+                # Immediately execute the approach logic
+                return self.go_to_wounded(lidar_data)
+
             if self.path:
                 command = self.follow_path(lidar_data)
             else:
@@ -1144,22 +1170,17 @@ class MyDronePrototype(DroneAbstract):
         detection_color = palette[color_idx]
     
 
-        if hasattr(self, 'frontier_clusters') and self.frontier_clusters :
-            # Only draw the 5 closest clusters to reduce rendering overhead
-            if len(self.frontier_clusters) > 5:
-                # Sort by distance to current position
-                sorted_clusters = sorted(
-                    self.frontier_clusters,
-                    key=lambda c: np.linalg.norm(c['barycenter'] - self.current_pose[:2])
-                )[:5]  # Take only 5 closest
-            else:
-                sorted_clusters = self.frontier_clusters
-            
-            for cluster in sorted_clusters:
-                bc = cluster.get('barycenter')
-                if bc is not None:
-                    ptb = bc + self._half_size_array
-                    arcade.draw_circle_filled(ptb[0], ptb[1], radius=6, color=detection_color)
+    # --- interesting area to explore---
+
+        if self.iteration % 10 == 0:
+            self.gain_targets = self.find_high_information_gain_targets()
+
+        if hasattr(self, 'gain_targets'):
+            for target in self.gain_targets:
+                pt = np.array(target) + self._half_size_array
+                # Cyan diamonds represent the high-gain "room entries"
+                arcade.draw_rectangle_filled(pt[0], pt[1], 12, 12, arcade.color.CYAN, tilt_angle=45)
+
 
         # Draw wounded detected via new simple API (wounded_to_rescue)
         try:
@@ -1745,7 +1766,7 @@ class MyDronePrototype(DroneAbstract):
                         if is_new_kill_zone:
                             print(f"[{self.identifier}] DETECTED KILL ZONE! Drone {drone_id} died at {death_pos}, at iteration {info['iteration']}")
                             self.known_kill_zones.append(death_pos)
-                            self.mark_kill_zone_on_grid(death_pos,drone_id)
+                            #self.mark_kill_zone_on_grid(death_pos,drone_id)
                             self.declared_dead_drones.add(drone_id)
 
             # --- FALSE ALARM CHECK ---
@@ -1767,7 +1788,7 @@ class MyDronePrototype(DroneAbstract):
 
         is_free = (grid_map < SEUIL_FREE)
         is_wall = (grid_map >= SEUIL_MUR)
-        struct = np.ones((6, 6), dtype=bool)
+        struct = np.ones((5, 5), dtype=bool)
         danger_zone = binary_dilation(is_wall, structure=struct, iterations=1)
         safe_free = is_free & (~danger_zone)
 
@@ -2261,4 +2282,47 @@ class MyDronePrototype(DroneAbstract):
             return self.follow_path(lidar_data) if lidar_data is not None else {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
         else:
             print(f"[{self.identifier}] No return area points available!")
-            
+    
+
+    def find_high_information_gain_targets(self):
+        """
+        Highly efficient Information Gain Gradient using vectorized box filters.
+        """
+        grid_map = self.grid.grid
+        
+        # 1. Binary Masks (Vectorized)
+        # Unexplored is roughly 0, Free is negative
+        is_unexplored = (grid_map >= -4.99) & (grid_map <= 4.0)
+        is_free = (grid_map < -5.0)
+        
+        # 2. Fast Box Filter (O(N) Complexity)
+        # Uniform filter calculates the mean in a 20x20 area instantly
+        window_size = 20
+        gain_map = ndimage.uniform_filter(is_unexplored.astype(np.float32), size=window_size)
+        
+        # 3. Constraint: Must be a reachable frontier
+        # We only care about high gain areas that touch our explored space
+        frontier_mask = is_free & binary_dilation(is_unexplored, iterations=1)
+        
+        # Apply mask and find top candidates
+        gain_map[~frontier_mask] = 0
+        
+        # 4. Efficient Peak Finding
+        # Instead of sorting every pixel, we find indices above a high threshold
+        threshold = 0.4  # Focus on areas that are at least 40% unknown
+        y_coords, x_coords = np.where(gain_map > threshold)
+        
+        if len(y_coords) == 0:
+            return []
+
+        # Subsample or pick local peaks to avoid clusters
+        # We take every 10th candidate to ensure spatial distribution
+        potential_targets = []
+        for i in range(0, len(y_coords), 10):
+            y, x = y_coords[i], x_coords[i]
+            world_pos = self.grid._conv_grid_to_world(y, x)
+            potential_targets.append((world_pos, gain_map[y, x]))
+
+        # Sort only the limited subset
+        potential_targets.sort(key=lambda x: x[1], reverse=True)
+        return [t[0] for t in potential_targets[:5]]
