@@ -48,8 +48,8 @@ class MyDronePrototype(DroneAbstract):
         
         # parametre PID rotation
         self.prev_angle_error = 0.0
-        self.Kp = 5.0
-        self.Kd = 3.0
+        self.Kp = 5
+        self.Kd = 3
 
         # PID translation
         self.Kp_pos = 7.0
@@ -1378,11 +1378,11 @@ class MyDronePrototype(DroneAbstract):
             
         lateral_cmd = float(np.clip(lateral_cmd, -1.0, 1.0))
         self.prev_lat_error = y_err
-        # 1. Calcul de la vitesse cible agressive
-        max_speed = 22.0 
-        # On utilise une accélération plus forte (0.25 au lieu de 0.15)
-        target_speed = max(0.0, min(max_speed, x_err * 0.25 + 0.5))
 
+        # 6. FORWARD SPEED PROFILE
+        max_speed = 100.0 
+        # Use x_err (longitudinal distance) to scale speed
+        target_speed = max(0.0, min(max_speed, x_err * 0.15 + 0.3))
 
         measured_vel = self.measured_velocity()
         if measured_vel is None:
@@ -2180,55 +2180,28 @@ class MyDronePrototype(DroneAbstract):
         return None
         
 
-
-
     def go_to_rescue_center_oriented(self, lidar_data) -> CommandsDict:
-        command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
-
-        if not self.rescue_zone_points:
-            return command
-
-        # 1. Vecteur vers le centre de secours
-        target_point = np.array(self.rescue_zone_points[0])
-        target_vector = target_point - self.current_pose[:2]
-        dist_to_center = np.linalg.norm(target_vector)
+        """
+        Stay close to rescue center and rotate until wounded is perfectly aligned.
+        The drone will not move forward, only rotate in place for precise presentation.
+        """
+        if not self.path:
+            return {"forward": 0, "lateral": 0, "rotation": 0}
         
-        # 2. ANGLE DE PRÉCISION
-        # Angle global vers le centre
-        angle_to_center = math.atan2(target_vector[1], target_vector[0])
         
-        # On récupère l'angle stocké. S'il est None (cas d'erreur), on assume l'arrière (pi)
-        grasp_angle = getattr(self, "grasped_wounded_angle", None)
-        if grasp_angle is None:
-            grasp_angle = math.pi
-            
-        # target_orientation est l'angle du drone tel que : 
-        # drone_orientation + grasp_angle = angle_to_center
-        target_orientation = normalize_angle(angle_to_center - grasp_angle)
+        rescue_center_pos = self.rescue_zone_points[0] if self.rescue_zone_points else None
+        if rescue_center_pos is None:
+            return self.follow_path(lidar_data)
         
-        # 3. Calcul de l'erreur d'angle
-        angle_error = normalize_angle(target_orientation - self.current_pose[2])
+        dist_to_rescue = np.linalg.norm(np.array(rescue_center_pos) - self.current_pose[:2])
+        
 
-        # --- LOGIQUE DE COMMANDE ---
-        
-        # A. Rotation : S'aligner sur l'axe du blessé
-        if abs(angle_error) > 0.03:  # Plus de précision (2 degrés)
-            command["rotation"] = np.clip(self.Kp * angle_error, -0.6, 0.6)
-            command["forward"] = 1.0
-        else:
-            command["rotation"] = 0.0
-            
-            # B. Translation : Pousser le blessé vers le centre
-            # On n'avance/recule que si l'alignement est quasi parfait
-            if dist_to_center > 12.0:  # Distance d'arrêt ajustée
-                # Si le blessé est plutôt devant (grasp_angle ~ 0), forward positif
-                # Si le blessé est plutôt derrière (grasp_angle ~ pi), forward négatif
-                direction = 1.0 if abs(grasp_angle) < math.pi/2 else -0.3
-                command["forward"] = direction
-            else:
-                command["forward"] = 1.0
+        # Stay near the rescue center (within 5-10px), only rotate
+        if dist_to_rescue > 80.0:
+            # Approach until close enough
+            return self.follow_path(lidar_data)
 
-        return command
+        return {"forward": 0.4, "lateral": 0, "rotation": 0.4}
     
 
     def add_return_area_point(self, new_point):
