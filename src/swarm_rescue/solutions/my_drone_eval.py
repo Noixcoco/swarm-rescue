@@ -1,4 +1,7 @@
 from swarm_rescue.solutions.my_drone_prototype import MyDronePrototype
+from swarm_rescue.solutions.my_drone_project.my_drone import MyDrone
+
+
 
 
 class MyDroneEval(MyDronePrototype):
