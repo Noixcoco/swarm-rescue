@@ -176,7 +176,7 @@ class MyDronePrototype(DroneAbstract):
         is_unexplored = (grid >= SEUIL_UNEXPLORED_MIN) & (grid <= SEUIL_UNEXPLORED_MAX)
         
         # Dilate les murs pour éviter les zones proches
-        struct = np.ones((6, 6), dtype=bool)
+        struct = np.ones((3, 3), dtype=bool)
         danger_zone = binary_dilation(is_wall, structure=struct, iterations=1)
 
 
@@ -1698,19 +1698,10 @@ class MyDronePrototype(DroneAbstract):
                 # other_grid is the incoming data, self.grid.grid is our current data
                 other_grid = np.array(other_message["grid_data"])
                 
-                # Define thresholds for 'certainty'
-                # In your code: Walls >= 4.0, Free Space <= -5.0, Unexplored ≈ 0
-                
-                # Mask 1: Other drone has found a wall where we have unknown or free space
-                other_found_wall = (other_grid >= 4.0)
-                
-                # Mask 2: Other drone has found free space where we only have unknown
-                # We don't overwrite our own walls with their free space to be safe (avoid clipping)
-                other_found_free = (other_grid <= -5.0) & (self.grid.grid < 4.0)
-                
-                # Apply updates
-                self.grid.grid[other_found_wall] = other_grid[other_found_wall]
-                self.grid.grid[other_found_free] = other_grid[other_found_free]
+                # Fusion logic: Keep the value with the higher absolute confidence
+                # This ensures that strong evidence (large |value|) overwrites weak evidence
+                mask_update = np.abs(other_grid) > np.abs(self.grid.grid)
+                self.grid.grid[mask_update] = other_grid[mask_update]
 
         # Store drone positions immediately (needed for avoidance)
         self.other_drones_positions = other_drones_positions
@@ -1783,7 +1774,7 @@ class MyDronePrototype(DroneAbstract):
 
         is_free = (grid_map < SEUIL_FREE)
         is_wall = (grid_map >= SEUIL_MUR)
-        struct = np.ones((6, 6), dtype=bool)
+        struct = np.ones((3, 3), dtype=bool)
         danger_zone = binary_dilation(is_wall, structure=struct, iterations=1)
         safe_free = is_free & (~danger_zone)
 
