@@ -165,7 +165,7 @@ class MyDronePrototype(DroneAbstract):
         goal = tuple(map(int, goal))
 
         # --- FIXED THRESHOLDS ---
-        SEUIL_MUR = 3.0
+        SEUIL_MUR = 1.0
         SEUIL_FREE = -5.0  # Free cells are BELOW this threshold
         SEUIL_UNEXPLORED_MAX = 2.99  # Unexplored cells are near 0 (between -4 and +4)
         SEUIL_UNEXPLORED_MIN = -4.99
@@ -181,7 +181,9 @@ class MyDronePrototype(DroneAbstract):
         
         # Dilate les murs pour éviter les zones proches
         struct = np.ones((3, 3), dtype=bool)
+        is_wall = ndimage.binary_opening(grid >= SEUIL_MUR, structure=np.ones((2,2)))
         danger_zone = binary_dilation(is_wall, structure=struct, iterations=1)
+        #danger_zone = binary_dilation(is_wall, structure=struct, iterations=self.inflation_radius_cells)
 
 
         # --- 4. SOFT CONSTRAINT SETUP (Distance Map) ---
@@ -204,6 +206,28 @@ class MyDronePrototype(DroneAbstract):
         # Cache drone danger zone for a few iterations if positions haven't changed
        
         # (Drone obstacle avoidance removed as per request)
+                # --- RÉACTIVATION DE L'ÉVITEMENT DES DRONES DANS LE PATH PLANNING ---
+        # On ajoute une "bulle" d'obstacle temporaire autour des autres drones
+        # pour que l'algorithme A* planifie un chemin qui les évite.
+        if hasattr(self, 'other_drones_positions') and self.other_drones_positions:
+            # Créer une "bulle" de 120px de diamètre (60px de rayon) autour des autres drones
+            bubble_radius_cells = int(90.0 / self.grid.resolution)
+
+            for other_drone_info in self.other_drones_positions:
+                other_pos_world = other_drone_info[0][:2]  # (x, y)
+                other_pos_grid = self.grid._conv_world_to_grid(*other_pos_world)
+                
+                if other_pos_grid is not None:
+                    gy, gx = int(other_pos_grid[0]), int(other_pos_grid[1])
+                    
+                    # Définir les limites d'un carré pour la bulle
+                    y0 = max(0, gy - bubble_radius_cells)
+                    y1 = min(grid.shape[0], gy + bubble_radius_cells + 1)
+                    x0 = max(0, gx - bubble_radius_cells)
+                    x1 = min(grid.shape[1], gx + bubble_radius_cells + 1)
+                    
+                    # Marquer cette zone comme dangereuse pour l'A*
+                    danger_zone[y0:y1, x0:x1] = True
 
     
 
@@ -308,9 +332,14 @@ class MyDronePrototype(DroneAbstract):
                 penalty = 0.0
 
                 # Apply penalty if closer than comfort distance
-                if dist_to_wall_cells < comfort_dist_cells:
-                    proximity = 1.0 - (dist_to_wall_cells / comfort_dist_cells)
-                    penalty = MAX_PENALTY * (proximity ** 2)
+                # if dist_to_wall_cells < comfort_dist_cells:
+                #     proximity = 1.0 - (dist_to_wall_cells / comfort_dist_cells)
+                #     penalty = MAX_PENALTY * (proximity ** 2)
+
+                # Si on est à moins de 50px d'un mur, on ajoute un coût exponentiel
+                comfort_limit = 50.0 / self.grid.resolution
+                if dist_to_wall_cells < comfort_limit:
+                    penalty = 50.0 * (1.0 - (dist_to_wall_cells / comfort_limit))**2
                 
                 move_cost = base_cost + penalty
                 # -----------------------------------------------
@@ -372,8 +401,8 @@ class MyDronePrototype(DroneAbstract):
         
         if not (0 <= y < danger_zone.shape[1] and 0 <= x < danger_zone.shape[0]):
             return False
-        
-        return not danger_zone[x, y]
+        region = danger_zone[max(0, y-1):y+2, max(0, x-1):x+2]
+        return not np.any(region)
     
 
     def define_message_for_all(self):
@@ -909,9 +938,26 @@ class MyDronePrototype(DroneAbstract):
             else:
                 command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
 
+        # elif self.state == self.Activity.GOING_TO_RETURN_AREA:
+        #     if self.path:
+        #         command = self.follow_path(lidar_data)
+        #     else:
+        #         # Si le chemin est fini ou invalide, on retente de cibler la zone
+        #         self.go_to_return_area(lidar_data)
         elif self.state == self.Activity.GOING_TO_RETURN_AREA:
-            if self.path:
-                command = self.follow_path(lidar_data)
+            # --- CONDITION DE SORTIE : Re-tenter l'exploration régulièrement ---
+            if self.iteration % 30 == 0:  # Toutes les 3 secondes
+                local_frontiers = self.find_safe_frontier_points()
+                shared_clusters = getattr(self, "shared_frontier_barycenters", [])
+                
+                # S'il y a de nouveau des zones à explorer (les nôtres ou celles des autres)
+                if local_frontiers or shared_clusters:
+                    print(f"[{self.identifier}] Nouvelles frontières détectées ! Reprise de l'exploration.")
+                    self.state = self.Activity.EXPLORING
+                    self.path = [] # Forcer la planification au prochain cycle
+                else:
+                    # Si le chemin est fini ou invalide, on retente de cibler la zone
+                    self.go_to_return_area(lidar_data)
             else:
                 # Si le chemin est fini ou invalide, on retente de cibler la zone
                 self.go_to_return_area(lidar_data)
@@ -999,8 +1045,23 @@ class MyDronePrototype(DroneAbstract):
 
             elif data.entity_type == DroneSemanticSensor.TypeEntity.RESCUE_CENTER:
                 global_angle = normalize_angle(ptheta + data.angle)
-                xr = px + data.distance * math.cos(global_angle)
-                yr = py + data.distance * math.sin(global_angle)
+                # xr = px + data.distance * math.cos(global_angle)
+                # yr = py + data.distance * math.sin(global_angle)
+
+                # Reculer le point de 20 pixels vers le drone pour être en zone sûre
+                safety_margin = 20.0
+                dist_adj = max(0, data.distance - safety_margin)
+                xr = px + dist_adj * math.cos(global_angle)
+                yr = py + dist_adj * math.sin(global_angle)
+                # --- AJOUT : Vérification de collision ---
+                res_grid = self.grid._conv_world_to_grid(xr, yr)
+                if res_grid is not None:
+                    gy, gx = int(res_grid[0]), int(res_grid[1])
+                    # On ne garde le point que s'il est dans une zone explorée libre (SEUIL_FREE)
+                    # On évite les valeurs >= 1.0 (murs/obstacles)
+                    if self.grid.grid[gy, gx] < -5.0: 
+                        newly_seen_rescue.append((xr, yr))
+
                 newly_seen_rescue.append((xr, yr))
 
         # Merge newly seen wounded
@@ -2005,7 +2066,7 @@ class MyDronePrototype(DroneAbstract):
                 return command
 
             # SETTINGS
-            SAFE_DIST = 120.0  # Start pushing away at 70 pixels (approx 0.7 meter)
+            SAFE_DIST = 150.0  # Start pushing away at 70 pixels (approx 0.7 meter)
             GAIN = 3.5      # Strong push (Stronger than walls to prevent tangling)
 
             repulsion_forward = 0.0
