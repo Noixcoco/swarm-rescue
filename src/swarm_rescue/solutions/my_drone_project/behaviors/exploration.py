@@ -1,5 +1,6 @@
 # behaviors/exploration.py
 import numpy as np
+from ..components.mapper import find_frontier_clusters
 
 class ExplorationBehavior:
     def __init__(self, navigator, mapper):

@@ -433,86 +433,6 @@ class MyDronePrototype(DroneAbstract):
     
         return message
 
-    def wall_follower_control(self, lidar_data) -> CommandsDict:
-        """
-        Suivre le mur de DROITE uniquement en l'absence de GPS.
-        """
-        # Force right side
-        self.wall_following_side = 'right'
-
-        command = {"forward": 0.3, "lateral": 0.0, "rotation": 0.0, "grasper": 0}
-        
-        angles = self.lidar().ray_angles
-        
-        # Define sectors
-        # Front: -30 to 30 degrees
-        front_indices = np.where(np.abs(angles) < math.radians(30))[0]
-        # Right: -110 to -70 degrees (Strict Side)
-        right_indices = np.where((angles > math.radians(-110)) & (angles < math.radians(-70)))[0]
-        # Front-Right: -60 to -20 (Corner anticipation)
-        front_right_indices = np.where((angles > math.radians(-60)) & (angles < math.radians(-20)))[0]
-        
-        front_dist = np.min(lidar_data[front_indices]) if len(front_indices) > 0 else 999.0
-        right_dist = np.min(lidar_data[right_indices]) if len(right_indices) > 0 else 999.0
-        front_right_dist = np.min(lidar_data[front_right_indices]) if len(front_right_indices) > 0 else 999.0
-        
-        TARGET_DIST = 45.0
-        
-        # 1. EMERGENCY: Too close to front -> Reverse
-        if front_dist < 30.0:
-            command["forward"] = -0.1
-            command["rotation"] = 0.5 # Turn left while reversing
-            return command
-
-        # 2. OBSTACLE AVOIDANCE: Front blocked -> Turn Left in place
-        if front_dist < 50.0:
-            command["forward"] = 0.0
-            command["rotation"] = 0.6 # Strong Left
-            return command
-            
-        # 3. CORNER AVOIDANCE: Front-Right blocked -> Turn Left while moving
-        if front_right_dist < 40.0:
-            command["forward"] = 0.2
-            command["rotation"] = 0.3 # Turn Left
-            return command
-
-        # 4. WALL FOLLOWING
-        if right_dist > 120.0:
-            # Lost wall -> Turn Right to find it
-            # But ensure we don't just spin if we are in open space.
-            # Move forward significantly.
-            command["forward"] = 0.3
-            command["rotation"] = -0.2 # Gentle Right
-            self.prev_wall_error = None # Reset derivative memory when wall is lost
-            self.integral_wall_error = 0.0 # Reset integral when wall is lost
-        else:
-            # Maintain distance
-            error = right_dist - TARGET_DIST
-            # error > 0 (too far) -> Turn Right (negative)
-            # error < 0 (too close) -> Turn Left (positive)
-
-            # Handle first iteration or re-acquisition to avoid derivative spike
-            if self.prev_wall_error is None:
-                self.prev_wall_error = error
-
-            # --- PID Controller ---
-            Kp = .1 # Proportional 
-            Ki = 0   # Integral 
-            Kd = 0  # Derivative 
-
-            self.integral_wall_error += error
-            self.integral_wall_error = np.clip(self.integral_wall_error, -100, 100) # Anti-windup
-            
-            deriv = error - self.prev_wall_error
-            self.prev_wall_error = error
-            
-            command["rotation"] = -(Kp * error + Ki * self.integral_wall_error + Kd * deriv)
-            # Clamp
-            command["rotation"] = max(-0.5, min(0.5, command["rotation"]))
-            command["forward"] = 0.3
-        
-        return command
-
     def control(self) -> CommandsDict:
         """
         Cerveau : Logique de test simplifiée.
@@ -959,7 +879,7 @@ class MyDronePrototype(DroneAbstract):
             has_gps = gps_pos is not None and not np.isnan(gps_pos[0])
             
             if not has_gps:
-                command = self.wall_follower_control(lidar_data)
+                command = self.follow_path(lidar_data)
             else:
                 if self.path:   
                     command = self.follow_path(lidar_data)
