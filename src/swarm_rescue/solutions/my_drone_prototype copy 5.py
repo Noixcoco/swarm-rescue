@@ -107,6 +107,10 @@ class MyDronePrototype(DroneAbstract):
         self.unstuck_target = None
         self.is_unstucking = False
 
+        self._last_drone_positions = None
+        self._last_drone_danger_zone = None
+        self._last_danger_zone_iter = -100
+
         self.frontier_clusters = [] 
 
         self.path_cache = {}
@@ -118,16 +122,16 @@ class MyDronePrototype(DroneAbstract):
         self.last_breadcrumb_pos = None
         self.breadcrumb_spacing = 100.0 # Distance between crumbs (pixels)
 
-        # # --- KILL ZONE DETECTION ---
-        # self.drone_last_heard = {}  # {drone_id: {"iteration": int, "position": (x,y)}}
-        # self.known_kill_zones = []  # List of (x, y) tuples marking death locations
-        # self.DEATH_TIMEOUT = 100 # 100 iterations = ~10 seconds of silence
-        # self.kill_zone_grid = None
-        # self.declared_dead_drones = set() 
-        # self.drone_position_history = {}    #to estimate kill zone position
-        # # Two-step verification before declaring death
-        # self.suspected_dead_drones = {}  # {drone_id: {"first_timeout_iter": int, "position": (x,y)}}
-        # self.CONFIRMATION_TIMEOUT = 5 # Additional iterations to confirm death
+        # --- KILL ZONE DETECTION ---
+        self.drone_last_heard = {}  # {drone_id: {"iteration": int, "position": (x,y)}}
+        self.known_kill_zones = []  # List of (x, y) tuples marking death locations
+        self.DEATH_TIMEOUT = 100 # 100 iterations = ~10 seconds of silence
+        self.kill_zone_grid = None
+        self.declared_dead_drones = set() 
+        self.drone_position_history = {}    #to estimate kill zone position
+        # Two-step verification before declaring death
+        self.suspected_dead_drones = {}  # {drone_id: {"first_timeout_iter": int, "position": (x,y)}}
+        self.CONFIRMATION_TIMEOUT = 5 # Additional iterations to confirm death
 
 
 
@@ -166,16 +170,19 @@ class MyDronePrototype(DroneAbstract):
         # --- FIXED THRESHOLDS ---
         SEUIL_MUR = 4.0
         SEUIL_FREE = -5.0  # Free cells are BELOW this threshold
-        SEUIL_UNEXPLORED_MAX = 3.99
+        SEUIL_UNEXPLORED_MAX = 3.99  # Unexplored cells are near 0 (between -4 and +4)
         SEUIL_UNEXPLORED_MIN = -4.99
     
         # Masque des murs (high positive values)
         is_wall = (grid >= SEUIL_MUR)
         
-        # if self.kill_zone_grid is not None:
-        #     is_wall = is_wall | (self.kill_zone_grid == 1.0)
+        if self.kill_zone_grid is not None:
+            is_wall = is_wall | (self.kill_zone_grid == 1.0)
         
-        # Mask for unknown cells (roughly 0.0)
+        # CORRECT: Only cells with NEGATIVE values are explored free space
+        is_explored_free = (grid < SEUIL_FREE)
+        
+        # CORRECT: Unexplored cells are near zero
         is_unexplored = (grid >= SEUIL_UNEXPLORED_MIN) & (grid <= SEUIL_UNEXPLORED_MAX)
         
         # Dilate les murs pour éviter les zones proches
@@ -190,7 +197,7 @@ class MyDronePrototype(DroneAbstract):
         dist_map = ndimage.distance_transform_edt(~is_wall)
 
         # DEFINITION: How far (in world units) do we want to be?
-        COMFORT_DISTANCE_WORLD = 250.0 
+        COMFORT_DISTANCE_WORLD = 250.0  # e.g., 60cm or 60px
         
         # CONVERSION: Convert that to grid cells so we can compare with dist_map
         comfort_dist_cells = COMFORT_DISTANCE_WORLD / self.grid.resolution
@@ -199,8 +206,10 @@ class MyDronePrototype(DroneAbstract):
         MAX_PENALTY = 150.0
 
         
+        # --- MODIFIED DRONE AVOIDANCE ZONE - ONLY AVOID DRONES IN FRONT ---
+        # Cache drone danger zone for a few iterations if positions haven't changed
        
-        # --- ADD OTHER DRONES AS TEMPORARY OBSTACLES ---
+        # --- NEW: ADD OTHER DRONES AS TEMPORARY OBSTACLES ---
         # This treats other drones as "walls" for the pathfinder
         if hasattr(self, 'other_drones_positions') and self.other_drones_positions:
         
@@ -234,7 +243,9 @@ class MyDronePrototype(DroneAbstract):
 
     
 
-    
+        # Si explored_only=True, ajouter les zones non explorées à danger_zone
+        if explored_only:
+            danger_zone = danger_zone | (~is_explored_free)  # Block unexplored cells
         
         # Si le start ou le goal sont dans la danger_zone (par ex. drone collé au mur),
         # on autorise une petite zone autour d'eux pour permettre à A* de s'extraire.
@@ -259,15 +270,8 @@ class MyDronePrototype(DroneAbstract):
             pass
 
         def heuristic(a, b):
-            # Tie-breaker: Prefer paths that align with the start-goal vector
-            dx1 = a[0] - b[0]
-            dy1 = a[1] - b[1]
-            dx2 = start[0] - b[0]
-            dy2 = start[1] - b[1]
-            cross = abs(dx1*dy2 - dx2*dy1)
-            
-            # Standard Euclidean + tiny cross-product penalty
-            return math.hypot(dx1, dy1) + (cross * 0.001)
+            # Euclidean distance as an admissible heuristic for 8-connected grid
+            return math.hypot(a[0] - b[0], a[1] - b[1])
 
         # Allow 8-connected moves (including diagonals)
         neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1),
@@ -332,7 +336,7 @@ class MyDronePrototype(DroneAbstract):
                     continue
 
 
-                # --- COST CALCULATION (Soft Constraints) ---
+                # --- NEW: COST CALCULATION (Soft Constraints) ---
                 base_cost = math.hypot(dx, dy)
                 # Retrieve distance to nearest wall (in CELLS)
                 dist_to_wall_cells = dist_map[neighbor[0], neighbor[1]]
@@ -345,11 +349,7 @@ class MyDronePrototype(DroneAbstract):
                     penalty = MAX_PENALTY * (proximity ** 2)
                 
                 move_cost = base_cost + penalty
-
-                # If we are in "return home" mode (explored_only=True) AND the cell is unknown,
-                # we add a massive penalty (50.0) but do NOT block it.
-                if explored_only and is_unexplored[neighbor]:
-                    move_cost += 50.0
+                # -----------------------------------------------
 
                 tentative_g_score = gscore[current] + move_cost
 
@@ -539,10 +539,10 @@ class MyDronePrototype(DroneAbstract):
             self.grid.update_grid(pose=self.estimated_pose)
 
             # Kill Zone Management
-            # if self.kill_zone_grid is None:
-            #     self.kill_zone_grid = np.zeros_like(self.grid.grid)
-            # else:
-            #     self.apply_kill_zones_to_grid()
+            if self.kill_zone_grid is None:
+                self.kill_zone_grid = np.zeros_like(self.grid.grid)
+            else:
+                self.apply_kill_zones_to_grid()
         
             # Semantic Detection
             try:
@@ -592,24 +592,10 @@ class MyDronePrototype(DroneAbstract):
         def is_near_grasped(w):
             return any(math.hypot(w[0] - gx, w[1] - gy) < exclusion_radius for (gx, gy) in grasped)
 
-        available_wounded = []
-        for w in self.wounded_to_rescue:
-            # 1. Check si déjà assigné ou considéré comme grasped (ton code actuel)
-            if w in self.wounded_assignments or is_near_grasped(w):
-                continue
-            
-            # 2. NOUVEAU CHECK : Est-ce que ce blessé est collé à un autre drone ?
-            is_too_close_to_drone = False
-            if hasattr(self, 'other_drones_positions'):
-                for drone_pos_info in self.other_drones_positions:
-                    other_pos = drone_pos_info[0] # (x, y)
-                    # Si le blessé est à moins de 40px d'un autre drone, on l'ignore
-                    if math.hypot(w[0] - other_pos[0], w[1] - other_pos[1]) < 40.0:
-                        is_too_close_to_drone = True
-                        break
-            
-            if not is_too_close_to_drone:
-                available_wounded.append(w)
+        available_wounded = [
+            w for w in self.wounded_to_rescue
+            if w not in self.wounded_assignments and not is_near_grasped(w)
+        ]
         
         if available_wounded and (self.iteration % 50 == 0):
             distances = [np.linalg.norm(np.array(w) - self.current_pose[:2]) for w in available_wounded]
@@ -700,6 +686,9 @@ class MyDronePrototype(DroneAbstract):
                 other_assignments = other.get("wounded_assignments", {})
                 
                 # Check if other_id is assigned to our specific target
+                # We use the position key directly. 
+                # Note: This assumes keys match exactly. If rounding errors occur, the previous distance check was necessary.
+                # But typically in this sim, keys are consistent tuples.
                 is_assigned_to_my_target = (other_assignments.get(self.current_target_wounded) == other_id)
                 
                 # If they are assigned to ANY target, but NOT ours, they are busy.
@@ -1029,63 +1018,68 @@ class MyDronePrototype(DroneAbstract):
 
 
     # --------------------------------------------------------------------------
-    # FONCTION DE DÉTECTION DES FRONTIÈRES SÛRES
-
+    # FONCTION DE DÉTECTION DES FRONTIÈRES SÛRES 
+    # --------------------------------------------------------------------------
     def find_safe_frontier_points(self) -> list:
-        """
-        Combines Frontier Detection with Information Gain for 
-        optimal swarm scouting.
-        """
-        grid_map = self.grid.grid
-        
-        # 1. GENERATE THE DENSITY MAP (The "Reward" layer)
-        # Counts unknown pixels in a 20x20 area around every cell
-        is_unknown = (grid_map >= -4.99) & (grid_map <= 4.0)
-        gain_map = ndimage.uniform_filter(is_unknown.astype(np.float32), size=20)
 
-        # 2. GENERATE THE FRONTIER MASK (The "Access" layer)
-        dx = ndimage.sobel(grid_map, axis=1)
-        dy = ndimage.sobel(grid_map, axis=0)
-        mag_sq = dx**2 + dy**2
-        
-        # Filter for edges that are safe (inflated) and touch unknown space
-        is_wall = (grid_map >= 4.0)
-        danger_zone = binary_dilation(is_wall, iterations=self.inflation_radius_cells)
-        near_unknown = binary_dilation(is_unknown, iterations=2)
-        
-        frontier_mask = (mag_sq > 25.0) & (~danger_zone) & near_unknown
-
-        # 3. EXTRACT AND SCORE CLUSTERS
-        labeled, num_features = ndimage.label(frontier_mask)
-        if num_features == 0: return []
-
-        slices = ndimage.find_objects(labeled)
-        scored_frontiers = []
-        
-        for i, sl in enumerate(slices):
-            if sl is None: continue
-            cluster_mask = (labeled[sl] == (i + 1))
+            grid_map = self.grid.grid 
             
-            if np.sum(cluster_mask) >= 5: # Minimum cluster size
-                coords = np.argwhere(cluster_mask)
-                # Find the center of this frontier
-                my = int(coords[:, 0].mean() + sl[0].start)
-                mx = int(coords[:, 1].mean() + sl[1].start)
-                
-                # GET THE REWARD: Look up the gain at this specific frontier center
-                info_gain = gain_map[my, mx]
-                
-                x_world, y_world = self.grid._conv_grid_to_world(my, mx)
-                scored_frontiers.append({
-                    "point": np.array([x_world, y_world]),
-                    "score": info_gain
-                })
+            # --- 1. CALCUL DU GRADIENT OPTIMISÉ ---
+            dx = ndimage.sobel(grid_map, axis=1)
+            dy = ndimage.sobel(grid_map, axis=0)
 
-        # 4. SORT BY REWARD (Highest Information Gain first)
-        scored_frontiers.sort(key=lambda x: x["score"], reverse=True)
+            mag_sq = dx**2 + dy**2
+            frontier_mask = (mag_sq > 25.0)
 
-        # Return only the points, sorted by best information gain
-        return [f["point"] for f in scored_frontiers]
+            # --- 2. FILTRAGE VECTORISÉ (PAS DE BOUCLE) ---
+ 
+            is_wall = (grid_map >= 4.0) 
+            danger_zone = binary_dilation(is_wall, iterations=2) # 2 itérations = ~20px
+            
+            is_unknown = (grid_map >= -2.0) & (grid_map <= 2.0)
+            
+            # Intersection : Gradient fort et zone sécurisée et proche de l'inconnu
+
+            near_unknown = binary_dilation(is_unknown, iterations=1)
+            frontier_mask &= (~danger_zone) & near_unknown
+
+            # --- 3. CLUSTERING EFFICACE ---
+
+            labeled, num_features = ndimage.label(frontier_mask)
+            
+            if num_features == 0:
+                return []
+
+            # Utilisation de find_objects pour extraire les clusters sans itérer sur toute la grille
+            slices = ndimage.find_objects(labeled)
+            
+            self.frontier_clusters = []
+            min_cluster_size = 5
+            
+            # On itère seulement sur les bounding boxes des clusters trouvés
+            for i, sl in enumerate(slices):
+                if sl is None: continue
+                
+                # Extraction rapide du cluster
+                cluster_mask = (labeled[sl] == (i + 1))
+                size = np.sum(cluster_mask)
+                
+                if size >= min_cluster_size:
+                    # Calcul direct des coordonnées moyennes dans la slice
+                    coords = np.argwhere(cluster_mask)
+                    mean_y = coords[:, 0].mean() + sl[0].start
+                    mean_x = coords[:, 1].mean() + sl[1].start
+                    
+                    # Conversion monde
+                    x_world, y_world = self.grid._conv_grid_to_world(mean_y, mean_x)
+                    
+                    self.frontier_clusters.append({
+                        "barycenter": np.array([x_world, y_world]),
+                        "size": int(size)
+                    })
+
+            # Retourne les barycentres pour la stratégie d'exploration
+            return [c["barycenter"] for c in self.frontier_clusters]
 
     # FONCTION DE DESSIN
     # --------------------------------------------------------------------------
@@ -1122,7 +1116,7 @@ class MyDronePrototype(DroneAbstract):
     # --- interesting area to explore---
 
         if self.iteration % 10 == 0:
-            self.gain_targets = self.find_safe_frontier_points()
+            self.gain_targets = self.find_high_information_gain_targets()
 
         if hasattr(self, 'gain_targets'):
             for target in self.gain_targets:
@@ -1194,6 +1188,14 @@ class MyDronePrototype(DroneAbstract):
                 p1 = self.path[i] + self._half_size_array
                 p2 = self.path[i+1] + self._half_size_array
                 arcade.draw_line(p1[0], p1[1], p2[0], p2[1], color=green, line_width=3)
+
+    
+        
+
+        # --- DRAW THIS DRONE'S POSITION (for reference) ---
+        my_screen_pos = self.current_pose[:2] + self._half_size_array
+        arcade.draw_circle_filled(my_screen_pos[0], my_screen_pos[1], 
+                                radius=18, color=detection_color)
         
     
 
@@ -1225,7 +1227,6 @@ class MyDronePrototype(DroneAbstract):
     # FONCTIONS DE PILOTAGE
     # --------------------------------------------------------------------------
  
-    
     def follow_path(self, lidar_data) -> CommandsDict:
         if not self.path:
             return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
@@ -1344,7 +1345,6 @@ class MyDronePrototype(DroneAbstract):
         gps_pos = self.measured_gps_position()
         compass_angle = self.measured_compass_angle()
         measured_vel = self.measured_velocity()
-        lidar_data = self.lidar_values()
         
         # Calculate dt for Kalman filter
         current_time = self.iteration * 0.1  # Assuming 10 Hz
@@ -1354,7 +1354,7 @@ class MyDronePrototype(DroneAbstract):
             self.kf_dt = 0.1  # Default for first iteration
         self.kf_last_time = current_time
 
-        # --- UPDATE HEADING ---
+        # --- UPDATE HEADING (always available unless in kill zone) ---
         if compass_angle is not None:
             self.current_pose[2] = compass_angle
         
@@ -1472,9 +1472,6 @@ class MyDronePrototype(DroneAbstract):
                 self.current_pose[0] += dx_world
                 self.current_pose[1] += dy_world
                 
-                if self.iteration % 10 == 0:  # Print every 10 iterations to reduce spam
-                    print(f"[{self.identifier}] Dead reckoning: dist={dist_travel:.1f}, alpha={math.degrees(alpha):.1f}°, "
-                        f"theta={math.degrees(theta):.1f}°, heading={math.degrees(heading):.1f}°")
 
 
     def process_communication_sensor(self):
@@ -1512,38 +1509,40 @@ class MyDronePrototype(DroneAbstract):
                 # Store as tuple: (position_array, id)
                 other_drones_positions.append((np.array(pos), other_id))
 
-        #          # CHECK IF THIS DRONE WAS DECLARED DEAD (FALSE POSITIVE)
-        #         if other_id in self.declared_dead_drones:
-        #             print(f"[{self.identifier}] FALSE POSITIVE DETECTED! Drone {other_id} is ALIVE!")
+                 # CHECK IF THIS DRONE WAS DECLARED DEAD (FALSE POSITIVE)
+                if other_id in self.declared_dead_drones:
+                    print(f"[{self.identifier}] FALSE POSITIVE DETECTED! Drone {other_id} is ALIVE!")
                     
-        #             # Remove from dead list
-        #             self.declared_dead_drones.remove(other_id)
+                    # Remove from dead list
+                    self.declared_dead_drones.remove(other_id)
                     
-        #             # Find and remove the kill zone associated with this drone
-        #             # We need to find the kill zone closest to where we last heard from them
-        #             if other_id in self.drone_last_heard:
-        #                 false_death_pos = self.drone_last_heard[other_id]["position"]
-        #                 self.clear_kill_zone_from_grid(false_death_pos)
+                    # Find and remove the kill zone associated with this drone
+                    # We need to find the kill zone closest to where we last heard from them
+                    if other_id in self.drone_last_heard:
+                        false_death_pos = self.drone_last_heard[other_id]["position"]
+                        self.clear_kill_zone_from_grid(false_death_pos)
 
                         
-        #             self.known_kill_zones = [
-        #                         kz for kz in self.known_kill_zones 
-        #                         if math.hypot(false_death_pos[0] - kz[0], false_death_pos[1] - kz[1]) > 150.0
-        # ]
+                    self.known_kill_zones = [
+                                kz for kz in self.known_kill_zones 
+                                if math.hypot(false_death_pos[0] - kz[0], false_death_pos[1] - kz[1]) > 150.0
+        ]
                         
+
+
 
                 # Update last heard status
-                # self.drone_last_heard[other_id] = {
-                #     "iteration": current_iteration,
-                #     "position": (pos[0], pos[1])
-                # }
+                self.drone_last_heard[other_id] = {
+                    "iteration": current_iteration,
+                    "position": (pos[0], pos[1])
+                }
 
-                # if other_id not in self.drone_position_history:
-                #     self.drone_position_history[other_id] = []
-                # self.drone_position_history[other_id].append((current_iteration, (pos[0], pos[1])))
-                # # Keep only the last 5 positions
-                # if len(self.drone_position_history[other_id]) > 3:
-                #     self.drone_position_history[other_id] = self.drone_position_history[other_id][-5:]
+                if other_id not in self.drone_position_history:
+                    self.drone_position_history[other_id] = []
+                self.drone_position_history[other_id].append((current_iteration, (pos[0], pos[1])))
+                # Keep only the last 5 positions
+                if len(self.drone_position_history[other_id]) > 3:
+                    self.drone_position_history[other_id] = self.drone_position_history[other_id][-5:]
 
 
             
@@ -1651,102 +1650,102 @@ class MyDronePrototype(DroneAbstract):
         self.wounded_to_rescue = merged_wounded
 
 
-        # # --- DETECT DEATHS (Check for silent drones) ---
+        # --- DETECT DEATHS (Check for silent drones) ---
 
-        # if not self.base.in_kill_zone:
-        #     for drone_id, info in list(self.drone_last_heard.items()):
-        #         silence_duration = current_iteration - info["iteration"]
+        if not self.base.in_kill_zone:
+            for drone_id, info in list(self.drone_last_heard.items()):
+                silence_duration = current_iteration - info["iteration"]
                 
-        #         # If a drone has been silent for too long, assume death
-        #         if silence_duration > self.DEATH_TIMEOUT:
-        #             death_pos = info["position"]
+                # If a drone has been silent for too long, assume death
+                if silence_duration > self.DEATH_TIMEOUT:
+                    death_pos = info["position"]
 
-        #         #  Don't mark kill zone if we're too far away to hear them anyway
-        #             my_distance_to_death = math.hypot(
-        #                 self.current_pose[0] - death_pos[0],
-        #                 self.current_pose[1] - death_pos[1]
-        #         )
+                #  Don't mark kill zone if we're too far away to hear them anyway
+                    my_distance_to_death = math.hypot(
+                        self.current_pose[0] - death_pos[0],
+                        self.current_pose[1] - death_pos[1]
+                )
                     
-        #             # If they were far away, they might just be out of range
-        #             MAX_COMM_RANGE = 200.0 
-        #             if my_distance_to_death > MAX_COMM_RANGE:
-        #                 continue
+                    # If they were far away, they might just be out of range
+                    MAX_COMM_RANGE = 200.0 
+                    if my_distance_to_death > MAX_COMM_RANGE:
+                        continue
                     
-        #             # First timeout - add to suspected list
-        #             if drone_id not in self.suspected_dead_drones:
-        #                 self.suspected_dead_drones[drone_id] = {
-        #                     "first_timeout_iter": current_iteration,
-        #                     "position": death_pos
-        #                 }
-        #                 print(f"[{self.identifier}] SUSPECTED DEATH: Drone {drone_id} at {death_pos}")
-        #                 print(f"    Waiting {self.CONFIRMATION_TIMEOUT} iterations for confirmation...")
-        #                 continue  # Don't declare yet!
+                    # First timeout - add to suspected list
+                    if drone_id not in self.suspected_dead_drones:
+                        self.suspected_dead_drones[drone_id] = {
+                            "first_timeout_iter": current_iteration,
+                            "position": death_pos
+                        }
+                        print(f"[{self.identifier}] SUSPECTED DEATH: Drone {drone_id} at {death_pos}")
+                        print(f"    Waiting {self.CONFIRMATION_TIMEOUT} iterations for confirmation...")
+                        continue  # Don't declare yet!
 
-        #             # STEP 2: Confirmation timeout - declare death
-        #             suspected_info = self.suspected_dead_drones[drone_id]
-        #             confirmation_duration = current_iteration - suspected_info["first_timeout_iter"]
+                    # STEP 2: Confirmation timeout - declare death
+                    suspected_info = self.suspected_dead_drones[drone_id]
+                    confirmation_duration = current_iteration - suspected_info["first_timeout_iter"]
                     
-        #             if confirmation_duration >= self.CONFIRMATION_TIMEOUT:
-        #                 # Check if we already marked this area
-        #                 is_new_kill_zone = True
-        #                 for kz_pos in self.known_kill_zones:
-        #                     if math.hypot(death_pos[0] - kz_pos[0], death_pos[1] - kz_pos[1]) < 50.0:
-        #                         is_new_kill_zone = False
-        #                         break
+                    if confirmation_duration >= self.CONFIRMATION_TIMEOUT:
+                        # Check if we already marked this area
+                        is_new_kill_zone = True
+                        for kz_pos in self.known_kill_zones:
+                            if math.hypot(death_pos[0] - kz_pos[0], death_pos[1] - kz_pos[1]) < 50.0:
+                                is_new_kill_zone = False
+                                break
 
-        #                 if is_new_kill_zone:
-        #                     print(f"[{self.identifier}] DETECTED KILL ZONE! Drone {drone_id} died at {death_pos}, at iteration {info['iteration']}")
-        #                     self.known_kill_zones.append(death_pos)
-        #                     #self.mark_kill_zone_on_grid(death_pos,drone_id)
-        #                     self.declared_dead_drones.add(drone_id)
+                        if is_new_kill_zone:
+                            print(f"[{self.identifier}] DETECTED KILL ZONE! Drone {drone_id} died at {death_pos}, at iteration {info['iteration']}")
+                            self.known_kill_zones.append(death_pos)
+                            #self.mark_kill_zone_on_grid(death_pos,drone_id)
+                            self.declared_dead_drones.add(drone_id)
 
-        #     # --- FALSE ALARM CHECK ---
-        #     for drone_id in list(self.suspected_dead_drones.keys()):
-        #         if drone_id in [d_id for (_, d_id) in other_drones_positions]:
-        #             print(f"[{self.identifier}]  FALSE ALARM: Drone {drone_id} is alive! Removing from suspected list.")
-        #             self.suspected_dead_drones.pop(drone_id, None)
+            # --- FALSE ALARM CHECK ---
+            for drone_id in list(self.suspected_dead_drones.keys()):
+                if drone_id in [d_id for (_, d_id) in other_drones_positions]:
+                    print(f"[{self.identifier}]  FALSE ALARM: Drone {drone_id} is alive! Removing from suspected list.")
+                    self.suspected_dead_drones.pop(drone_id, None)
 
 
             
-    # def find_free_position_for_unstuck(self):
-    #     """
-    #     Find the first safe free position at a medium distance to escape when stuck.
-    #     Returns a position (x, y) in world coordinates, or None if not found.
-    #     """
-    #     grid_map = self.grid.grid
-    #     SEUIL_FREE = -10.0
-    #     SEUIL_MUR = 5.0
+    def find_free_position_for_unstuck(self):
+        """
+        Find the first safe free position at a medium distance to escape when stuck.
+        Returns a position (x, y) in world coordinates, or None if not found.
+        """
+        grid_map = self.grid.grid
+        SEUIL_FREE = -10.0
+        SEUIL_MUR = 5.0
 
-    #     is_free = (grid_map < SEUIL_FREE)
-    #     is_wall = (grid_map >= SEUIL_MUR)
-    #     struct = np.ones((5, 5), dtype=bool)
-    #     danger_zone = binary_dilation(is_wall, structure=struct, iterations=1)
-    #     safe_free = is_free & (~danger_zone)
+        is_free = (grid_map < SEUIL_FREE)
+        is_wall = (grid_map >= SEUIL_MUR)
+        struct = np.ones((5, 5), dtype=bool)
+        danger_zone = binary_dilation(is_wall, structure=struct, iterations=1)
+        safe_free = is_free & (~danger_zone)
 
-    #     if not np.any(safe_free):
-    #         return None
+        if not np.any(safe_free):
+            return None
 
-    #     current_grid_pos = self.grid._conv_world_to_grid(self.current_pose[0], self.current_pose[1])
-    #     current_y, current_x = int(current_grid_pos[0]), int(current_grid_pos[1])
+        current_grid_pos = self.grid._conv_world_to_grid(self.current_pose[0], self.current_pose[1])
+        current_y, current_x = int(current_grid_pos[0]), int(current_grid_pos[1])
 
-    #     safe_positions = np.argwhere(safe_free)
-    #     if len(safe_positions) == 0:
-    #         return None
+        safe_positions = np.argwhere(safe_free)
+        if len(safe_positions) == 0:
+            return None
 
-    #     distances = np.sqrt(
-    #         (safe_positions[:, 0] - current_y) ** 2 +
-    #         (safe_positions[:, 1] - current_x) ** 2
-    #     )
+        distances = np.sqrt(
+            (safe_positions[:, 0] - current_y) ** 2 +
+            (safe_positions[:, 1] - current_x) ** 2
+        )
 
-    #     min_dist = 3
-    #     max_dist = 6
-    #     for idx, d in enumerate(distances):
-    #         if min_dist <= d <= max_dist:
-    #             chosen_pos = safe_positions[idx]
-    #             x_free, y_free = self.grid._conv_grid_to_world(chosen_pos[0], chosen_pos[1])
-    #             return (x_free, y_free)
+        min_dist = 3
+        max_dist = 6
+        for idx, d in enumerate(distances):
+            if min_dist <= d <= max_dist:
+                chosen_pos = safe_positions[idx]
+                x_free, y_free = self.grid._conv_grid_to_world(chosen_pos[0], chosen_pos[1])
+                return (x_free, y_free)
 
-    #     return None  # No suitable cell found
+        return None  # No suitable cell found
 
     # def check_and_handle_general_stuck(self):
     #     """
@@ -1904,189 +1903,180 @@ class MyDronePrototype(DroneAbstract):
             self.last_breadcrumb_pos = current_pos_tuple
     
 
-    # def mark_kill_zone_on_grid(self, death_pos, drone_id):
-    #     try:
-    #         if self.kill_zone_grid is None:
-    #             self.kill_zone_grid = np.zeros_like(self.grid.grid)
+    def mark_kill_zone_on_grid(self, death_pos, drone_id):
+        try:
+            if self.kill_zone_grid is None:
+                self.kill_zone_grid = np.zeros_like(self.grid.grid)
 
-    #         # Use last two positions for direction and speed
-    #         history = self.drone_position_history.get(drone_id, [])
-    #         if len(history) >= 2:
-    #             (iter1, pos1), (iter2, pos2) = history[-2], history[-1]
-    #             dt = max(1, iter2 - iter1)
-    #             dx = pos2[0] - pos1[0]
-    #             dy = pos2[1] - pos1[1]
-    #             speed = math.hypot(dx, dy) / dt  # px per iteration
-    #             # Estimate how far it could have gone since last heard
-    #             silence = self.DEATH_TIMEOUT
-    #             max_travel = speed * silence
-    #             # Center kill zone a bit ahead in the direction of movement
-    #             direction = np.array([dx, dy])
-    #             if np.linalg.norm(direction) > 0:
-    #                 direction = direction / np.linalg.norm(direction)
-    #             center = np.array(pos2) + direction * (max_travel / 2)
-    #             square_size = max(130, min(150.0, max_travel * 5))
-    #         else:
-    #             center = np.array(death_pos)
-    #             square_size = 150.0  # fallback
+            # Use last two positions for direction and speed
+            history = self.drone_position_history.get(drone_id, [])
+            if len(history) >= 2:
+                (iter1, pos1), (iter2, pos2) = history[-2], history[-1]
+                dt = max(1, iter2 - iter1)
+                dx = pos2[0] - pos1[0]
+                dy = pos2[1] - pos1[1]
+                speed = math.hypot(dx, dy) / dt  # px per iteration
+                # Estimate how far it could have gone since last heard
+                silence = self.DEATH_TIMEOUT
+                max_travel = speed * silence
+                # Center kill zone a bit ahead in the direction of movement
+                direction = np.array([dx, dy])
+                if np.linalg.norm(direction) > 0:
+                    direction = direction / np.linalg.norm(direction)
+                center = np.array(pos2) + direction * (max_travel / 2)
+                square_size = max(130, min(150.0, max_travel * 5))
+            else:
+                center = np.array(death_pos)
+                square_size = 150.0  # fallback
 
-    #         # Convert to grid and mark
-    #         grid_pos = self.grid._conv_world_to_grid(center[0], center[1])
-    #         center_y, center_x = int(grid_pos[0]), int(grid_pos[1])
-    #         size_cells = int(square_size / self.grid.resolution)
-    #         half_size = size_cells // 2
-    #         y0 = max(0, center_y - half_size)
-    #         y1 = min(self.grid.grid.shape[0], center_y + half_size)
-    #         x0 = max(0, center_x - half_size)
-    #         x1 = min(self.grid.grid.shape[1], center_x + half_size)
-    #         self.kill_zone_grid[y0:y1, x0:x1] = 1.0
+            # Convert to grid and mark
+            grid_pos = self.grid._conv_world_to_grid(center[0], center[1])
+            center_y, center_x = int(grid_pos[0]), int(grid_pos[1])
+            size_cells = int(square_size / self.grid.resolution)
+            half_size = size_cells // 2
+            y0 = max(0, center_y - half_size)
+            y1 = min(self.grid.grid.shape[0], center_y + half_size)
+            x0 = max(0, center_x - half_size)
+            x1 = min(self.grid.grid.shape[1], center_x + half_size)
+            self.kill_zone_grid[y0:y1, x0:x1] = 1.0
 
-    #         print(f"[{self.identifier}] Marked improved kill zone for {drone_id} at {center} (size {square_size:.1f})")
-    #     except Exception as e:
-    #         print(f"[{self.identifier}] Error marking kill zone: {e}")
+            print(f"[{self.identifier}] Marked improved kill zone for {drone_id} at {center} (size {square_size:.1f})")
+        except Exception as e:
+            print(f"[{self.identifier}] Error marking kill zone: {e}")
 
 
 
-    # def apply_kill_zones_to_grid(self):
-    #     """
-    #     RE-APPLY all known kill zones after lidar updates overwrite them.
-    #     Uses vectorized operations for speed (no loops over zones).
-    #     """
-    #     if self.kill_zone_grid is None or not np.any(self.kill_zone_grid):
-    #         return  # No kill zones marked yet
+    def apply_kill_zones_to_grid(self):
+        """
+        RE-APPLY all known kill zones after lidar updates overwrite them.
+        Uses vectorized operations for speed (no loops over zones).
+        """
+        if self.kill_zone_grid is None or not np.any(self.kill_zone_grid):
+            return  # No kill zones marked yet
     
-    #     # Where kill_zone_grid == 1.0, set grid.grid to 100.0
-    #     self.grid.grid[self.kill_zone_grid == 1.0] = 100.0
+        # Where kill_zone_grid == 1.0, set grid.grid to 100.0
+        self.grid.grid[self.kill_zone_grid == 1.0] = 100.0
 
 
-    # def detect_kill_zone_size(self, death_pos, drone_id):
-    #     """
-    #     ULTRA-SIMPLE METHOD: Use the drone's LAST HEARD position as the safe position.
-    #     The last heard position is inherently safe (they were alive and transmitting).
-    #     Returns square size in PIXELS.
-    #     """
-    #     try:
+    def detect_kill_zone_size(self, death_pos, drone_id):
+        """
+        ULTRA-SIMPLE METHOD: Use the drone's LAST HEARD position as the safe position.
+        The last heard position is inherently safe (they were alive and transmitting).
+        Returns square size in PIXELS.
+        """
+        try:
             
-    #         # SIMPLIFIED APPROACH: Use a reasonable default based on drone speed
-    #         # Drones move at ~50-100 pixels per timeout period
-    #         # DEATH_TIMEOUT = 20 iterations = ~2 seconds
-    #         # Max speed ≈ 100 px/s → 200px in 2 seconds
+            # SIMPLIFIED APPROACH: Use a reasonable default based on drone speed
+            # Drones move at ~50-100 pixels per timeout period
+            # DEATH_TIMEOUT = 20 iterations = ~2 seconds
+            # Max speed ≈ 100 px/s → 200px in 2 seconds
             
-    #         SAFETY_MARGIN = 1.5  # 50% larger for safety
-    #         ASSUMED_TRAVEL_DISTANCE = 125.0  # Conservative estimate
+            SAFETY_MARGIN = 1.5  # 50% larger for safety
+            ASSUMED_TRAVEL_DISTANCE = 125.0  # Conservative estimate
             
-    #         square_size = ASSUMED_TRAVEL_DISTANCE * SAFETY_MARGIN
+            square_size = ASSUMED_TRAVEL_DISTANCE * SAFETY_MARGIN
             
-    #         # Validation
-    #         MIN_SIZE = 100.0
-    #         MAX_SIZE = 500.0
-    #         square_size = np.clip(square_size, MIN_SIZE, MAX_SIZE)
+            # Validation
+            MIN_SIZE = 100.0
+            MAX_SIZE = 500.0
+            square_size = np.clip(square_size, MIN_SIZE, MAX_SIZE)
             
-    #         print(f"[{self.identifier}] Kill zone detection for drone {drone_id}:")
-    #         print(f"    Death position: {death_pos}")
-    #         print(f"    Assumed travel distance: {ASSUMED_TRAVEL_DISTANCE}px")
-    #         print(f"    Square size (with {SAFETY_MARGIN}x margin): {square_size:.0f}x{square_size:.0f}px")
+            print(f"[{self.identifier}] Kill zone detection for drone {drone_id}:")
+            print(f"    Death position: {death_pos}")
+            print(f"    Assumed travel distance: {ASSUMED_TRAVEL_DISTANCE}px")
+            print(f"    Square size (with {SAFETY_MARGIN}x margin): {square_size:.0f}x{square_size:.0f}px")
             
-    #         return float(square_size)
+            return float(square_size)
             
-    #     except Exception as e:
-    #         print(f"[{self.identifier}] Error detecting kill zone size: {e}")
-    #         import traceback
-    #         traceback.print_exc()
-    #         return 200.0  # Safe fallback
+        except Exception as e:
+            print(f"[{self.identifier}] Error detecting kill zone size: {e}")
+            import traceback
+            traceback.print_exc()
+            return 200.0  # Safe fallback
         
+
 
     def go_to_wounded(self, lidar_data) -> CommandsDict:
         """
-        Navigation vers le blessé avec 'Soft Landing'.
+        Navigation vers le blessé.
+        - Si distance > 20 pixels : utilise follow_path (suivi de chemin A*)
+        - Si distance <= 20 pixels : s'oriente vers le blessé et avance rapidement (pas de ralentissement).
         """
         if self.current_target_wounded is None:
-            return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0, "grasper": 0}
+            return {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
 
         dist_to_wounded = np.linalg.norm(np.array(self.current_target_wounded) - self.current_pose[:2])
 
-        # 1. Long range: use standard path following
-        if dist_to_wounded > 50.0:
+        # Get closer before switching to direct approach
+        if dist_to_wounded > 80.0:
             return self.follow_path(lidar_data)
         
-        # 2. Short range: Begin Direct Approach & Soft Landing logic
-        self.grasped_wounded_angle = self.get_wounded_orientation()
+        else:
+            # --- Store wounded orientation just before grasping ---
+            self.grasped_wounded_angle = self.get_wounded_orientation()
 
-        # Calculate errors
+
+    # Direct approach: orient and move fast
         delta_pos = np.array(self.current_target_wounded) - self.current_pose[:2]
         target_angle = math.atan2(delta_pos[1], delta_pos[0])
-        angle_error = normalize_angle(target_angle - self.current_pose[2])
+        heading = self.current_pose[2]
+        angle_error = normalize_angle(target_angle - heading)
 
-        # Rotation PID (Maintains alignment during approach)
+        # PID Rotation
         deriv_error = angle_error - getattr(self, "prev_angle_error", 0.0)
-        rotation_speed = float(np.clip(self.Kp * angle_error + self.Kd * deriv_error, -1.0, 1.0))
+        rotation_speed = self.Kp * angle_error + self.Kd * deriv_error
+        rotation_speed = float(np.clip(rotation_speed, -1.0, 1.0))
         self.prev_angle_error = angle_error
 
-        # --- SOFT LANDING LOGIC ---
-        # We define a 'min_speed' to ensure we reach the target, and 'max_speed' for the start of the approach.
-        # The speed scales down as 'dist_to_wounded' decreases.
-        MIN_SPEED = 0.2
-        MAX_SPEED = 0.8
-        APPROACH_RADIUS = 50.0
-        
-        # Proportional speed: slower as we get closer
-        proportional_speed = (dist_to_wounded / APPROACH_RADIUS) * MAX_SPEED
-        forward_speed = max(MIN_SPEED, proportional_speed)
-
-        # 3. Decision Layer
-        ALIGNMENT_THRESHOLD = math.radians(7.0) # Allow slight error to keep moving
+        # Align more loosely if you want to be more aggressive
+        ALIGNMENT_THRESHOLD = math.radians(5.0)
 
         if abs(angle_error) > ALIGNMENT_THRESHOLD:
-            # Phase 1: Heavy rotation required, stop forward movement to pivot
-            return {"forward": 0.0, "lateral": 0.0, "rotation": rotation_speed, "grasper": 1}
+            # Phase 1: Turn in place
+            return {"forward": 0.0, "lateral": 0.0, "rotation": rotation_speed}
         else:
-            # Phase 2: Aligned enough to move, apply soft landing speed
-            return {
-                "forward": float(forward_speed),
-                "lateral": 0.0,
-                "rotation": rotation_speed,
-                "grasper": 1
-            }
+            # Phase 2: Go straight, fast!
+            return {"forward": 1.0, "lateral": 0.0, "rotation": rotation_speed}
 
 
-    # def clear_kill_zone_from_grid(self, false_death_pos):
-    #         try:
-    #             if self.kill_zone_grid is None:
-    #                 return
+    def clear_kill_zone_from_grid(self, false_death_pos):
+            try:
+                if self.kill_zone_grid is None:
+                    return
                 
-    #             # Utiliser la même taille que lors du marquage (150px par défaut dans votre code)
-    #             ASSUMED_TRAVEL_DISTANCE = 150.0
-    #             SAFETY_MARGIN = 1.5
-    #             square_size = ASSUMED_TRAVEL_DISTANCE * SAFETY_MARGIN
+                # Utiliser la même taille que lors du marquage (150px par défaut dans votre code)
+                ASSUMED_TRAVEL_DISTANCE = 150.0
+                SAFETY_MARGIN = 1.5
+                square_size = ASSUMED_TRAVEL_DISTANCE * SAFETY_MARGIN
                 
-    #             grid_pos = self.grid._conv_world_to_grid(false_death_pos[0], false_death_pos[1])
-    #             center_y, center_x = int(grid_pos[0]), int(grid_pos[1])
+                grid_pos = self.grid._conv_world_to_grid(false_death_pos[0], false_death_pos[1])
+                center_y, center_x = int(grid_pos[0]), int(grid_pos[1])
                 
-    #             size_cells = int(square_size / self.grid.resolution)
-    #             half_size = size_cells // 2
+                size_cells = int(square_size / self.grid.resolution)
+                half_size = size_cells // 2
                 
-    #             y0 = max(0, center_y - half_size)
-    #             y1 = min(self.grid.grid.shape[0], center_y + half_size)
-    #             x0 = max(0, center_x - half_size)
-    #             x1 = min(self.grid.grid.shape[1], center_x + half_size)
+                y0 = max(0, center_y - half_size)
+                y1 = min(self.grid.grid.shape[0], center_y + half_size)
+                x0 = max(0, center_x - half_size)
+                x1 = min(self.grid.grid.shape[1], center_x + half_size)
                 
-    #             # --- CORRECTION : Remplacer par une valeur "Explored Free" ---
-    #             # Dans votre code, SEUIL_FREE est à -5.0. On met -10.0 pour être sûr.
-    #             VALEUR_EXPLORED_FREE = -10.0
+                # --- CORRECTION : Remplacer par une valeur "Explored Free" ---
+                # Dans votre code, SEUIL_FREE est à -5.0. On met -10.0 pour être sûr.
+                VALEUR_EXPLORED_FREE = -10.0
                 
-    #             # # 1. On efface le masque de la kill zone
-    #             # self.kill_zone_grid[y0:y1, x0:x1] = 0.0
+                # 1. On efface le masque de la kill zone
+                self.kill_zone_grid[y0:y1, x0:x1] = 0.0
                 
-    #             # 2. On remplace les murs artificiels par du vide exploré dans la grille de navigation
-    #             # On ne le fait que là où il y avait un mur de Kill Zone (valeur 100.0)
-    #             # pour ne pas effacer les vrais murs physiques aux alentours.
-    #             mask_to_clear = (self.grid.grid[y0:y1, x0:x1] >= 100.0)
-    #             self.grid.grid[y0:y1, x0:x1][mask_to_clear] = VALEUR_EXPLORED_FREE
+                # 2. On remplace les murs artificiels par du vide exploré dans la grille de navigation
+                # On ne le fait que là où il y avait un mur de Kill Zone (valeur 100.0)
+                # pour ne pas effacer les vrais murs physiques aux alentours.
+                mask_to_clear = (self.grid.grid[y0:y1, x0:x1] >= 100.0)
+                self.grid.grid[y0:y1, x0:x1][mask_to_clear] = VALEUR_EXPLORED_FREE
                 
-    #             print(f"[{self.identifier}] Kill zone cleared and grid restored to free space at {false_death_pos}")
+                print(f"[{self.identifier}] Kill zone cleared and grid restored to free space at {false_death_pos}")
                 
-    #         except Exception as e:
-    #             print(f"[{self.identifier}] Error clearing kill zone: {e}")
+            except Exception as e:
+                print(f"[{self.identifier}] Error clearing kill zone: {e}")
 
 
 
@@ -2224,4 +2214,45 @@ class MyDronePrototype(DroneAbstract):
             print(f"[{self.identifier}] No return area points available!")
     
 
-    
+    def find_high_information_gain_targets(self):
+        """
+        Highly efficient Information Gain Gradient using vectorized box filters.
+        """
+        grid_map = self.grid.grid
+        
+        # 1. Binary Masks (Vectorized)
+        # Unexplored is roughly 0, Free is negative
+        is_unexplored = (grid_map >= -4.99) & (grid_map <= 4.0)
+        is_free = (grid_map < -5.0)
+        
+        # 2. Fast Box Filter (O(N) Complexity)
+        # Uniform filter calculates the mean in a 20x20 area instantly
+        window_size = 20
+        gain_map = ndimage.uniform_filter(is_unexplored.astype(np.float32), size=window_size)
+        
+        # 3. Constraint: Must be a reachable frontier
+        # We only care about high gain areas that touch our explored space
+        frontier_mask = is_free & binary_dilation(is_unexplored, iterations=1)
+        
+        # Apply mask and find top candidates
+        gain_map[~frontier_mask] = 0
+        
+        # 4. Efficient Peak Finding
+        # Instead of sorting every pixel, we find indices above a high threshold
+        threshold = 0.4  # Focus on areas that are at least 40% unknown
+        y_coords, x_coords = np.where(gain_map > threshold)
+        
+        if len(y_coords) == 0:
+            return []
+
+        # Subsample or pick local peaks to avoid clusters
+        # We take every 10th candidate to ensure spatial distribution
+        potential_targets = []
+        for i in range(0, len(y_coords), 10):
+            y, x = y_coords[i], x_coords[i]
+            world_pos = self.grid._conv_grid_to_world(y, x)
+            potential_targets.append((world_pos, gain_map[y, x]))
+
+        # Sort only the limited subset
+        potential_targets.sort(key=lambda x: x[1], reverse=True)
+        return [t[0] for t in potential_targets[:5]]
