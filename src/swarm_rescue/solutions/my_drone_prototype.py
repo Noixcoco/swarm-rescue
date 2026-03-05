@@ -130,8 +130,8 @@ class MyDronePrototype(DroneAbstract):
         # --- Dead Drones / Kill Zones Detection ---
         self.dead_drones = []  # Confirmed dead drones (x, y)
         self.suspected_dead_drones = [] # Candidates: {'pos': (x,y), 'first_seen_iter': int, 'last_seen_iter': int}
-        self.dead_drone_radius = 60.0 # Radius to match a drone
-        self.dead_confirm_iterations = 5 # How many iterations of immobility to confirm death
+        self.dead_drone_radius = 80.0 # Radius to match a drone
+        self.dead_confirm_iterations = 10 # How many iterations of immobility to confirm death
 
         self.prev_wall_error = None
         self.integral_wall_error = 0.0
@@ -207,28 +207,27 @@ class MyDronePrototype(DroneAbstract):
         # Cache drone danger zone for a few iterations if positions haven't changed
        
         # (Drone obstacle avoidance removed as per request)
-                # --- RÉACTIVATION DE L'ÉVITEMENT DES DRONES DANS LE PATH PLANNING ---
-        # On ajoute une "bulle" d'obstacle temporaire autour des autres drones
-        # pour que l'algorithme A* planifie un chemin qui les évite.
-        if hasattr(self, 'other_drones_positions') and self.other_drones_positions:
-            # Créer une "bulle" de 120px de diamètre (60px de rayon) autour des autres drones
-            bubble_radius_cells = int(90.0 / self.grid.resolution)
+        # # On ajoute une "bulle" d'obstacle temporaire autour des autres drones
+        # # pour que l'algorithme A* planifie un chemin qui les évite.
+        # if hasattr(self, 'other_drones_positions') and self.other_drones_positions:
+        #     # Créer une "bulle" de 120px de diamètre (60px de rayon) autour des autres drones
+        #     bubble_radius_cells = int(90.0 / self.grid.resolution)
 
-            for other_drone_info in self.other_drones_positions:
-                other_pos_world = other_drone_info[0][:2]  # (x, y)
-                other_pos_grid = self.grid._conv_world_to_grid(*other_pos_world)
+        #     for other_drone_info in self.other_drones_positions:
+        #         other_pos_world = other_drone_info[0][:2]  # (x, y)
+        #         other_pos_grid = self.grid._conv_world_to_grid(*other_pos_world)
                 
-                if other_pos_grid is not None:
-                    gy, gx = int(other_pos_grid[0]), int(other_pos_grid[1])
+        #         if other_pos_grid is not None:
+        #             gy, gx = int(other_pos_grid[0]), int(other_pos_grid[1])
                     
-                    # Définir les limites d'un carré pour la bulle
-                    y0 = max(0, gy - bubble_radius_cells)
-                    y1 = min(grid.shape[0], gy + bubble_radius_cells + 1)
-                    x0 = max(0, gx - bubble_radius_cells)
-                    x1 = min(grid.shape[1], gx + bubble_radius_cells + 1)
+        #             # Définir les limites d'un carré pour la bulle
+        #             y0 = max(0, gy - bubble_radius_cells)
+        #             y1 = min(grid.shape[0], gy + bubble_radius_cells + 1)
+        #             x0 = max(0, gx - bubble_radius_cells)
+        #             x1 = min(grid.shape[1], gx + bubble_radius_cells + 1)
                     
-                    # Marquer cette zone comme dangereuse pour l'A*
-                    danger_zone[y0:y1, x0:x1] = True
+        #             # Marquer cette zone comme dangereuse pour l'A*
+        #             danger_zone[y0:y1, x0:x1] = True
 
     
 
@@ -397,8 +396,10 @@ class MyDronePrototype(DroneAbstract):
         
         if not (0 <= y < danger_zone.shape[1] and 0 <= x < danger_zone.shape[0]):
             return False
-        region = danger_zone[max(0, y-1):y+2, max(0, x-1):x+2]
-        return not np.any(region)
+        # region = danger_zone[max(0, y-1):y+2, max(0, x-1):x+2]
+        # return not np.any(region)
+        
+        return not danger_zone[x, y]
     
 
     def define_message_for_all(self):
@@ -1035,21 +1036,8 @@ class MyDronePrototype(DroneAbstract):
 
             elif data.entity_type == DroneSemanticSensor.TypeEntity.RESCUE_CENTER:
                 global_angle = normalize_angle(ptheta + data.angle)
-
-                # Reculer le point de 20 pixels vers le drone pour être en zone sûre
-                safety_margin = 20.0
-                dist_adj = max(0, data.distance - safety_margin)
-                xr = px + dist_adj * math.cos(global_angle)
-                yr = py + dist_adj * math.sin(global_angle)
-                # --- AJOUT : Vérification de collision ---
-                res_grid = self.grid._conv_world_to_grid(xr, yr)
-                if res_grid is not None:
-                    gy, gx = int(res_grid[0]), int(res_grid[1])
-                    # On ne garde le point que s'il est dans une zone explorée libre (SEUIL_FREE)
-                    # On évite les valeurs >= 1.0 (murs/obstacles)
-                    if self.grid.grid[gy, gx] < -5.0: 
-                        newly_seen_rescue.append((xr, yr))
-
+                xr = px + data.distance * math.cos(global_angle)
+                yr = py + data.distance * math.sin(global_angle)
                 newly_seen_rescue.append((xr, yr))
 
         # Merge newly seen wounded
@@ -1196,7 +1184,7 @@ class MyDronePrototype(DroneAbstract):
         # 4. Apply Virtual Walls for Confirmed Dead Drones (The Bubble)
         if self.dead_drones:
             grid_h, grid_w = self.grid.grid.shape
-            radius_cells = int(50.0 / self.grid.resolution)
+            radius_cells = int(90.0 / self.grid.resolution)
             val_wall = 100.0 # Very high value for virtual wall
 
             y, x = np.ogrid[-radius_cells:radius_cells+1, -radius_cells:radius_cells+1]
@@ -1527,6 +1515,17 @@ class MyDronePrototype(DroneAbstract):
             forward_cmd *= 0.0  # Stop and pivot for very sharp angles
         elif abs(angle_error) > 0.4:
             forward_cmd *= 0.5  # Slow down for moderate turns
+
+        # --- Ralentissement en zone inconnue ---
+        grid_pos = self.grid._conv_world_to_grid(*self.current_pose[:2])
+        if grid_pos is not None:
+            gy, gx = int(grid_pos[0]), int(grid_pos[1])
+            if 0 <= gy < self.grid.grid.shape[0] and 0 <= gx < self.grid.grid.shape[1]:
+                grid_val = self.grid.grid[gy, gx]
+                # Valeur entre -4.99 et 2.99 = Inexploré
+                if -4.99 <= grid_val <= 2.99:
+                    forward_cmd *= 0.4  # On limite la poussée
+                    lateral_cmd *= 0.6  # On stabilise les côtés
 
         forward_cmd = float(np.clip(forward_cmd, -1.0, 1.0))
         self.prev_speed_error = speed_error
