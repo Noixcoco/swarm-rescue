@@ -30,6 +30,7 @@ class MyDronePrototype(DroneAbstract):
         GOING_TO_RESCUE_CENTER = 3
         GOING_TO_RETURN_AREA = 4
 
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         
@@ -165,7 +166,7 @@ class MyDronePrototype(DroneAbstract):
         goal = tuple(map(int, goal))
 
         # --- FIXED THRESHOLDS ---
-        SEUIL_MUR = 1.0
+        SEUIL_MUR = 3.0
         SEUIL_FREE = -5.0  # Free cells are BELOW this threshold
         SEUIL_UNEXPLORED_MAX = 2.99  # Unexplored cells are near 0 (between -4 and +4)
         SEUIL_UNEXPLORED_MIN = -4.99
@@ -181,7 +182,7 @@ class MyDronePrototype(DroneAbstract):
         
         # Dilate les murs pour éviter les zones proches
         struct = np.ones((3, 3), dtype=bool)
-        is_wall = ndimage.binary_opening(grid >= SEUIL_MUR, structure=np.ones((2,2)))
+        # is_wall = ndimage.binary_opening(grid >= SEUIL_MUR, structure=np.ones((2,2)))
         danger_zone = binary_dilation(is_wall, structure=struct, iterations=1)
         #danger_zone = binary_dilation(is_wall, structure=struct, iterations=self.inflation_radius_cells)
 
@@ -332,14 +333,9 @@ class MyDronePrototype(DroneAbstract):
                 penalty = 0.0
 
                 # Apply penalty if closer than comfort distance
-                # if dist_to_wall_cells < comfort_dist_cells:
-                #     proximity = 1.0 - (dist_to_wall_cells / comfort_dist_cells)
-                #     penalty = MAX_PENALTY * (proximity ** 2)
-
-                # Si on est à moins de 50px d'un mur, on ajoute un coût exponentiel
-                comfort_limit = 50.0 / self.grid.resolution
-                if dist_to_wall_cells < comfort_limit:
-                    penalty = 50.0 * (1.0 - (dist_to_wall_cells / comfort_limit))**2
+                if dist_to_wall_cells < comfort_dist_cells:
+                    proximity = 1.0 - (dist_to_wall_cells / comfort_dist_cells)
+                    penalty = MAX_PENALTY * (proximity ** 2)
                 
                 move_cost = base_cost + penalty
                 # -----------------------------------------------
@@ -938,12 +934,6 @@ class MyDronePrototype(DroneAbstract):
             else:
                 command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
 
-        # elif self.state == self.Activity.GOING_TO_RETURN_AREA:
-        #     if self.path:
-        #         command = self.follow_path(lidar_data)
-        #     else:
-        #         # Si le chemin est fini ou invalide, on retente de cibler la zone
-        #         self.go_to_return_area(lidar_data)
         elif self.state == self.Activity.GOING_TO_RETURN_AREA:
             # --- CONDITION DE SORTIE : Re-tenter l'exploration régulièrement ---
             if self.iteration % 30 == 0:  # Toutes les 3 secondes
@@ -1045,8 +1035,6 @@ class MyDronePrototype(DroneAbstract):
 
             elif data.entity_type == DroneSemanticSensor.TypeEntity.RESCUE_CENTER:
                 global_angle = normalize_angle(ptheta + data.angle)
-                # xr = px + data.distance * math.cos(global_angle)
-                # yr = py + data.distance * math.sin(global_angle)
 
                 # Reculer le point de 20 pixels vers le drone pour être en zone sûre
                 safety_margin = 20.0
@@ -2066,7 +2054,7 @@ class MyDronePrototype(DroneAbstract):
                 return command
 
             # SETTINGS
-            SAFE_DIST = 150.0  # Start pushing away at 70 pixels (approx 0.7 meter)
+            SAFE_DIST = 120.0  # Start pushing away at 70 pixels (approx 0.7 meter)
             GAIN = 3.5      # Strong push (Stronger than walls to prevent tangling)
 
             repulsion_forward = 0.0
