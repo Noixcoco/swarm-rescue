@@ -14,7 +14,6 @@ import sys
 from pathlib import Path
 from swarm_rescue.simulation.utils.constants import MAX_RANGE_LIDAR_SENSOR
 
-# Ensure examples can be imported when running from the repository root
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent.parent))
 from examples.example_mapping import OccupancyGrid
 from swarm_rescue.simulation.utils.pose import Pose
@@ -42,7 +41,7 @@ class MyDronePrototype(DroneAbstract):
                                   resolution=resolution,
                                   lidar=self.lidar())
         
-        # --- Sécurité et Inflation ---
+        # Sécurité et Inflation 
         self.robot_radius_pixels = 30
         self.inflation_radius_cells = int(self.robot_radius_pixels / self.grid.resolution)
         if self.inflation_radius_cells < 1:
@@ -103,7 +102,7 @@ class MyDronePrototype(DroneAbstract):
         self.removed_wounded_set = set() 
        
         
-        # --- NEW: General unstuck mechanism ---
+        # General unstuck mechanism 
         self.general_stuck_counter = 0
         self.last_unstuck_check_pos = None
         self.unstuck_target = None
@@ -119,7 +118,7 @@ class MyDronePrototype(DroneAbstract):
         self.path_cache_max_age = 50
         self.path_cache_max_size = 15
 
-         # --- HANSEL & GRETEL pour retourner a la rescue zone si find explored path fail ---
+         # HANSEL & GRETEL pour retourner a la rescue zone si find explored path fail 
         self.breadcrumbs = [] # Stores (x, y) tuples
         self.last_breadcrumb_pos = None
         self.breadcrumb_spacing = 100.0 # Distance between crumbs (pixels)
@@ -127,11 +126,11 @@ class MyDronePrototype(DroneAbstract):
         #tracking grasped wounded angle for better approach
         self.grasped_wounded_angle = None 
 
-        # --- Dead Drones / Kill Zones Detection ---
+        # Dead Drones / Kill Zones Detection
         self.dead_drones = []  # Confirmed dead drones (x, y)
         self.suspected_dead_drones = [] # Candidates: {'pos': (x,y), 'first_seen_iter': int, 'last_seen_iter': int}
         self.dead_drone_radius = 80.0 # Radius to match a drone
-        self.dead_confirm_iterations = 10 # How many iterations of immobility to confirm death
+        self.dead_confirm_iterations = 5 # How many iterations of immobility to confirm death
 
         self.prev_wall_error = None
         self.integral_wall_error = 0.0
@@ -165,7 +164,7 @@ class MyDronePrototype(DroneAbstract):
         start = tuple(map(int, start))
         goal = tuple(map(int, goal))
 
-        # --- FIXED THRESHOLDS ---
+        # thresholds
         SEUIL_MUR = 3.0
         SEUIL_FREE = -5.0  # Free cells are BELOW this threshold
         SEUIL_UNEXPLORED_MAX = 2.99  # Unexplored cells are near 0 (between -4 and +4)
@@ -174,62 +173,32 @@ class MyDronePrototype(DroneAbstract):
         # Masque des murs (high positive values)
         is_wall = (grid >= SEUIL_MUR)
         
-        # CORRECT: Only cells with NEGATIVE values are explored free space
+        # Only cells with negative values are explored free space
         is_explored_free = (grid < SEUIL_FREE)
         
-        # CORRECT: Unexplored cells are near zero
+        #  Unexplored cells are near zero
         is_unexplored = (grid >= SEUIL_UNEXPLORED_MIN) & (grid <= SEUIL_UNEXPLORED_MAX)
         
         # Dilate les murs pour éviter les zones proches
         struct = np.ones((3, 3), dtype=bool)
-        # is_wall = ndimage.binary_opening(grid >= SEUIL_MUR, structure=np.ones((2,2)))
         danger_zone = binary_dilation(is_wall, structure=struct, iterations=1)
-        #danger_zone = binary_dilation(is_wall, structure=struct, iterations=self.inflation_radius_cells)
+   
 
 
-        # --- 4. SOFT CONSTRAINT SETUP (Distance Map) ---
+        # SOFT CONSTRAINT SETUP (Distance Map)
         # Calculate distance from every pixel to the nearest wall (IN CELLS)
         # This creates the "Gradient" that pushes the drone to the center.
         # We invert is_wall because we want distance to the WALLS.
         dist_map = ndimage.distance_transform_edt(~is_wall)
 
-        # DEFINITION: How far (in world units) do we want to be?
-        COMFORT_DISTANCE_WORLD = 200.0  # e.g., 60cm or 60px
+        # How far (in world units) do we want to be?
+        COMFORT_DISTANCE_WORLD = 200.0 
         
-        # CONVERSION: Convert that to grid cells so we can compare with dist_map
+        # Convert that to grid cells so we can compare with dist_map
         comfort_dist_cells = COMFORT_DISTANCE_WORLD / self.grid.resolution
         
         # Max penalty to apply if we are right next to the wall
         MAX_PENALTY = 100.0
-
-        
-        # --- MODIFIED DRONE AVOIDANCE ZONE - ONLY AVOID DRONES IN FRONT ---
-        # Cache drone danger zone for a few iterations if positions haven't changed
-       
-        # (Drone obstacle avoidance removed as per request)
-        # # On ajoute une "bulle" d'obstacle temporaire autour des autres drones
-        # # pour que l'algorithme A* planifie un chemin qui les évite.
-        # if hasattr(self, 'other_drones_positions') and self.other_drones_positions:
-        #     # Créer une "bulle" de 120px de diamètre (60px de rayon) autour des autres drones
-        #     bubble_radius_cells = int(90.0 / self.grid.resolution)
-
-        #     for other_drone_info in self.other_drones_positions:
-        #         other_pos_world = other_drone_info[0][:2]  # (x, y)
-        #         other_pos_grid = self.grid._conv_world_to_grid(*other_pos_world)
-                
-        #         if other_pos_grid is not None:
-        #             gy, gx = int(other_pos_grid[0]), int(other_pos_grid[1])
-                    
-        #             # Définir les limites d'un carré pour la bulle
-        #             y0 = max(0, gy - bubble_radius_cells)
-        #             y1 = min(grid.shape[0], gy + bubble_radius_cells + 1)
-        #             x0 = max(0, gx - bubble_radius_cells)
-        #             x1 = min(grid.shape[1], gx + bubble_radius_cells + 1)
-                    
-        #             # Marquer cette zone comme dangereuse pour l'A*
-        #             danger_zone[y0:y1, x0:x1] = True
-
-    
 
         # Si explored_only=True, ajouter les zones non explorées à danger_zone
         if explored_only:
@@ -238,7 +207,7 @@ class MyDronePrototype(DroneAbstract):
         # Si le start ou le goal sont dans la danger_zone (par ex. drone collé au mur),
         # on autorise une petite zone autour d'eux pour permettre à A* de s'extraire.
         try:
-            radius_clear = 2  # Increased to 2 (from 1) to ensure connectivity if stuck
+            radius_clear = 2
             sx, sy = start
             gx, gy = goal
             x0 = max(0, sx - radius_clear)
@@ -275,14 +244,14 @@ class MyDronePrototype(DroneAbstract):
             current = heapq.heappop(oheap)[1]
 
             if current == goal:
-                # --- 1. FULL PATH RECONSTRUCTION ---
+                # FULL PATH RECONSTRUCTION
                 path = [current]
                 while current in came_from:
                     current = came_from[current]
                     path.append(current)
                 path.reverse()
                 
-                # --- 2. FIXED-STEP SUBSAMPLING ---
+                # FIXED-STEP SUBSAMPLING
                 # Keep 1 point every 4 steps to maintain a stable trail.
                 STEP = 7 
                 if len(path) > STEP:
@@ -297,7 +266,7 @@ class MyDronePrototype(DroneAbstract):
                 else:
                     path = path  # Keep short paths as-is
             
-                # --- 3. APPLY SMOOTHING ---
+                # APPLY SMOOTHING
                 if len(path) > 2 and self.path_smoothing_enabled:
                     smoothed = self.smooth_path(path, danger_zone)
                 else:
@@ -324,7 +293,7 @@ class MyDronePrototype(DroneAbstract):
                     continue
 
 
-                # --- NEW: COST CALCULATION (Soft Constraints) ---
+                # COST CALCULATION (Soft Constraints)
                 base_cost = math.hypot(dx, dy)
                 # Retrieve distance to nearest wall (in CELLS)
                 dist_to_wall_cells = dist_map[neighbor[0], neighbor[1]]
@@ -337,7 +306,6 @@ class MyDronePrototype(DroneAbstract):
                     penalty = MAX_PENALTY * (proximity ** 2)
                 
                 move_cost = base_cost + penalty
-                # -----------------------------------------------
 
                 tentative_g_score = gscore[current] + move_cost
 
@@ -396,9 +364,7 @@ class MyDronePrototype(DroneAbstract):
         
         if not (0 <= y < danger_zone.shape[1] and 0 <= x < danger_zone.shape[0]):
             return False
-        # region = danger_zone[max(0, y-1):y+2, max(0, x-1):x+2]
-        # return not np.any(region)
-        
+       
         return not danger_zone[x, y]
     
 
@@ -473,13 +439,13 @@ class MyDronePrototype(DroneAbstract):
         # Process received messages from other drones
         self.process_communication_sensor()
 
-        # --- 1. PERCEPTION ---
+        # PERCEPTION
         self.update_pose()
 
-        # --- RECORD HISTORY ---
+        # RECORD HISTORY
         self.update_breadcrumbs()
 
-         # ---Check if lidar is available before updating grid, if drone killed  ---
+         # Check if lidar is available before updating grid, if drone killed
         lidar_data = self.lidar_values()
         if lidar_data is None:
             # Drone is destroyed - cannot continue
@@ -491,7 +457,7 @@ class MyDronePrototype(DroneAbstract):
             if len(self.return_area_points) < 3:
                 self.add_return_area_point(self.current_pose[:2])
             
-        # --- USE KALMAN-FILTERED POSE for grid update ---
+        # USE KALMAN-FILTERED POSE for grid update
         self.estimated_pose = Pose(np.asarray([self.current_pose[0], self.current_pose[1]]),
                                 self.current_pose[2])
         self.grid.update_grid(pose=self.estimated_pose)
@@ -553,7 +519,7 @@ class MyDronePrototype(DroneAbstract):
                 # Create a hashable key for this wounded
                 wounded_key = (round(closest_wounded[0], 1), round(closest_wounded[1], 1))
                 
-                # --- FIXED: Only check if this wounded has NEVER been evaluated ---
+                # Only check if this wounded has NEVER been evaluated
                 if wounded_key not in self.evaluated_wounded:
                     self.evaluated_wounded.add(wounded_key)  # Mark as evaluated IMMEDIATELY
                     
@@ -594,7 +560,7 @@ class MyDronePrototype(DroneAbstract):
             def is_near_grasped(w):
                 return any(math.hypot(w[0] - gx, w[1] - gy) < exclusion_radius for (gx, gy) in grasped)
 
-            # --- Check before grasping: if drone is near a grasped wounded, abort and explore ---
+            # Check before grasping: if drone is near a grasped wounded, abort and explore
             for (gx, gy) in grasped:
                 if math.hypot(self.current_pose[0] - gx, self.current_pose[1] - gy) < exclusion_radius:
                     self.state = self.Activity.EXPLORING
@@ -609,7 +575,7 @@ class MyDronePrototype(DroneAbstract):
 
                     
 
-            # --- IMPROVED: Continuous conflict resolution ---
+            # Continuous conflict resolution
             if self.current_target_wounded is not None:
                 # Check every 30 iterations if another drone is now much closer
                 if self.iteration % 30 == 0:
@@ -764,7 +730,7 @@ class MyDronePrototype(DroneAbstract):
                 
                 
             else:
-                # --- ENSURE SAFE RETURN: Only use explored areas ---
+                # ENSURE SAFE RETURN: Only use explored areas
                 if self.rescue_zone_points:
                    
                     # Replan with explored_only=True for safe return
@@ -773,7 +739,7 @@ class MyDronePrototype(DroneAbstract):
                     # RECALCULATE PATH REGULARLY (every 30 iterations)
                     if self.iteration % 30 == 0:
                         should_replan = True
-                    # Also retry if no path exists (and we haven't tried just recently)
+                    # retry if no path exists (and we haven't tried just recently)
                     elif (not self.path or len(self.path) == 0):
                         iterations_since_replan = self.iteration - self.last_replan_iteration
                         if iterations_since_replan >= 30 or self.last_replan_iteration == 0:
@@ -788,7 +754,7 @@ class MyDronePrototype(DroneAbstract):
                         )
                         self.last_replan_iteration = self.iteration
                         
-                                                # If no safe path found through explored areas, try without restriction
+                        # If no safe path found through explored areas, try without restriction
                         if not self.path:
                             print(f"[{self.identifier}] No safe explored path to rescue center, using breadcrumbs!")
                             if len(self.breadcrumbs) > 4:
@@ -815,7 +781,7 @@ class MyDronePrototype(DroneAbstract):
                                     explored_only=False
                                 )
 
-        # --- 2. STRATÉGIE ---
+        # STRATÉGIE
         # Replanification for exploration (only when in EXPLORING state)
         if self.state == self.Activity.EXPLORING:
             need_replan = False
@@ -831,7 +797,7 @@ class MyDronePrototype(DroneAbstract):
                     need_replan = False
 
             if need_replan:
-                # --- FUSION DES CIBLES (Locales + Partagées) ---
+                # FUSION DES CIBLES (Locales + Partagées)
                 local_frontiers = self.find_safe_frontier_points()
                 shared_clusters = getattr(self, "shared_frontier_barycenters", [])
                 
@@ -848,7 +814,7 @@ class MyDronePrototype(DroneAbstract):
                         all_candidates.append({"point": lf, "source": "local"})
 
                 if all_candidates:
-                    # --- CALCUL DU MEILLEUR SCORE ---
+                    # CALCUL DU MEILLEUR SCORE
                     scored_targets = []
                     
                     # Récupération des positions des autres pour les pénalités
@@ -864,7 +830,7 @@ class MyDronePrototype(DroneAbstract):
                         p = cand["point"]
                         distance = np.linalg.norm(p - self.current_pose[:2])
                         
-                        # Ton calcul de pénalité de conflit
+                        # calcul de pénalité de conflit
                         conflict_penalty = 0.0
                         for other_target in assigned_targets.values():
                             if np.linalg.norm(p - other_target) < 300.0:
@@ -883,7 +849,7 @@ class MyDronePrototype(DroneAbstract):
                     # Tri par score (le plus petit est le meilleur)
                     scored_targets.sort(key=lambda x: x["score"])
 
-                    # --- BOUCLE DE TENTATIVE (REPLI) ---
+                    # BOUCLE DE TENTATIVE (REPLI)
                     found_path = False
                     for target_info in scored_targets:
                         path = self.creer_chemin(self.current_pose[:2], target_info["point"])
@@ -891,7 +857,7 @@ class MyDronePrototype(DroneAbstract):
                             self.target_point = target_info["point"]
                             self.path = path
                             found_path = True
-                            break # Cible trouvée, on sort de la boucle !
+                            break # Cible trouvée, on sort de la boucle
                     
                     if not found_path:
                         self.go_to_return_area(lidar_data)
@@ -936,7 +902,7 @@ class MyDronePrototype(DroneAbstract):
                 command = {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
 
         elif self.state == self.Activity.GOING_TO_RETURN_AREA:
-            # --- CONDITION DE SORTIE : Re-tenter l'exploration régulièrement ---
+            # CONDITION DE SORTIE : Re-tenter l'exploration régulièrement
             if self.iteration % 30 == 0:  # Toutes les 3 secondes
                 local_frontiers = self.find_safe_frontier_points()
                 shared_clusters = getattr(self, "shared_frontier_barycenters", [])
@@ -955,7 +921,7 @@ class MyDronePrototype(DroneAbstract):
 
 
 
-########## GRASPER LOGIC ############
+        # GRASPER LOGIC
         # Grasper is ONLY active when going to wounded or rescue center
         if self.state == self.Activity.GOING_TO_WOUNDED or self.state == self.Activity.GOING_TO_RESCUE_CENTER:
             command["grasper"] = 1
@@ -986,7 +952,7 @@ class MyDronePrototype(DroneAbstract):
                     self.last_replan_iteration = self.iteration
 
 
-        # 2. Apply Drone Repulsion (Safety against other agents)
+        # Apply Drone Repulsion (Safety against other agents)
         # This will override/modify the command to push us away from collisions
         command = self.drone_repulsion(command)
 
@@ -1057,14 +1023,14 @@ class MyDronePrototype(DroneAbstract):
         for nx, ny in newly_seen_rescue:
             self._add_or_merge_rescue_point((nx, ny))
             
-        # --- DETECT DEAD DRONES ---
+        # DETECT DEAD DRONES
         self.detect_dead_drones(detections, px, py, ptheta)
 
     def detect_dead_drones(self, detections, px, py, ptheta):
         """
         Identify drones that are visible but not communicating and not moving.
         """
-        # 1. Collect positions of communicating "alive" drones
+        # Collect positions of communicating "alive" drones
         alive_drones_positions = []
         for msg in getattr(self.communicator, "received_messages", []):
             if isinstance(msg, dict):
@@ -1078,7 +1044,7 @@ class MyDronePrototype(DroneAbstract):
             if p is not None:
                 alive_drones_positions.append(np.array(p[:2]))
 
-        # 2. Process Semantic Detections for Drones
+        # Process Semantic Detections for Drones
         visible_drones = []
         for data in detections:
              if data.entity_type == DroneSemanticSensor.TypeEntity.DRONE:
@@ -1087,9 +1053,9 @@ class MyDronePrototype(DroneAbstract):
                 yd = py + data.distance * math.sin(global_angle)
                 visible_drones.append(np.array([xd, yd]))
         
-        # 3. Filter visible drones
+        # Filter visible drones
         for v_drone_pos in visible_drones:
-            # A. Check if it corresponds to a communicating drone
+            # Check if it corresponds to a communicating drone
             min_dist_alive = float('inf')
             if alive_drones_positions:
                 dists = [np.linalg.norm(v_drone_pos - ap) for ap in alive_drones_positions]
@@ -1098,7 +1064,7 @@ class MyDronePrototype(DroneAbstract):
             if min_dist_alive < self.dead_drone_radius:
                 continue
 
-            # B. Check if it corresponds to an already known DEAD drone
+            # Check if it corresponds to an already known DEAD drone
             is_known_dead = False
             for dead_pos in self.dead_drones:
                 if np.linalg.norm(v_drone_pos - np.array(dead_pos)) < self.dead_drone_radius:
@@ -1108,7 +1074,7 @@ class MyDronePrototype(DroneAbstract):
             if is_known_dead:
                 continue
             
-            # C. It is silent and unknown. Check suspects.
+            # It is silent and unknown. Check suspects.
             matched_suspect = None
             for suspect in self.suspected_dead_drones:
                 if np.linalg.norm(v_drone_pos - np.array(suspect['pos'])) < self.dead_drone_radius:
@@ -1124,7 +1090,7 @@ class MyDronePrototype(DroneAbstract):
                 # For now, we update last_seen_iter.
                 
                 dist_from_start = np.linalg.norm(v_drone_pos - np.array(matched_suspect['start_pos']))
-                if dist_from_start > 30.0: # It moved > 30px since first seen
+                if dist_from_start > 50.0: # It moved > 50px since first seen
                     # It is moving, so not dead in the "static" sense. Remove from suspects.
                     print(f"[{self.identifier}] Suspect moved {dist_from_start:.1f}px - REMOVING")
                     self.suspected_dead_drones.remove(matched_suspect)
@@ -1162,7 +1128,7 @@ class MyDronePrototype(DroneAbstract):
             if (self.iteration - s['last_seen_iter']) < 10
         ]
 
-        # 5. Cleanup Dead Drones that disappeared (False Positives correction)
+        # Cleanup Dead Drones that disappeared (False Positives correction)
         drones_to_remove = []
         for dead_pos in self.dead_drones:
             # Check if we are close enough to theoretically see it (approx range check)
@@ -1181,7 +1147,7 @@ class MyDronePrototype(DroneAbstract):
         for d in drones_to_remove:
             self.dead_drones.remove(d)
 
-        # 4. Apply Virtual Walls for Confirmed Dead Drones (The Bubble)
+        # Apply Virtual Walls for Confirmed Dead Drones (The Bubble)
         if self.dead_drones:
             grid_h, grid_w = self.grid.grid.shape
             radius_cells = int(90.0 / self.grid.resolution)
@@ -1225,14 +1191,14 @@ class MyDronePrototype(DroneAbstract):
 
             grid_map = self.grid.grid 
             
-            # --- 1. CALCUL DU GRADIENT OPTIMISÉ ---
+            # CALCUL DU GRADIENT OPTIMISÉ
             dx = ndimage.sobel(grid_map, axis=1)
             dy = ndimage.sobel(grid_map, axis=0)
 
             mag_sq = dx**2 + dy**2
             frontier_mask = (mag_sq > 25.0)
 
-            # --- 2. FILTRAGE VECTORISÉ (PAS DE BOUCLE) ---
+            # FILTRAGE VECTORISÉ (PAS DE BOUCLE) 
  
             is_wall = (grid_map >= 4.0) 
             danger_zone = binary_dilation(is_wall, iterations=2) # 2 itérations = ~20px
@@ -1244,7 +1210,7 @@ class MyDronePrototype(DroneAbstract):
             near_unknown = binary_dilation(is_unknown, iterations=1)
             frontier_mask &= (~danger_zone) & near_unknown
 
-            # --- 3. CLUSTERING EFFICACE ---
+            # CLUSTERING EFFICACE
 
             labeled, num_features = ndimage.label(frontier_mask)
             
@@ -1282,6 +1248,7 @@ class MyDronePrototype(DroneAbstract):
             # Retourne les barycentres pour la stratégie d'exploration
             return [c["barycenter"] for c in self.frontier_clusters]
 
+    # --------------------------------------------------------------------------
     # FONCTION DE DESSIN
     # --------------------------------------------------------------------------
     
@@ -1390,7 +1357,7 @@ class MyDronePrototype(DroneAbstract):
     
         
 
-        # --- DRAW THIS DRONE'S POSITION (for reference) ---
+        # DRAW THIS DRONE'S POSITION (for reference)
         my_screen_pos = self.current_pose[:2] + self._half_size_array
         arcade.draw_circle_filled(my_screen_pos[0], my_screen_pos[1], 
                                 radius=18, color=detection_color)
@@ -1440,7 +1407,7 @@ class MyDronePrototype(DroneAbstract):
             # Defaults to 40.0 or a class attribute if defined
             lookahead_dist = getattr(self, 'path_lookahead_distance', 40.0)
 
-        # 2. TARGET SELECTION (Pure Pursuit style)
+        # TARGET SELECTION (Pure Pursuit style)
         lookahead_idx = 0
         for i, wp in enumerate(self.path):
             if np.linalg.norm(wp - self.current_pose[:2]) > lookahead_dist:
@@ -1448,7 +1415,7 @@ class MyDronePrototype(DroneAbstract):
                 break
         target_pos = self.path[min(lookahead_idx, len(self.path)-1)]
 
-        # 3. ERROR COMPUTATION (Body Frame - From Version 2)
+        #  ERROR COMPUTATION (Body Frame)
         delta_pos = target_pos - self.current_pose[:2]
         heading = self.current_pose[2]
         target_angle = math.atan2(delta_pos[1], delta_pos[0])
@@ -1459,7 +1426,7 @@ class MyDronePrototype(DroneAbstract):
         x_err = cos_h * delta_pos[0] + sin_h * delta_pos[1]   # Longitudinal (Forward/Back)
         y_err = -sin_h * delta_pos[0] + cos_h * delta_pos[1]  # Lateral (Left/Right)
 
-        # 4. ROTATION CONTROL (With Damping & Load Sensitivity)
+        # ROTATION CONTROL (With Damping & Load Sensitivity)
         angle_error = normalize_angle(target_angle - heading)
         deriv_angle = angle_error - self.prev_angle_error
         
@@ -1467,7 +1434,6 @@ class MyDronePrototype(DroneAbstract):
         Kp_rot = self.Kp
         Kd_rot = self.Kd
 
-        # Apply Version 1's damping for small errors and Version 2's load reduction
         if abs(angle_error) < math.radians(10):
             Kp_rot *= 0.6
             Kd_rot *= 0.8
@@ -1476,7 +1442,7 @@ class MyDronePrototype(DroneAbstract):
         rotation_speed = float(np.clip(rotation_speed, -1.0, 1.0))
         self.prev_angle_error = angle_error
 
-        # 5. LATERAL CONTROL (Cross-track Correction)
+        # LATERAL CONTROL (Cross-track Correction)
         Kp_lat = 0.05
         Kd_lat = 0.02
         
@@ -1490,7 +1456,7 @@ class MyDronePrototype(DroneAbstract):
             
         lateral_cmd = float(np.clip(lateral_cmd, -1.0, 1.0))
         self.prev_lat_error = y_err
-        # 1. Calcul de la vitesse cible agressive
+        # Calcul de la vitesse cible agressive
         max_speed = 22.0 
         # On utilise une accélération plus forte (0.25 au lieu de 0.15)
         target_speed = max(0.0, min(max_speed, x_err * 0.25 + 0.5))
@@ -1516,7 +1482,7 @@ class MyDronePrototype(DroneAbstract):
         elif abs(angle_error) > 0.4:
             forward_cmd *= 0.5  # Slow down for moderate turns
 
-        # --- Ralentissement en zone inconnue ---
+        # Ralentissement en zone inconnue
         grid_pos = self.grid._conv_world_to_grid(*self.current_pose[:2])
         if grid_pos is not None:
             gy, gx = int(grid_pos[0]), int(grid_pos[1])
@@ -1524,13 +1490,13 @@ class MyDronePrototype(DroneAbstract):
                 grid_val = self.grid.grid[gy, gx]
                 # Valeur entre -4.99 et 2.99 = Inexploré
                 if -4.99 <= grid_val <= 2.99:
-                    forward_cmd *= 0.4  # On limite la poussée
+                    forward_cmd *= 0.5  # On limite la poussée
                     lateral_cmd *= 0.6  # On stabilise les côtés
 
         forward_cmd = float(np.clip(forward_cmd, -1.0, 1.0))
         self.prev_speed_error = speed_error
 
-        # 7. WAYPOINT MANAGEMENT (Multi-drop logic from Version 2)
+        # WAYPOINT MANAGEMENT (Multi-drop logic)
         close_thresh = 50.0 
         drop_until = -1
         max_check = min(5, len(self.path))
@@ -1564,11 +1530,11 @@ class MyDronePrototype(DroneAbstract):
             self.kf_dt = 0.1  # Default for first iteration
         self.kf_last_time = current_time
 
-        # --- UPDATE HEADING ---
+        # UPDATE HEADING
         if compass_angle is not None:
             self.current_pose[2] = compass_angle
         
-        # --- GPS AVAILABLE: Use Kalman filter ---
+        # GPS AVAILABLE: Use Kalman filter
         if gps_pos is not None and not np.isnan(gps_pos[0]):
             # Initialize filter on first GPS measurement
             if not self.kf_initialized:
@@ -1625,7 +1591,7 @@ class MyDronePrototype(DroneAbstract):
             self.current_pose[0] = self.kf_state[0]
             self.current_pose[1] = self.kf_state[1]
 
-        # --- NO GPS ZONE: Use odometry for dead reckoning ---
+        # NO GPS ZONE: Use odometry for dead reckoning
         else:
             odom_data = self.odometer_values()
             if odom_data is None:
@@ -1686,9 +1652,8 @@ class MyDronePrototype(DroneAbstract):
                     print(f"[{self.identifier}] Dead reckoning: dist={dist_travel:.1f}, alpha={math.degrees(alpha):.1f}°, "
                         f"theta={math.degrees(theta):.1f}°, heading={math.degrees(heading):.1f}°")
 
-        # ---------------------------------------------------------
-        # ÉTAPE 4 : SLAM (SCAN MATCHING)
-        # ---------------------------------------------------------
+        # SLAM (SCAN MATCHING)
+
         gps_missing = (gps_pos is None or np.isnan(gps_pos[0]))
         has_lidar = (lidar_data is not None)
         # On ne fait le SLAM que tous les 5 pas (ex: toutes les 0.5 secondes)
@@ -1697,7 +1662,7 @@ class MyDronePrototype(DroneAbstract):
         # Condition : Pas de GPS, Lidar dispo, on a une carte (itération > 50) et c'est le moment
         if gps_missing and has_lidar and self.iteration > 50 and do_slam_now:
             
-            # --- OPTIMISATION 1 : TRACKING MODE ---
+            # OPTIMISATION 1 : TRACKING MODE
             # Si le score précédent était bon (> 300 par exemple, dépend de la carte),
             # on réduit la zone de recherche pour aller vite.
             # Sinon, on cherche large pour se retrouver.
@@ -1718,7 +1683,7 @@ class MyDronePrototype(DroneAbstract):
             # Calcul du nouveau score pour le prochain tour
             self.last_slam_score = self.calculate_scan_score(corrected_pose, lidar_data)
 
-            # --- SECURITE 2 : GATING (ANTI-SAUT) ---
+            # SECURITE 2 : GATING (ANTI-SAUT)
             # On calcule la distance entre la prédiction (Odométrie) et la correction (SLAM)
             dist_correction = math.sqrt((corrected_pose[0] - current_guess[0])**2 + 
                                         (corrected_pose[1] - current_guess[1])**2)
@@ -1855,7 +1820,7 @@ class MyDronePrototype(DroneAbstract):
             if "frontier_clusters" in other_message:
                 all_frontier_clusters.extend(other_message["frontier_clusters"])
         
-            # --- Grid fusion (inside process_communication_sensor) ---
+            # Grid fusion (inside process_communication_sensor)
             if "grid_data" in other_message:
                 # other_grid is the incoming data, self.grid.grid is our current data
                 other_grid = np.array(other_message["grid_data"])
@@ -1874,7 +1839,7 @@ class MyDronePrototype(DroneAbstract):
             for cluster in getattr(self, "frontier_clusters", [])
         ])
     
-        # --- WOUNDED MANAGEMENT ---
+        # WOUNDED MANAGEMENT
         # Merge new wounded (vectorized distance check would be faster but this is clearer)
         merged_wounded = list(self.wounded_to_rescue)
         for w in all_wounded:
@@ -1897,22 +1862,22 @@ class MyDronePrototype(DroneAbstract):
     
         self.wounded_to_rescue = deduped_wounded
     
-        # --- ASSIGNMENTS ---
+        # ASSIGNMENTS
         for w, drone_id in all_assignments.items():
             if w not in self.wounded_assignments:
                 self.wounded_assignments[w] = drone_id
     
-        # --- GRASPED WOUNDED ---
+        # GRASPED WOUNDED
         if not hasattr(self, "other_grasped_wounded"):
             self.other_grasped_wounded = set()
         self.other_grasped_wounded = all_grasped
     
-        # --- RESCUE ZONES ---
+        # RESCUE ZONES
         for r in all_rescue_zones:
             if r not in self.rescue_zone_points:
                 self.rescue_zone_points.append(r)
     
-        # --- FRONTIER DEDUPLICATION (ALL clusters, no limiting) ---
+        # FRONTIER DEDUPLICATION (ALL clusters, no limiting)
         if all_frontier_clusters:
             deduped_barycenters = []
             dedup_radius_frontier = 60.0
@@ -2029,7 +1994,7 @@ class MyDronePrototype(DroneAbstract):
             # 100.0 is safe to ensure we don't accidentally add the same zone twice
             DEDUP_RADIUS = 80.0 
 
-            # 1. Check against ALL existing points
+            # Check against ALL existing points
             for (rx, ry) in self.rescue_zone_points:
                 dist = math.hypot(rx - nx, ry - ny)
                 if dist < DEDUP_RADIUS:
@@ -2038,7 +2003,7 @@ class MyDronePrototype(DroneAbstract):
                     # Just return to keep the existing point stable.
                     return
 
-            # 2. If we are here, it is a completely NEW area.
+            # If we are here, it is a completely NEW area.
             if len(self.rescue_zone_points) < MAX_RESCUE_POINTS:
                 self.rescue_zone_points.append((nx, ny))
 
@@ -2072,13 +2037,13 @@ class MyDronePrototype(DroneAbstract):
                 dist = math.hypot(dx, dy)
 
                 if 0 < dist < SAFE_DIST:
-                    # 1. Magnitude: Stronger as we get closer (0.0 to 1.0)
+                    # Magnitude: Stronger as we get closer (0.0 to 1.0)
                     force = (SAFE_DIST - dist) / SAFE_DIST
                     
-                    # 2. Direction: Global angle of the push
+                    # Direction: Global angle of the push
                     angle_global = math.atan2(dy, dx)
                     
-                    # 3. Local Projection: Convert to Forward/Lateral relative to head
+                    # Local Projection: Convert to Forward/Lateral relative to head
                     angle_local = normalize_angle(angle_global - my_theta)
                     
                     repulsion_forward += force * math.cos(angle_local)
@@ -2137,7 +2102,7 @@ class MyDronePrototype(DroneAbstract):
             return self.follow_path(lidar_data)
         
         else:
-            # --- Store wounded orientation just before grasping ---
+            # Store wounded orientation just before grasping
             self.grasped_wounded_angle = self.get_wounded_orientation()
 
 
@@ -2160,7 +2125,7 @@ class MyDronePrototype(DroneAbstract):
             # Phase 1: Turn in place
             return {"forward": 0.0, "lateral": 0.0, "rotation": rotation_speed}
         else:
-            # Phase 2: Go straight, fast!
+            # Phase 2: Go straight, fast
             return {"forward": 1.0, "lateral": 0.0, "rotation": rotation_speed}
 
 
@@ -2188,12 +2153,12 @@ class MyDronePrototype(DroneAbstract):
         if not self.rescue_zone_points:
             return command
 
-        # 1. Vecteur vers le centre de secours
+        # Vecteur vers le centre de secours
         target_point = np.array(self.rescue_zone_points[0])
         target_vector = target_point - self.current_pose[:2]
         dist_to_center = np.linalg.norm(target_vector)
         
-        # 2. ANGLE DE PRÉCISION
+        # ANGLE DE PRÉCISION
         # Angle global vers le centre
         angle_to_center = math.atan2(target_vector[1], target_vector[0])
         
@@ -2206,19 +2171,19 @@ class MyDronePrototype(DroneAbstract):
         # drone_orientation + grasp_angle = angle_to_center
         target_orientation = normalize_angle(angle_to_center - grasp_angle)
         
-        # 3. Calcul de l'erreur d'angle
+        # Calcul de l'erreur d'angle
         angle_error = normalize_angle(target_orientation - self.current_pose[2])
 
-        # --- LOGIQUE DE COMMANDE ---
+        # LOGIQUE DE COMMANDE
         
-        # A. Rotation : S'aligner sur l'axe du blessé
+        # Rotation : S'aligner sur l'axe du blessé
         if abs(angle_error) > 0.03:  # Plus de précision (2 degrés)
             command["rotation"] = np.clip(self.Kp * angle_error, -0.6, 0.6)
             command["forward"] = 1.0
         else:
             command["rotation"] = 0.0
             
-            # B. Translation : Pousser le blessé vers le centre
+            # Translation : Pousser le blessé vers le centre
             # On n'avance/recule que si l'alignement est quasi parfait
             if dist_to_center > 12.0:  # Distance d'arrêt ajustée
                 # Si le blessé est plutôt devant (grasp_angle ~ 0), forward positif
@@ -2235,7 +2200,7 @@ class MyDronePrototype(DroneAbstract):
         nx, ny = new_point
         # Radius to consider a point "already known"
         DEDUP_RADIUS = 50.0 
-        #make distance from rescue center to avoid traffic jam near rescue center
+        # make distance from rescue center to avoid traffic jam near rescue center
         MIN_DIST_FROM_RESCUE = 170.0
 
 
@@ -2246,14 +2211,14 @@ class MyDronePrototype(DroneAbstract):
                         if dist_to_rescue < MIN_DIST_FROM_RESCUE:
                             return
                         
-        # 1. Check against ALL existing points
+        # Check against ALL existing points
         for (rx, ry) in self.return_area_points:
             dist = math.hypot(rx - nx, ry - ny)
             if dist < DEDUP_RADIUS:
                 return
             
 
-        # 2. If we are here, it is a completely NEW area.
+        # If we are here, it is a completely NEW area.
         self.return_area_points.append((nx, ny))
 
 
