@@ -479,7 +479,7 @@ class MyDronePrototype(DroneAbstract):
                 return command
             
             else:
-                print(f"[{self.identifier}] No barycenters available - using simple reverse")
+                #print(f"[{self.identifier}] No barycenters available - using simple reverse")
                 return {"forward": -0.5, "lateral": 0.3, "rotation": 0.4, "grasper": 1}
                
 
@@ -509,7 +509,7 @@ class MyDronePrototype(DroneAbstract):
             ]
             
             if available_wounded and (self.iteration % 50 == 0):
-                print(f"[{self.identifier}] [DEBUG] Available wounded: {available_wounded}")
+                #print(f"[{self.identifier}] [DEBUG] Available wounded: {available_wounded}")
                 # Choose closest available wounded
                 distances = [np.linalg.norm(np.array(w) - self.current_pose[:2]) for w in available_wounded]
                 closest_idx = int(np.argmin(distances))
@@ -597,7 +597,7 @@ class MyDronePrototype(DroneAbstract):
                                 break
                     
                     if should_abandon:
-                        print(f"[{self.identifier}] Abandoning target - drone {winner_id} is closer")
+                        #print(f"[{self.identifier}] Abandoning target - drone {winner_id} is closer")
                         self.state = self.Activity.EXPLORING
                         self.wounded_assignments.pop(self.current_target_wounded, None)
                         self.current_target_wounded = None
@@ -669,22 +669,24 @@ class MyDronePrototype(DroneAbstract):
                                             wounded_detected = True
                                             break
                                 except Exception as e:
-                                    print(f"  Error processing detection: {e}")
+                                    #print(f"  Error processing detection: {e}")
                                     continue
                         else:
-                            print("No semantic detections available")
+                            #print("No semantic detections available")
+                            pass
                     except Exception as e:
-                        print(f"Error reading semantic sensor: {e}")
+                        #print(f"Error reading semantic sensor: {e}")
+                        pass
                     
                     
                   
                   
                     if not wounded_detected:
-                        print(f"\n*** WOUNDED NOT FOUND - REMOVING FROM LIST ***")
+                        #print(f"\n*** WOUNDED NOT FOUND - REMOVING FROM LIST ***")
                         check_radius = 50.0
                         
                         count_before = len(self.wounded_to_rescue)
-                        print(f"Wounded list before removal: {self.wounded_to_rescue}")
+                        #print(f"Wounded list before removal: {self.wounded_to_rescue}")
                         
                         # Remove wounded persons close to the target location
                         self.wounded_to_rescue = [
@@ -694,8 +696,8 @@ class MyDronePrototype(DroneAbstract):
                         ]
                         
                         count_after = len(self.wounded_to_rescue)
-                        print(f"Removed {count_before - count_after} wounded from list")
-                        print(f"Wounded list after removal: {self.wounded_to_rescue}")
+                        #print(f"Removed {count_before - count_after} wounded from list")
+                        #print(f"Wounded list after removal: {self.wounded_to_rescue}")
                         self.removed_wounded.append(self.current_target_wounded)
                         
 
@@ -704,7 +706,7 @@ class MyDronePrototype(DroneAbstract):
                         self.state = self.Activity.EXPLORING
                         self.current_target_wounded = None
                         self.path = []
-                        print(f"Switched to EXPLORING state\n")
+                        #print(f"Switched to EXPLORING state\n")
 
 
             else:
@@ -756,9 +758,9 @@ class MyDronePrototype(DroneAbstract):
                         
                         # If no safe path found through explored areas, try without restriction
                         if not self.path:
-                            print(f"[{self.identifier}] No safe explored path to rescue center, using breadcrumbs!")
+                            #print(f"[{self.identifier}] No safe explored path to rescue center, using breadcrumbs!")
                             if len(self.breadcrumbs) > 4:
-                                print("enter the loop")
+                                #print("enter the loop")
                                 # Reverse the recorded history
                                 current_pos = self.current_pose[:2]
                                 breadcrumbs_np = np.array(self.breadcrumbs)
@@ -772,9 +774,10 @@ class MyDronePrototype(DroneAbstract):
                                 # Append the actual rescue center at the end to be sure
                                 self.path.append(np.array(self.rescue_zone_points[0]))
                                 
-                                print(f"[{self.identifier}] Success: Using Breadcrumbs (Length: {len(self.path)})")
+                                #print(f"[{self.identifier}] Success: Using Breadcrumbs (Length: {len(self.path)})")
                             else:
-                                print(f"[{self.identifier}] No safe explored path to rescue center, trying unexplored areas!")
+                                #
+                                # print(f"[{self.identifier}] No safe explored path to rescue center, trying unexplored areas!")
                                 self.path = self.creer_chemin(
                                     self.current_pose[:2], 
                                     self.rescue_zone_points[0], 
@@ -909,7 +912,7 @@ class MyDronePrototype(DroneAbstract):
                 
                 # S'il y a de nouveau des zones à explorer (les nôtres ou celles des autres)
                 if local_frontiers or shared_clusters:
-                    print(f"[{self.identifier}] Nouvelles frontières détectées ! Reprise de l'exploration.")
+                    #print(f"[{self.identifier}] Nouvelles frontières détectées ! Reprise de l'exploration.")
                     self.state = self.Activity.EXPLORING
                     self.path = [] # Forcer la planification au prochain cycle
                 else:
@@ -956,10 +959,10 @@ class MyDronePrototype(DroneAbstract):
         # This will override/modify the command to push us away from collisions
         command = self.drone_repulsion(command)
 
-        if self.iteration % 5 == 0:
-            self.grid.display(self.grid.zoomed_grid,
-                              self.estimated_pose,
-                              title="zoomed occupancy grid")
+        # if self.iteration % 5 == 0:
+        #     self.grid.display(self.grid.zoomed_grid,
+        #                       self.estimated_pose,
+        #                       title="zoomed occupancy grid")
 
         return command
 
@@ -1092,7 +1095,7 @@ class MyDronePrototype(DroneAbstract):
                 dist_from_start = np.linalg.norm(v_drone_pos - np.array(matched_suspect['start_pos']))
                 if dist_from_start > 50.0: # It moved > 50px since first seen
                     # It is moving, so not dead in the "static" sense. Remove from suspects.
-                    print(f"[{self.identifier}] Suspect moved {dist_from_start:.1f}px - REMOVING")
+                    #print(f"[{self.identifier}] Suspect moved {dist_from_start:.1f}px - REMOVING")
                     self.suspected_dead_drones.remove(matched_suspect)
                 else:
                     matched_suspect['last_seen_iter'] = self.iteration
@@ -1101,19 +1104,19 @@ class MyDronePrototype(DroneAbstract):
                     # Check confirmation condition
                     if (self.iteration - matched_suspect['first_seen_iter']) > self.dead_confirm_iterations:
                         # CONFIRMED DEAD
-                        print(f"[{self.identifier}] *** CONFIRMED DEAD DRONE at ({matched_suspect['pos'][0]:.1f}, {matched_suspect['pos'][1]:.1f}) ***")
+                        #print(f"[{self.identifier}] *** CONFIRMED DEAD DRONE at ({matched_suspect['pos'][0]:.1f}, {matched_suspect['pos'][1]:.1f}) ***")
                         self.dead_drones.append(matched_suspect['pos'])
                         self.suspected_dead_drones.remove(matched_suspect)
 
                         # FORCE REPLANNING to avoid the newly discovered kill zone
-                        print(f"[{self.identifier}] -> Clearing path to force replanning around kill zone.")
+                        #print(f"[{self.identifier}] -> Clearing path to force replanning around kill zone.")
                         self.path = []
             
             else:
                 # Create new suspect
-                print(f"[{self.identifier}] VISIBLE DRONE WITHOUT RADIO SIGNAL at ({v_drone_pos[0]:.1f}, {v_drone_pos[1]:.1f})")
-                print(f"[{self.identifier}] (Nearest radio signal: {min_dist_alive:.1f})")
-                print(f"[{self.identifier}] ??? SUSPECTED DEAD DRONE initialized ???")
+                #print(f"[{self.identifier}] VISIBLE DRONE WITHOUT RADIO SIGNAL at ({v_drone_pos[0]:.1f}, {v_drone_pos[1]:.1f})")
+                #print(f"[{self.identifier}] (Nearest radio signal: {min_dist_alive:.1f})")
+                #print(f"[{self.identifier}] ??? SUSPECTED DEAD DRONE initialized ???")
                 self.suspected_dead_drones.append({
                     'pos': (v_drone_pos[0], v_drone_pos[1]),
                     'start_pos': (v_drone_pos[0], v_drone_pos[1]),
@@ -1141,7 +1144,7 @@ class MyDronePrototype(DroneAbstract):
                         break
                 
                 if not is_still_there:
-                    print(f"[{self.identifier}] Dead drone at ({dead_pos[0]:.1f}, {dead_pos[1]:.1f}) disappeared - REMOVING KILL ZONE")
+                    #print(f"[{self.identifier}] Dead drone at ({dead_pos[0]:.1f}, {dead_pos[1]:.1f}) disappeared - REMOVING KILL ZONE")
                     drones_to_remove.append(dead_pos)
         
         for d in drones_to_remove:
@@ -1252,141 +1255,141 @@ class MyDronePrototype(DroneAbstract):
     # FONCTION DE DESSIN
     # --------------------------------------------------------------------------
     
-    def draw_bottom_layer(self):
-        """ Dessine le chemin calculé (tous les points) """
+    # def draw_bottom_layer(self):
+    #     """ Dessine le chemin calculé (tous les points) """
 
-        # Define a palette of colors (extend as needed)
-        palette = [
-            (200, 60, 60),   # Red
-            (60, 200, 60),   # Green
-            (60, 60, 200),   # Blue
-            (200, 200, 60),  # Yellow
-            (200, 60, 200),  # Magenta
-            (60, 200, 200),  # Cyan
-            (255, 128, 0),   # Orange
-            (128, 0, 255),   # Purple
-        ]
-        # Assign a color based on the drone's identifier (hash to index)
-        color_idx = int(self.identifier) % len(palette)
-        detection_color = palette[color_idx]
+    #     # Define a palette of colors (extend as needed)
+    #     palette = [
+    #         (200, 60, 60),   # Red
+    #         (60, 200, 60),   # Green
+    #         (60, 60, 200),   # Blue
+    #         (200, 200, 60),  # Yellow
+    #         (200, 60, 200),  # Magenta
+    #         (60, 200, 200),  # Cyan
+    #         (255, 128, 0),   # Orange
+    #         (128, 0, 255),   # Purple
+    #     ]
+    #     # Assign a color based on the drone's identifier (hash to index)
+    #     color_idx = int(self.identifier) % len(palette)
+    #     detection_color = palette[color_idx]
     
 
-        if hasattr(self, 'frontier_clusters') and self.frontier_clusters :
-            # Only draw the 5 closest clusters to reduce rendering overhead
-            if len(self.frontier_clusters) > 5:
-                # Sort by distance to current position
-                sorted_clusters = sorted(
-                    self.frontier_clusters,
-                    key=lambda c: np.linalg.norm(c['barycenter'] - self.current_pose[:2])
-                )[:5]  # Take only 5 closest
-            else:
-                sorted_clusters = self.frontier_clusters
+    #     if hasattr(self, 'frontier_clusters') and self.frontier_clusters :
+    #         # Only draw the 5 closest clusters to reduce rendering overhead
+    #         if len(self.frontier_clusters) > 5:
+    #             # Sort by distance to current position
+    #             sorted_clusters = sorted(
+    #                 self.frontier_clusters,
+    #                 key=lambda c: np.linalg.norm(c['barycenter'] - self.current_pose[:2])
+    #             )[:5]  # Take only 5 closest
+    #         else:
+    #             sorted_clusters = self.frontier_clusters
             
-            for cluster in sorted_clusters:
-                bc = cluster.get('barycenter')
-                if bc is not None:
-                    ptb = bc + self._half_size_array
-                    arcade.draw_circle_filled(ptb[0], ptb[1], radius=6, color=detection_color)
+    #         for cluster in sorted_clusters:
+    #             bc = cluster.get('barycenter')
+    #             if bc is not None:
+    #                 ptb = bc + self._half_size_array
+    #                 arcade.draw_circle_filled(ptb[0], ptb[1], radius=6, color=detection_color)
 
-        # Draw wounded detected via new simple API (wounded_to_rescue)
-        try:
-            if hasattr(self, 'wounded_to_rescue') and self.wounded_to_rescue:
-                for (xw, yw) in self.wounded_to_rescue:
-                    pt = np.array([xw, yw]) + self._half_size_array
+    #     # Draw wounded detected via new simple API (wounded_to_rescue)
+    #     try:
+    #         if hasattr(self, 'wounded_to_rescue') and self.wounded_to_rescue:
+    #             for (xw, yw) in self.wounded_to_rescue:
+    #                 pt = np.array([xw, yw]) + self._half_size_array
 
 
-                   # Match the wounded to an assignment using a distance threshold
-                    assigned_drone_id = None
+    #                # Match the wounded to an assignment using a distance threshold
+    #                 assigned_drone_id = None
                     
-                    # Iterate through assignments to find a match for this (xw, yw)
-                    for w_pos, drone_id in self.wounded_assignments.items():
-                        # Handle potential string keys from communication
-                        if isinstance(w_pos, str):
-                            try:
-                                # Convert "(1.2, 3.4)" -> [1.2, 3.4]
-                                coords = [float(x) for x in w_pos.strip("()").split(",")]
-                                kx, ky = coords[0], coords[1]
-                            except: continue
-                        else:
-                            kx, ky = w_pos[0], w_pos[1]
+    #                 # Iterate through assignments to find a match for this (xw, yw)
+    #                 for w_pos, drone_id in self.wounded_assignments.items():
+    #                     # Handle potential string keys from communication
+    #                     if isinstance(w_pos, str):
+    #                         try:
+    #                             # Convert "(1.2, 3.4)" -> [1.2, 3.4]
+    #                             coords = [float(x) for x in w_pos.strip("()").split(",")]
+    #                             kx, ky = coords[0], coords[1]
+    #                         except: continue
+    #                     else:
+    #                         kx, ky = w_pos[0], w_pos[1]
                         
-                        # Distance threshold check (must be the same person)
-                        if math.hypot(xw - kx, yw - ky) < 10.0:
-                            assigned_drone_id = drone_id
-                            break
+    #                     # Distance threshold check (must be the same person)
+    #                     if math.hypot(xw - kx, yw - ky) < 10.0:
+    #                         assigned_drone_id = drone_id
+    #                         break
                     
-                    # Set color based on assigned drone
-                    if assigned_drone_id is not None:
-                        color = palette[int(assigned_drone_id) % len(palette)]
-                        label = f"ASSIGNED: DRONE {assigned_drone_id}"
-                    else:
-                        color = (255, 255, 255) # White if unassigned
-                        label = "AVAILABLE"
+    #                 # Set color based on assigned drone
+    #                 if assigned_drone_id is not None:
+    #                     color = palette[int(assigned_drone_id) % len(palette)]
+    #                     label = f"ASSIGNED: DRONE {assigned_drone_id}"
+    #                 else:
+    #                     color = (255, 255, 255) # White if unassigned
+    #                     label = "AVAILABLE"
 
-                    # Draw the marker and the text
-                    arcade.draw_circle_outline(pt[0], pt[1], 20, color, 2)
-                    arcade.draw_text(label, pt[0] + 25, pt[1] - 10, color, 11, bold=True)
-        except Exception:
-            pass
+    #                 # Draw the marker and the text
+    #                 arcade.draw_circle_outline(pt[0], pt[1], 20, color, 2)
+    #                 arcade.draw_text(label, pt[0] + 25, pt[1] - 10, color, 11, bold=True)
+    #     except Exception:
+    #         pass
 
-        # Draw additional rescue zone points detected via new API
-        try:
-            if hasattr(self, 'rescue_zone_points') and self.rescue_zone_points:
-                for (xr, yr) in self.rescue_zone_points:
-                    pt = np.array([xr, yr]) + self._half_size_array
-                    arcade.draw_rectangle_outline(pt[0], pt[1], width=30, height=30, color=(0,160,0), border_width=2)
-                    arcade.draw_text("RZ", pt[0] + 12, pt[1] + 12, (0,120,0), 10)
-        except Exception:
-            pass
+    #     # Draw additional rescue zone points detected via new API
+    #     try:
+    #         if hasattr(self, 'rescue_zone_points') and self.rescue_zone_points:
+    #             for (xr, yr) in self.rescue_zone_points:
+    #                 pt = np.array([xr, yr]) + self._half_size_array
+    #                 arcade.draw_rectangle_outline(pt[0], pt[1], width=30, height=30, color=(0,160,0), border_width=2)
+    #                 arcade.draw_text("RZ", pt[0] + 12, pt[1] + 12, (0,120,0), 10)
+    #     except Exception:
+    #         pass
         
 
-        if self.path and len(self.path) > 0:
-            radius = 7
-            blue = (0,0,255)
-            green = (0,255,0)
-            # Affiche chaque point du chemin
-            for pt in self.path:
-                point_arcade = pt + self._half_size_array
-                arcade.draw_circle_filled(point_arcade[0], point_arcade[1], radius=radius, color=blue)
-            # Relie les points par des segments
-            for i in range(len(self.path)-1):
-                p1 = self.path[i] + self._half_size_array
-                p2 = self.path[i+1] + self._half_size_array
-                arcade.draw_line(p1[0], p1[1], p2[0], p2[1], color=green, line_width=3)
+    #     if self.path and len(self.path) > 0:
+    #         radius = 7
+    #         blue = (0,0,255)
+    #         green = (0,255,0)
+    #         # Affiche chaque point du chemin
+    #         for pt in self.path:
+    #             point_arcade = pt + self._half_size_array
+    #             arcade.draw_circle_filled(point_arcade[0], point_arcade[1], radius=radius, color=blue)
+    #         # Relie les points par des segments
+    #         for i in range(len(self.path)-1):
+    #             p1 = self.path[i] + self._half_size_array
+    #             p2 = self.path[i+1] + self._half_size_array
+    #             arcade.draw_line(p1[0], p1[1], p2[0], p2[1], color=green, line_width=3)
 
     
         
 
-        # DRAW THIS DRONE'S POSITION (for reference)
-        my_screen_pos = self.current_pose[:2] + self._half_size_array
-        arcade.draw_circle_filled(my_screen_pos[0], my_screen_pos[1], 
-                                radius=18, color=detection_color)
+    #     # DRAW THIS DRONE'S POSITION (for reference)
+    #     my_screen_pos = self.current_pose[:2] + self._half_size_array
+    #     arcade.draw_circle_filled(my_screen_pos[0], my_screen_pos[1], 
+    #                             radius=18, color=detection_color)
         
     
 
-        try:
-            current_pose_screen = self.current_pose[:2] + self._half_size_array
-            # Get state name
-            state_name = self.state.name if hasattr(self.state, 'name') else str(self.state)
-            # Display above drone (offset +25 pixels above)
-            arcade.draw_text(state_name, 
-                           current_pose_screen[0] - 30, 
-                           current_pose_screen[1] + 25, 
-                           (255, 255, 255), 
-                           12, 
-                           bold=True)
-        except Exception:
-            pass
+    #     try:
+    #         current_pose_screen = self.current_pose[:2] + self._half_size_array
+    #         # Get state name
+    #         state_name = self.state.name if hasattr(self.state, 'name') else str(self.state)
+    #         # Display above drone (offset +25 pixels above)
+    #         arcade.draw_text(state_name, 
+    #                        current_pose_screen[0] - 30, 
+    #                        current_pose_screen[1] + 25, 
+    #                        (255, 255, 255), 
+    #                        12, 
+    #                        bold=True)
+    #     except Exception:
+    #         pass
             
-        # Draw return area points
-        try:
-            if hasattr(self, 'return_area_points') and self.return_area_points:
-                for (rx, ry) in self.return_area_points:
-                    pt = np.array([rx, ry]) + self._half_size_array
-                    arcade.draw_rectangle_outline(pt[0], pt[1], width=30, height=30, color=(0, 160, 255), border_width=2)
-                    arcade.draw_text("RA", pt[0] + 12, pt[1] + 12, (0, 120, 200), 10)
-        except Exception:
-            pass
+    #     # Draw return area points
+    #     try:
+    #         if hasattr(self, 'return_area_points') and self.return_area_points:
+    #             for (rx, ry) in self.return_area_points:
+    #                 pt = np.array([rx, ry]) + self._half_size_array
+    #                 arcade.draw_rectangle_outline(pt[0], pt[1], width=30, height=30, color=(0, 160, 255), border_width=2)
+    #                 arcade.draw_text("RA", pt[0] + 12, pt[1] + 12, (0, 120, 200), 10)
+    #     except Exception:
+    #         pass
 
     # --------------------------------------------------------------------------
     # FONCTIONS DE PILOTAGE
@@ -1649,8 +1652,9 @@ class MyDronePrototype(DroneAbstract):
                 self.current_pose[1] += dy_world
                 
                 if self.iteration % 10 == 0:  # Print every 10 iterations to reduce spam
-                    print(f"[{self.identifier}] Dead reckoning: dist={dist_travel:.1f}, alpha={math.degrees(alpha):.1f}°, "
-                        f"theta={math.degrees(theta):.1f}°, heading={math.degrees(heading):.1f}°")
+                    #print(f"[{self.identifier}] Dead reckoning: dist={dist_travel:.1f}, alpha={math.degrees(alpha):.1f}°, "
+                    #    f"theta={math.degrees(theta):.1f}°, heading={math.degrees(heading):.1f}°")
+                    pass
 
         # SLAM (SCAN MATCHING)
 
@@ -1962,19 +1966,20 @@ class MyDronePrototype(DroneAbstract):
         
         # If stuck for too long, trigger unstuck behavior
         if self.general_stuck_counter > 5:  # 5 iterations of being stuck
-            print(f"[{self.identifier}] General stuck detected! Counter: {self.general_stuck_counter}")
-            
+            #print(f"[{self.identifier}] General stuck detected! Counter: {self.general_stuck_counter}")
+            pass
+
             # Find a free position to navigate to
             if self.unstuck_target is None or self.general_stuck_counter % 10 == 0:
                 self.unstuck_target = self.find_free_position_for_unstuck()
                 
                 if self.unstuck_target:
-                    print(f"[{self.identifier}] Found unstuck target: {self.unstuck_target}")
+                    #print(f"[{self.identifier}] Found unstuck target: {self.unstuck_target}")
                     # Create path to unstuck target
                     self.path = self.creer_chemin(self.current_pose[:2], self.unstuck_target)
                     self.is_unstucking = True
                 else:
-                    print(f"[{self.identifier}] No unstuck target found")
+                    #print(f"[{self.identifier}] No unstuck target found")
                     self.is_unstucking = False
             
             return True
@@ -2141,7 +2146,8 @@ class MyDronePrototype(DroneAbstract):
                     return angle
                 
         except Exception as e:
-            print(f"[{self.identifier}] Error processing semantic data: {e}")
+            #print(f"[{self.identifier}] Error processing semantic data: {e}")
+            pass
         return None
         
 
@@ -2243,7 +2249,7 @@ class MyDronePrototype(DroneAbstract):
             if path:
                 self.path = path
                 self.target_point = np.array(target_world)
-                print(f"[{self.identifier}] [FALLBACK] Moving to nearest unexplored cell at {target_world}")
+                #print(f"[{self.identifier}] [FALLBACK] Moving to nearest unexplored cell at {target_world}")
                 return
             
 
@@ -2260,5 +2266,5 @@ class MyDronePrototype(DroneAbstract):
 
             return self.follow_path(lidar_data) if lidar_data is not None else {"forward": 0.0, "lateral": 0.0, "rotation": 0.0}
         else:
-            print(f"[{self.identifier}] No return area points available!")
-            
+            #print(f"[{self.identifier}] No return area points available!")
+            pass    
